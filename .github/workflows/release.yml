@@ -34,7 +34,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -81,7 +81,7 @@ jobs:
             echo '{"ok":false}' > macos-sig.json
             echo "::warning::No .sig file found — TAURI_SIGNING_PRIVATE_KEY may not be set"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-sig
           path: macos-sig.json
@@ -96,7 +96,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -142,7 +142,7 @@ jobs:
             echo '{"ok":false}' > windows-sig.json
             echo "::warning::No .sig file found — TAURI_SIGNING_PRIVATE_KEY may not be set"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-sig
           path: windows-sig.json
@@ -165,7 +165,7 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             patchelf
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -210,7 +210,7 @@ jobs:
             echo '{"ok":false}' > linux-sig.json
             echo "::warning::No .sig file found — TAURI_SIGNING_PRIVATE_KEY may not be set"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-sig
           path: linux-sig.json
@@ -226,11 +226,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: macos-sig, path: artifacts }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: windows-sig, path: artifacts }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: linux-sig, path: artifacts }
 
       - name: Generate latest.json
