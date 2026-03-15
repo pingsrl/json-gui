@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - "v*.*.*"
 
 jobs:
   # ─────────────────────────────────────────────────────────
@@ -58,9 +58,16 @@ jobs:
             src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
       - name: Save macOS signature for latest.json
         run: |
-          SIG=$(cat src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig)
-          URL=$(ls src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz | xargs basename)
-          echo "{\"sig\":\"$SIG\",\"url\":\"$URL\"}" > macos-sig.json
+          SIG_FILE=$(ls src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig 2>/dev/null | head -1)
+          TAR_FILE=$(ls src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz 2>/dev/null | head -1)
+          if [ -n "$SIG_FILE" ] && [ -n "$TAR_FILE" ]; then
+            SIG=$(cat "$SIG_FILE")
+            URL=$(basename "$TAR_FILE")
+            echo "{\"sig\":\"$SIG\",\"url\":\"$URL\",\"ok\":true}" > macos-sig.json
+          else
+            echo '{"ok":false}' > macos-sig.json
+            echo "::warning::No .sig file found — TAURI_SIGNING_PRIVATE_KEY may not be set"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: macos-sig
@@ -99,9 +106,16 @@ jobs:
       - name: Save Windows signature for latest.json
         shell: bash
         run: |
-          SIG=$(cat src-tauri/target/release/bundle/nsis/*.nsis.zip.sig)
-          URL=$(ls src-tauri/target/release/bundle/nsis/*.nsis.zip | xargs basename)
-          echo "{\"sig\":\"$SIG\",\"url\":\"$URL\"}" > windows-sig.json
+          SIG_FILE=$(ls src-tauri/target/release/bundle/nsis/*.nsis.zip.sig 2>/dev/null | head -1)
+          ZIP_FILE=$(ls src-tauri/target/release/bundle/nsis/*.nsis.zip 2>/dev/null | head -1)
+          if [ -n "$SIG_FILE" ] && [ -n "$ZIP_FILE" ]; then
+            SIG=$(cat "$SIG_FILE")
+            URL=$(basename "$ZIP_FILE")
+            echo "{\"sig\":\"$SIG\",\"url\":\"$URL\",\"ok\":true}" > windows-sig.json
+          else
+            echo '{"ok":false}' > windows-sig.json
+            echo "::warning::No .sig file found — TAURI_SIGNING_PRIVATE_KEY may not be set"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: windows-sig
@@ -147,9 +161,16 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb
       - name: Save Linux signature for latest.json
         run: |
-          SIG=$(cat src-tauri/target/release/bundle/appimage/*.AppImage.sig)
-          URL=$(ls src-tauri/target/release/bundle/appimage/*.AppImage | xargs basename)
-          echo "{\"sig\":\"$SIG\",\"url\":\"$URL\"}" > linux-sig.json
+          SIG_FILE=$(ls src-tauri/target/release/bundle/appimage/*.AppImage.sig 2>/dev/null | head -1)
+          IMG_FILE=$(ls src-tauri/target/release/bundle/appimage/*.AppImage 2>/dev/null | head -1)
+          if [ -n "$SIG_FILE" ] && [ -n "$IMG_FILE" ]; then
+            SIG=$(cat "$SIG_FILE")
+            URL=$(basename "$IMG_FILE")
+            echo "{\"sig\":\"$SIG\",\"url\":\"$URL\",\"ok\":true}" > linux-sig.json
+          else
+            echo '{"ok":false}' > linux-sig.json
+            echo "::warning::No .sig file found — TAURI_SIGNING_PRIVATE_KEY may not be set"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: linux-sig
@@ -167,51 +188,66 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
-        with: { name: macos-sig,   path: artifacts }
+        with: { name: macos-sig, path: artifacts }
       - uses: actions/download-artifact@v4
         with: { name: windows-sig, path: artifacts }
       - uses: actions/download-artifact@v4
-        with: { name: linux-sig,   path: artifacts }
+        with: { name: linux-sig, path: artifacts }
 
       - name: Generate latest.json
         env:
           TAG: ${{ github.ref_name }}
           REPO: pingsrl/json-gui
         run: |
-          VERSION="${TAG#v}"
-          BASE="https://github.com/$REPO/releases/download/$TAG"
+          python3 - <<'PYEOF'
+          import json, os, sys, subprocess
+          from datetime import datetime, timezone
 
-          MACOS_SIG=$(python3 -c "import json; d=json.load(open('artifacts/macos-sig.json')); print(d['sig'])")
-          MACOS_URL=$(python3 -c "import json; d=json.load(open('artifacts/macos-sig.json')); print(d['url'])")
+          tag  = os.environ["TAG"]
+          repo = os.environ["REPO"]
+          version = tag.lstrip("v")
+          base = f"https://github.com/{repo}/releases/download/{tag}"
+          pub_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-          WIN_SIG=$(python3 -c "import json; d=json.load(open('artifacts/windows-sig.json')); print(d['sig'])")
-          WIN_URL=$(python3 -c "import json; d=json.load(open('artifacts/windows-sig.json')); print(d['url'])")
+          def load(name):
+              d = json.load(open(f"artifacts/{name}"))
+              if not d.get("ok"):
+                  print(f"::warning::Signatures missing in {name} — latest.json will not include auto-update info")
+                  return None, None
+              return d["sig"], d["url"]
 
-          LINUX_SIG=$(python3 -c "import json; d=json.load(open('artifacts/linux-sig.json')); print(d['sig'])")
-          LINUX_URL=$(python3 -c "import json; d=json.load(open('artifacts/linux-sig.json')); print(d['url'])")
+          macos_sig, macos_url   = load("macos-sig.json")
+          win_sig,   win_url     = load("windows-sig.json")
+          linux_sig, linux_url   = load("linux-sig.json")
 
-          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          if not all([macos_sig, win_sig, linux_sig]):
+              print("::warning::One or more signatures are missing. Skipping latest.json generation.")
+              print("Set TAURI_SIGNING_PRIVATE_KEY in GitHub Secrets to enable auto-updates.")
+              sys.exit(0)
 
-          python3 - <<PYEOF
-          import json
           data = {
-            "version": "$VERSION",
+            "version": version,
             "notes": "",
-            "pub_date": "$PUB_DATE",
+            "pub_date": pub_date,
             "platforms": {
-              "darwin-aarch64": {"signature": "$MACOS_SIG", "url": "$BASE/$MACOS_URL"},
-              "darwin-x86_64":  {"signature": "$MACOS_SIG", "url": "$BASE/$MACOS_URL"},
-              "linux-x86_64":   {"signature": "$LINUX_SIG", "url": "$BASE/$LINUX_URL"},
-              "windows-x86_64": {"signature": "$WIN_SIG",   "url": "$BASE/$WIN_URL"},
+              "darwin-aarch64": {"signature": macos_sig, "url": f"{base}/{macos_url}"},
+              "darwin-x86_64":  {"signature": macos_sig, "url": f"{base}/{macos_url}"},
+              "linux-x86_64":   {"signature": linux_sig, "url": f"{base}/{linux_url}"},
+              "windows-x86_64": {"signature": win_sig,   "url": f"{base}/{win_url}"},
             }
           }
           with open("latest.json", "w") as f:
-            json.dump(data, f, indent=2)
-          print("latest.json generated")
+              json.dump(data, f, indent=2)
+          print("latest.json generated successfully")
           PYEOF
 
-      - name: Upload latest.json and publish release
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           draft: false
+
+      - name: Upload latest.json (if signatures were available)
+        if: hashFiles('latest.json') != ''
+        uses: softprops/action-gh-release@v2
+        with:
           files: latest.json
