@@ -1,201 +1,187 @@
-# JsonGUI — Piano di Sviluppo
+# JsonGUI — Piano di sviluppo
 
 ## Obiettivo
 
-App desktop cross-platform (Mac, Linux, Windows) per visualizzare e interrogare file JSON
-di grandi dimensioni (1 GB+) con interfaccia grafica moderna, senza mai caricare l'intero
-file in memoria.
+App desktop Tauri per aprire, esplorare e cercare all'interno di file JSON di grandi dimensioni con la massima efficienza. Interfaccia minimalista focalizzata su velocità e usabilità.
 
 ---
 
-## Stack Tecnologico
+## Stack tecnico
 
-| Layer | Tecnologia | Motivazione |
-|---|---|---|
-| Shell desktop | **Tauri 2** (Rust) | Leggero, cross-platform, accesso nativo FS |
-| UI Framework | **Svelte 5** | Reattivo, bundle piccolo, ottimo con Tauri |
-| Virtual scrolling | **TanStack Virtual** | Render solo righe visibili, RAM costante |
-| Editor query | **Monaco Editor** | Syntax highlight per SQL/jq/JSONPath |
-| Motore query | **DuckDB** (`duckdb-rs`) | SQL su JSON multi-GB senza caricare in RAM |
-| Parser streaming | **sonic-rs** | SIMD, ~4x più veloce di serde_json |
-| Query jq-style | **jaq** | Crate Rust jq-compatibile |
-| Query JSONPath | **jsonpath-rust** | Sintassi `$.store.book[*]` |
-| Styling | **Tailwind CSS 4** | Utility-first, build veloce |
+### Backend (Rust)
+- **Tauri 2.x** — shell nativa, IPC, accesso filesystem
+- **sonic-rs** (`cloudwego/sonic-rs`) — parsing JSON SIMD-accelerated, il più veloce disponibile in Rust per x86/ARM
+  - Fallback: **simd-json** se sonic-rs non supporta la piattaforma target
+  - Per file molto grandi (>100MB): parsing lazy/streaming con **json-event-parser** o **ijson**-style iteration
+- **serde_json** — solo per serializzazione di risposte IPC verso il frontend (strutture piccole)
+- **rayon** — parallelismo per ricerche su alberi grandi
+- **memmap2** — memory-mapped file I/O per file >50MB
+
+### Frontend
+- **React 18** + **TypeScript**
+- **Vite** come bundler
+- **Tailwind CSS** — styling utility-first
+- **@tanstack/react-virtual** — virtualizzazione lista/albero (gestisce migliaia di nodi senza lag)
+- **zustand** — state management leggero
 
 ---
 
 ## Architettura
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  Tauri 2 Shell                      │
-│                                                     │
-│  ┌──────────────────────┐  ┌─────────────────────┐  │
-│  │   Frontend (Svelte)  │  │   Backend (Rust)    │  │
-│  │                      │  │                     │  │
-│  │  • FileOpener        │  │  • FileManager      │  │
-│  │  • TreeView          │◄─►  • StreamingParser  │  │
-│  │  • QueryEditor       │  │  • DuckDBEngine     │  │
-│  │  • ResultTable       │  │  • JaqEngine        │  │
-│  │  • StatusBar         │  │  • JsonPathEngine   │  │
-│  │  • TanStack Virtual  │  │  • PaginatedResults │  │
-│  └──────────────────────┘  └─────────────────────┘  │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────┐
+│  Frontend (React)                   │
+│  ┌─────────┐  ┌──────────────────┐  │
+│  │TreeView │  │  SearchPanel     │  │
+│  │(virtual)│  │  (query + results│  │
+│  └────┬────┘  └────────┬─────────┘  │
+│       └───────┬────────┘            │
+│          Tauri IPC                  │
+└───────────────┼─────────────────────┘
+                │
+┌───────────────▼─────────────────────┐
+│  Backend (Rust)                     │
+│  ┌──────────┐  ┌───────────────┐    │
+│  │FileLoader│  │  JsonIndex    │    │
+│  │sonic-rs  │  │  (path→value) │    │
+│  └──────────┘  └───────────────┘    │
+│  ┌──────────────────────────────┐   │
+│  │  SearchEngine (rayon)        │   │
+│  └──────────────────────────────┘   │
+└─────────────────────────────────────┘
 ```
 
-### Flusso dati
+### Modello dati interno
 
-```
-File JSON (1GB+)
-     │
-     ▼
-StreamingParser (sonic-rs)          ← scan top-level keys, struttura
-     │
-     ├──► TreeView (struttura JSON navigabile)
-     │
-     ▼
-DuckDB / jaq / jsonpath-rust        ← query engine selezionato dall'utente
-     │
-     ▼
-PaginatedResults (chunk da 100-500 righe)
-     │
-     ▼
-TanStack Virtual (render solo righe visibili)
-```
+Il JSON viene parsato in una struttura **arena-allocated** piatta (`Vec<Node>`) con indici padre/figlio. Questo evita allocazioni ricorsive e rende la navigazione O(1).
 
----
-
-## Funzionalità
-
-### MVP (v0.1)
-
-- [ ] Apertura file JSON tramite dialog nativo
-- [ ] Tree view della struttura (lazy, non carica tutto)
-- [ ] Visualizzazione raw con virtual scrolling
-- [ ] Query SQL via DuckDB con risultati paginati
-- [ ] Esportazione risultati in JSON / CSV
-- [ ] Status bar con info file (dimensione, path, record count)
-
-### v0.2
-
-- [ ] Query jq-style via jaq
-- [ ] Query JSONPath via jsonpath-rust
-- [ ] Tab multipli per file diversi
-- [ ] Storico query
-- [ ] Syntax highlight errori query in tempo reale
-
-### v0.3
-
-- [ ] Supporto JSONL (JSON Lines / NDJSON)
-- [ ] Supporto JSON compresso (gzip)
-- [ ] Schema inference automatica
-- [ ] Salvataggio sessione (file aperti + query)
-- [ ] Formattazione / pretty-print sezione selezionata
-
-### Futuro (v1.0+)
-
-- [ ] Plugin query engine custom
-- [ ] Integrazione con file remoti (S3, HTTP)
-- [ ] Diff tra due file JSON
-- [ ] Visualizzazioni grafiche (chart su dati numerici)
-
----
-
-## Struttura Progetto
-
-```
-JsonGUI/
-├── src-tauri/                  # Backend Rust
-│   ├── src/
-│   │   ├── main.rs
-│   │   ├── commands/           # Comandi Tauri (IPC)
-│   │   │   ├── file.rs         # open_file, get_structure
-│   │   │   ├── query.rs        # run_query, get_page
-│   │   │   └── export.rs       # export_results
-│   │   ├── engine/
-│   │   │   ├── duckdb.rs       # DuckDB engine
-│   │   │   ├── jaq.rs          # jaq engine
-│   │   │   └── jsonpath.rs     # JSONPath engine
-│   │   └── parser/
-│   │       └── streaming.rs    # sonic-rs streaming parser
-│   └── Cargo.toml
-├── src/                        # Frontend Svelte
-│   ├── lib/
-│   │   ├── components/
-│   │   │   ├── FileOpener.svelte
-│   │   │   ├── TreeView.svelte
-│   │   │   ├── QueryEditor.svelte
-│   │   │   ├── ResultTable.svelte
-│   │   │   └── StatusBar.svelte
-│   │   └── stores/
-│   │       ├── file.ts
-│   │       └── query.ts
-│   ├── App.svelte
-│   └── main.ts
-├── PLAN.md
-├── package.json
-└── tauri.conf.json
+```rust
+struct Node {
+    id: u32,
+    parent: Option<u32>,
+    key: Option<StringId>,   // StringId = indice in string_pool
+    value: NodeValue,
+    children_start: u32,
+    children_len: u32,
+}
+enum NodeValue {
+    Object, Array,
+    Str(StringId), Num(f64), Bool(bool), Null,
+}
 ```
 
 ---
 
-## Principi Tecnici Fondamentali
+## Comandi Tauri IPC
 
-1. **Zero full-load** — il file JSON non viene mai caricato interamente in RAM
-2. **Paginazione lato Rust** — il frontend riceve max 500 righe alla volta
-3. **Thread separato per query** — la UI non si blocca mai durante l'elaborazione
-4. **Indice lazy** — alla prima apertura si scansiona solo la struttura top-level
-5. **IPC minimale** — si trasferisce solo ciò che la viewport mostra
+| Comando | Input | Output |
+|---|---|---|
+| `open_file` | `path: String` | `FileInfo { node_count, depth, size_bytes }` |
+| `get_children` | `node_id: u32, offset: u32, limit: u32` | `Vec<NodeDto>` |
+| `get_path` | `node_id: u32` | `String` (JSONPath) |
+| `search` | `query: SearchQuery` | `Vec<SearchResult>` |
+| `get_raw` | `node_id: u32` | `String` (JSON raw del sottoalbero) |
+| `expand_to` | `jsonpath: String` | `Vec<u32>` (ids da espandere) |
 
----
-
-## Priorità Sviluppo
-
-```
-Fase 1 — Scaffolding (3-4h)
-  └── Setup Tauri 2 + Svelte 5 + Tailwind
-  └── Layout base UI (sidebar + main + statusbar)
-  └── Apertura file dialog nativo
-
-Fase 2 — Core Engine (1-2 giorni)
-  └── Integrazione DuckDB + comando run_query
-  └── StreamingParser per tree view
-  └── ResultTable con TanStack Virtual
-
-Fase 3 — Query UX (1 giorno)
-  └── Monaco Editor per SQL
-  └── Selezione engine (SQL / jq / JSONPath)
-  └── Paginazione e navigazione risultati
-
-Fase 4 — Polish + Build (1 giorno)
-  └── Export risultati
-  └── Error handling e feedback utente
-  └── Build cross-platform (GitHub Actions)
+### SearchQuery
+```typescript
+interface SearchQuery {
+  text: string;          // testo da cercare
+  target: 'keys' | 'values' | 'both';
+  case_sensitive: boolean;
+  regex: boolean;
+  max_results: number;   // default 500
+}
 ```
 
 ---
 
-## Comandi di Sviluppo
+## UI — Layout
 
-```bash
-# Setup iniziale
-cargo install tauri-cli
-npm create tauri-app@latest JsonGUI -- --template svelte-ts
-
-# Dev
-npm run tauri dev
-
-# Build cross-platform
-npm run tauri build
 ```
+┌─────────────────────────────────────────────────┐
+│ [📂 Apri file]  path/al/file.json  [⟳]  [⚙]   │  ← Toolbar
+├────────────────────┬────────────────────────────┤
+│                    │ 🔍 [___________________]   │  ← Search bar
+│  Tree Explorer     │  ○ chiavi  ○ valori  ○ entrambi │
+│                    │  □ regex  □ case sensitive  │
+│  ▶ root (object)   ├────────────────────────────┤
+│    ▼ users (array) │ Risultati (243)             │
+│      ▶ 0 (object)  │  > users[0].name "Alice"   │
+│      ▶ 1 (object)  │  > users[1].name "Bob"     │
+│    ▶ config        │  ...                        │
+│                    │                             │
+├────────────────────┴────────────────────────────┤
+│ Nodi: 12.847  |  Profondità: 8  |  2.3 MB       │  ← Status bar
+└─────────────────────────────────────────────────┘
+```
+
+### Comportamenti chiave
+
+- **Click** su nodo → espande/collassa
+- **Click destro** → copia path / copia valore / copia sottoalbero JSON
+- **Hover** su valore lungo → tooltip con valore completo
+- **F** o **Cmd+F** → focus sulla search bar
+- **Frecce** → navigazione tastiera nel tree
+- Drag & drop file sulla finestra per aprirlo
+- I nodi vengono caricati **lazy**: solo i figli visibili sono richiesti al backend
 
 ---
 
-## Riferimenti
+## Fasi di sviluppo
 
-- [Tauri 2 Docs](https://tauri.app)
-- [DuckDB JSON Functions](https://duckdb.org/docs/data/json)
-- [sonic-rs crate](https://crates.io/crates/sonic-rs)
-- [jaq crate](https://crates.io/crates/jaq)
-- [TanStack Virtual](https://tanstack.com/virtual)
-- [Monaco Editor](https://microsoft.github.io/monaco-editor/)
+### Fase 1 — Core (MVP) ✅ completata 2026-03-15
+- [x] Setup Tauri 2 + React + Vite + Tailwind CSS
+- [x] Struttura arena `JsonIndex` con `Vec<Node>` e build_tree ricorsivo (`src-tauri/src/json_index.rs`)
+- [x] Comandi IPC: `open_file`, `get_children`, `get_path`, `get_raw` (`src-tauri/src/commands.rs`)
+- [x] TreeView con espansione lazy (caricamento figli on-demand) (`src/components/TreeNode.tsx`)
+- [x] Status bar con metadati file (nodi, dimensione, path)
+- [x] zustand store con state management (`src/store.ts`)
+- [x] TypeScript senza errori, `cargo check` OK
+- [x] sonic-rs — integrato in Fase 4 (2026-03-15); `cargo check` OK
+
+### Fase 2 — Ricerca ✅ completata 2026-03-15
+- [x] SearchEngine con rayon (parallelismo) nella funzione `JsonIndex::search`
+- [x] Ricerca su chiavi / valori / entrambi con opzione case-sensitive
+- [x] Pannello risultati con path JSONPath e preview valore
+- [x] Shortcut Cmd+F / Ctrl+F per focus search bar
+- [ ] Support regex via crate `regex` — non ancora implementato
+- [ ] `expand_to` per navigare automaticamente al risultato selezionato — non ancora implementato
+
+### Fase 3 — UX ✅ completata 2026-03-15
+- [x] Drag & drop apertura file (overlay visivo + Tauri `onDragDropEvent`)
+- [x] Click su risultato ricerca → espande albero e scrolla al nodo (`expand_to` IPC + highlight)
+- [x] Shortcut Cmd+F / Ctrl+F → focus search bar
+- [x] Navigazione da tastiera completa (ArrowUp/Down/Left/Right/Enter sul tree)
+- [x] Context menu click destro (copia path / copia valore / copia raw JSON)
+- [x] Cronologia file recenti (max 5, persistita in localStorage, dropdown in toolbar)
+- [ ] Tema chiaro/scuro (Tailwind dark mode)
+
+### Fase 4 — Performance avanzata (parziale)
+- [x] Integrazione sonic-rs al posto di serde_json per il parsing iniziale (SIMD NEON/AVX2)
+  - Nota: compilato e funzionante su macOS ARM (Apple Silicon) con NEON
+  - API compatibile con serde_json: `sonic_rs::from_str` restituisce `serde_json::Value`
+- [ ] Memory-mapped I/O per file >50MB
+- [ ] Parsing incrementale/streaming per file >200MB
+- [ ] Worker thread dedicato per non bloccare UI durante il parsing
+- [ ] Cache LRU dei nodi espansi
+
+---
+
+## Benchmark obiettivo
+
+| File | Dimensione | Target parse | Target search |
+|---|---|---|---|
+| Piccolo | <1 MB | <10ms | <5ms |
+| Medio | 10 MB | <150ms | <30ms |
+| Grande | 100 MB | <2s | <500ms |
+| XL | 500 MB | streaming | <3s |
+
+---
+
+## Note su sonic-rs
+
+- Richiede CPU con istruzione AVX2 (x86_64) o NEON (ARM/Apple Silicon) — entrambe presenti sui Mac moderni
+- API compatibile con serde_json per la maggior parte dei casi
+- Per il parsing lazy (get value by path senza parsare tutto) usare `sonic_rs::get` / `sonic_rs::pointer`
+- Valutare **gjson** (port Rust) per query JSONPath dirette su raw bytes se non è necessaria la struttura ad albero completa
