@@ -119,13 +119,16 @@ impl JsonIndex {
         let mut keys = StringPool::new();
         let mut temp_nodes: Vec<TempNode> = Vec::new();
 
-        // BFS queue: (serde_json::Value, parent Option<u32>, key Option<u32>)
-        let mut queue: VecDeque<(serde_json::Value, Option<u32>, Option<u32>)> = VecDeque::new();
-        queue.push_back((root_value, None, None));
+        // BFS queue: (value, parent, key, pre-assigned id)
+        // L'ID viene assegnato al momento dell'accodamento, non dell'elaborazione,
+        // così tutti i fratelli ricevono ID distinti anche prima di essere processati.
+        let mut next_id: u32 = 0;
+        let mut queue: VecDeque<(serde_json::Value, Option<u32>, Option<u32>, u32)> =
+            VecDeque::new();
+        queue.push_back((root_value, None, None, next_id));
+        next_id += 1;
 
-        while let Some((value, parent, key)) = queue.pop_front() {
-            let id = temp_nodes.len() as u32;
-
+        while let Some((value, parent, key, id)) = queue.pop_front() {
             let node_value = match &value {
                 serde_json::Value::Object(_) => NodeValue::Object,
                 serde_json::Value::Array(_) => NodeValue::Array,
@@ -147,17 +150,19 @@ impl JsonIndex {
                 serde_json::Value::Object(map) => {
                     for (k, v) in map {
                         let kid = keys.intern(&k);
-                        let child_id = temp_nodes.len() as u32;
+                        let child_id = next_id;
+                        next_id += 1;
                         temp_nodes[id as usize].children.push(child_id);
-                        queue.push_back((v, Some(id), Some(kid)));
+                        queue.push_back((v, Some(id), Some(kid), child_id));
                     }
                 }
                 serde_json::Value::Array(arr) => {
                     for (i, v) in arr.into_iter().enumerate() {
                         let kid = keys.intern(&i.to_string());
-                        let child_id = temp_nodes.len() as u32;
+                        let child_id = next_id;
+                        next_id += 1;
                         temp_nodes[id as usize].children.push(child_id);
-                        queue.push_back((v, Some(id), Some(kid)));
+                        queue.push_back((v, Some(id), Some(kid), child_id));
                     }
                 }
                 _ => {}
