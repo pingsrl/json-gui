@@ -1,115 +1,120 @@
-import { create } from 'zustand'
-import { invoke } from '@tauri-apps/api/core'
+import { create } from "zustand";
+import { invoke } from "@tauri-apps/api/core";
 
 export interface NodeDto {
-  id: number
-  key: string | null
-  value_type: string
-  value_preview: string
-  has_children: boolean
-  children_count: number
+  id: number;
+  key: string | null;
+  value_type: string;
+  value_preview: string;
+  has_children: boolean;
+  children_count: number;
 }
 
 export interface VNode {
-  node: NodeDto
-  depth: number
+  node: NodeDto;
+  depth: number;
 }
 
 export interface SearchResult {
-  node_id: number
-  path: string
-  key: string | null
-  value_preview: string
+  node_id: number;
+  path: string;
+  key: string | null;
+  value_preview: string;
 }
 
 interface FileInfo {
-  node_count: number
-  size_bytes: number
-  root_children: NodeDto[]
+  node_count: number;
+  size_bytes: number;
+  root_children: NodeDto[];
 }
 
 interface ExpandToResult {
-  expansions: [number, NodeDto[]][]
-  path: string
+  expansions: [number, NodeDto[]][];
+  path: string;
 }
 
-const MAX_RECENT = 5
-const MAX_CHILDREN_CACHE = 2000
+const MAX_RECENT = 5;
+const MAX_CHILDREN_CACHE = 2000;
 
 // Cache LRU semplice (FIFO con limite) per i figli già caricati
-const childrenCache = new Map<number, NodeDto[]>()
+const childrenCache = new Map<number, NodeDto[]>();
 
 // Cache a livello modulo (non reactive) per path e nodi noti
-const pathCache = new Map<number, string>()
-const nodeMapCache = new Map<number, NodeDto>()
+const pathCache = new Map<number, string>();
+const nodeMapCache = new Map<number, NodeDto>();
 
 function cacheSet(id: number, children: NodeDto[]) {
   if (childrenCache.size >= MAX_CHILDREN_CACHE) {
-    const firstKey = childrenCache.keys().next().value
-    if (firstKey !== undefined) childrenCache.delete(firstKey)
+    const firstKey = childrenCache.keys().next().value;
+    if (firstKey !== undefined) childrenCache.delete(firstKey);
   }
-  childrenCache.set(id, children)
+  childrenCache.set(id, children);
 }
 
 function loadRecentFiles(): string[] {
   try {
-    return JSON.parse(localStorage.getItem('recentFiles') ?? '[]')
+    return JSON.parse(localStorage.getItem("recentFiles") ?? "[]");
   } catch {
-    return []
+    return [];
   }
 }
 
 function buildVisibleNodes(
   rootChildren: NodeDto[],
-  expandedNodes: Map<number, NodeDto[]>,
+  expandedNodes: Map<number, NodeDto[]>
 ): VNode[] {
-  const result: VNode[] = []
+  const result: VNode[] = [];
   function traverse(nodes: NodeDto[], depth: number) {
     for (const node of nodes) {
-      result.push({ node, depth })
+      result.push({ node, depth });
       if (expandedNodes.has(node.id)) {
-        const children = expandedNodes.get(node.id)!
-        traverse(children, depth + 1)
+        const children = expandedNodes.get(node.id)!;
+        traverse(children, depth + 1);
       }
     }
   }
-  traverse(rootChildren, 0)
-  return result
+  traverse(rootChildren, 0);
+  return result;
 }
 
 export interface ContextMenuState {
-  x: number
-  y: number
-  nodeId: number
-  valueType: string
-  valuePreview: string
+  x: number;
+  y: number;
+  nodeId: number;
+  valueType: string;
+  valuePreview: string;
 }
 
 interface JsonStore {
-  filePath: string | null
-  nodeCount: number
-  sizeBytes: number
-  rootChildren: NodeDto[]
-  expandedNodes: Map<number, NodeDto[]>
-  selectedNodeId: number | null
-  selectedNode: NodeDto | null
-  selectedNodePath: string | null
-  focusedNodeId: number | null
-  visibleNodes: VNode[]
-  recentFiles: string[]
-  searchResults: SearchResult[]
-  searching: boolean
-  loading: boolean
-  contextMenu: ContextMenuState | null
-  openFile: (path: string) => Promise<void>
-  toggleNode: (nodeId: number) => Promise<void>
-  selectNode: (node: NodeDto) => Promise<void>
-  navigateToNode: (nodeId: number) => Promise<void>
-  setFocusedNode: (nodeId: number | null) => void
-  search: (query: string, target: string, caseSensitive: boolean, useRegex: boolean) => Promise<void>
-  clearSearch: () => void
-  showContextMenu: (cm: ContextMenuState) => void
-  hideContextMenu: () => void
+  filePath: string | null;
+  nodeCount: number;
+  sizeBytes: number;
+  rootChildren: NodeDto[];
+  expandedNodes: Map<number, NodeDto[]>;
+  selectedNodeId: number | null;
+  selectedNode: NodeDto | null;
+  selectedNodePath: string | null;
+  focusedNodeId: number | null;
+  visibleNodes: VNode[];
+  recentFiles: string[];
+  searchResults: SearchResult[];
+  searching: boolean;
+  loading: boolean;
+  contextMenu: ContextMenuState | null;
+  openFile: (path: string) => Promise<void>;
+  toggleNode: (nodeId: number) => Promise<void>;
+  selectNode: (node: NodeDto) => Promise<void>;
+  navigateToNode: (nodeId: number) => Promise<void>;
+  setFocusedNode: (nodeId: number | null) => void;
+  search: (
+    query: string,
+    target: string,
+    caseSensitive: boolean,
+    useRegex: boolean
+  ) => Promise<void>;
+  clearSearch: () => void;
+  showContextMenu: (cm: ContextMenuState) => void;
+  hideContextMenu: () => void;
 }
 
 export const useJsonStore = create<JsonStore>((set, get) => ({
@@ -130,23 +135,25 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   contextMenu: null,
 
   openFile: async (path: string) => {
-    set({ loading: true })
-    const info = await invoke<FileInfo>('open_file', { path }).finally(() => set({ loading: false }))
-    const expandedNodes = new Map<number, NodeDto[]>()
-    const visibleNodes = buildVisibleNodes(info.root_children, expandedNodes)
+    set({ loading: true });
+    const info = await invoke<FileInfo>("open_file", { path }).finally(() =>
+      set({ loading: false })
+    );
+    const expandedNodes = new Map<number, NodeDto[]>();
+    const visibleNodes = buildVisibleNodes(info.root_children, expandedNodes);
 
-    childrenCache.clear()
-    pathCache.clear()
-    nodeMapCache.clear()
+    childrenCache.clear();
+    pathCache.clear();
+    nodeMapCache.clear();
 
     // Popola nodeMapCache con root_children
     for (const n of info.root_children) {
-      nodeMapCache.set(n.id, n)
+      nodeMapCache.set(n.id, n);
     }
 
-    const prev = get().recentFiles.filter((f) => f !== path)
-    const recentFiles = [path, ...prev].slice(0, MAX_RECENT)
-    localStorage.setItem('recentFiles', JSON.stringify(recentFiles))
+    const prev = get().recentFiles.filter((f) => f !== path);
+    const recentFiles = [path, ...prev].slice(0, MAX_RECENT);
+    localStorage.setItem("recentFiles", JSON.stringify(recentFiles));
 
     set({
       filePath: path,
@@ -160,99 +167,109 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       focusedNodeId: null,
       visibleNodes,
       recentFiles,
-      searchResults: [],
-    })
+      searchResults: []
+    });
   },
 
   toggleNode: async (nodeId: number) => {
-    const { expandedNodes, rootChildren } = get()
-    let next: Map<number, NodeDto[]>
+    const { expandedNodes, rootChildren } = get();
+    let next: Map<number, NodeDto[]>;
     if (expandedNodes.has(nodeId)) {
-      next = new Map(expandedNodes)
-      next.delete(nodeId)
+      next = new Map(expandedNodes);
+      next.delete(nodeId);
     } else {
-      let children = childrenCache.get(nodeId)
+      let children = childrenCache.get(nodeId);
       if (!children) {
-        children = await invoke<NodeDto[]>('get_children', { nodeId })
-        cacheSet(nodeId, children)
+        children = await invoke<NodeDto[]>("get_children", { nodeId });
+        cacheSet(nodeId, children);
       }
       // Aggiungi i nuovi children a nodeMapCache
       for (const child of children) {
-        nodeMapCache.set(child.id, child)
+        nodeMapCache.set(child.id, child);
       }
-      next = new Map(expandedNodes)
-      next.set(nodeId, children)
+      next = new Map(expandedNodes);
+      next.set(nodeId, children);
     }
-    const visibleNodes = buildVisibleNodes(rootChildren, next)
-    set({ expandedNodes: next, visibleNodes })
+    const visibleNodes = buildVisibleNodes(rootChildren, next);
+    set({ expandedNodes: next, visibleNodes });
   },
 
   selectNode: async (node: NodeDto) => {
-    let path = pathCache.get(node.id)
+    let path = pathCache.get(node.id);
     if (!path) {
-      path = await invoke<string>('get_path', { nodeId: node.id })
-      pathCache.set(node.id, path)
+      path = await invoke<string>("get_path", { nodeId: node.id });
+      pathCache.set(node.id, path);
     }
-    set({ selectedNodeId: node.id, selectedNode: node, selectedNodePath: path, focusedNodeId: node.id })
+    set({
+      selectedNodeId: node.id,
+      selectedNode: node,
+      selectedNodePath: path,
+      focusedNodeId: node.id
+    });
   },
 
   setFocusedNode: (nodeId: number | null) => {
-    set({ focusedNodeId: nodeId })
+    set({ focusedNodeId: nodeId });
   },
 
-  search: async (query: string, target: string, caseSensitive: boolean, useRegex: boolean) => {
+  search: async (
+    query: string,
+    target: string,
+    caseSensitive: boolean,
+    useRegex: boolean
+  ) => {
     if (!query.trim()) {
-      get().clearSearch()
-      return
+      get().clearSearch();
+      return;
     }
-    set({ searching: true })
+    set({ searching: true });
     try {
-      const results = await invoke<SearchResult[]>('search', {
+      const results = await invoke<SearchResult[]>("search", {
         query: {
           text: query,
           target,
           case_sensitive: caseSensitive,
           regex: useRegex,
-          max_results: 500,
-        },
-      })
-      set({ searchResults: results, searching: false })
+          max_results: 500
+        }
+      });
+      set({ searchResults: results, searching: false });
     } catch (err) {
-      console.error('Search error:', err)
-      set({ searching: false })
+      console.error("Search error:", err);
+      set({ searching: false });
     }
   },
 
   navigateToNode: async (nodeId: number) => {
-    const result = await invoke<ExpandToResult>('expand_to', { nodeId })
-    const { expandedNodes, rootChildren } = get()
-    const next = new Map(expandedNodes)
+    const result = await invoke<ExpandToResult>("expand_to", { nodeId });
+    const { expandedNodes, rootChildren } = get();
+    const next = new Map(expandedNodes);
     for (const [id, children] of result.expansions) {
-      next.set(id, children)
-      cacheSet(id, children)
+      next.set(id, children);
+      cacheSet(id, children);
       // Popola nodeMapCache con i figli espansi
       for (const child of children) {
-        nodeMapCache.set(child.id, child)
+        nodeMapCache.set(child.id, child);
       }
     }
     // Salva il path nel cache
-    pathCache.set(nodeId, result.path)
+    pathCache.set(nodeId, result.path);
 
-    const visibleNodes = buildVisibleNodes(rootChildren, next)
+    const visibleNodes = buildVisibleNodes(rootChildren, next);
     // Trova il NodeDto del nodo target da nodeMapCache
-    const targetNode = nodeMapCache.get(nodeId) ?? null
+    const targetNode = nodeMapCache.get(nodeId) ?? null;
     set({
       expandedNodes: next,
       selectedNodeId: nodeId,
       selectedNode: targetNode,
       selectedNodePath: result.path,
       focusedNodeId: nodeId,
-      visibleNodes,
-    })
+      visibleNodes
+    });
   },
 
   clearSearch: () => set({ searchResults: [], searching: false }),
 
   showContextMenu: (cm: ContextMenuState) => set({ contextMenu: cm }),
-  hideContextMenu: () => set({ contextMenu: null }),
-}))
+  hideContextMenu: () => set({ contextMenu: null })
+}));
