@@ -45,6 +45,19 @@ jobs:
         with:
           workspaces: src-tauri
       - run: npm ci --legacy-peer-deps
+      - name: Set version from tag
+        run: |
+          node -e "
+            const fs = require('fs');
+            const v = process.env.GITHUB_REF_NAME.replace(/^v/, '');
+            const t = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            t.version = v;
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(t, null, 2));
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            p.version = v;
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2));
+            console.log('Version set to', v);
+          "
       - name: Build universal macOS app
         run: npm run tauri build -- --target universal-apple-darwin
         env:
@@ -92,6 +105,19 @@ jobs:
         with:
           workspaces: src-tauri
       - run: npm ci --legacy-peer-deps
+      - name: Set version from tag
+        run: |
+          node -e "
+            const fs = require('fs');
+            const v = process.env.GITHUB_REF_NAME.replace(/^v/, '');
+            const t = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            t.version = v;
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(t, null, 2));
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            p.version = v;
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2));
+            console.log('Version set to', v);
+          "
       - name: Build Windows app
         run: npm run tauri build
         env:
@@ -148,6 +174,19 @@ jobs:
         with:
           workspaces: src-tauri
       - run: npm ci --legacy-peer-deps
+      - name: Set version from tag
+        run: |
+          node -e "
+            const fs = require('fs');
+            const v = process.env.GITHUB_REF_NAME.replace(/^v/, '');
+            const t = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            t.version = v;
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(t, null, 2));
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            p.version = v;
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2));
+            console.log('Version set to', v);
+          "
       - name: Build Linux app
         run: npm run tauri build
         env:
