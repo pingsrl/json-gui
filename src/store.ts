@@ -59,7 +59,7 @@ function loadRecentFiles(): string[] {
   }
 }
 
-function buildVisibleNodes(
+export function buildVisibleNodes(
   rootChildren: NodeDto[],
   expandedNodes: Map<number, NodeDto[]>
 ): VNode[] {

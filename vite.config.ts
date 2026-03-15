@@ -12,4 +12,13 @@ export default defineConfig({
       ignored: ['**/src-tauri/**'],
     },
   },
+  test: {
+    environment: 'node',
+    globals: true,
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.ts', 'src/**/*.tsx'],
+      exclude: ['src/main.tsx'],
+    },
+  },
 })

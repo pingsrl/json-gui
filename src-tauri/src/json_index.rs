@@ -432,3 +432,236 @@ fn json_escape_into(out: &mut String, s: &str) {
         }
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idx(json: &str) -> JsonIndex {
+        JsonIndex::from_str(json).expect("parse failed")
+    }
+
+    // ── BFS correctness ───────────────────────────────────────────────────────
+
+    #[test]
+    fn object_children_have_unique_ids() {
+        let index = idx(r#"{"a":1,"b":2,"c":3}"#);
+        let root_children = index.get_children_slice(index.root);
+        let ids: Vec<u32> = root_children.to_vec();
+        let unique: std::collections::HashSet<u32> = ids.iter().cloned().collect();
+        assert_eq!(ids.len(), unique.len(), "fratelli con lo stesso ID");
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn array_children_have_unique_ids() {
+        let index = idx(r#"[10,20,30,40]"#);
+        let root_children = index.get_children_slice(index.root);
+        let ids: Vec<u32> = root_children.to_vec();
+        let unique: std::collections::HashSet<u32> = ids.iter().cloned().collect();
+        assert_eq!(ids.len(), unique.len(), "elementi array con lo stesso ID");
+        assert_eq!(ids.len(), 4);
+    }
+
+    #[test]
+    fn nested_object_children_unique_ids() {
+        // verifica il bug BFS per nodi con più figli a più livelli
+        let index = idx(r#"{"x":{"a":1,"b":2},"y":{"c":3,"d":4}}"#);
+        let all_ids: Vec<u32> = (0..index.nodes.len() as u32).collect();
+        let unique: std::collections::HashSet<u32> = all_ids.iter().cloned().collect();
+        assert_eq!(all_ids.len(), unique.len());
+    }
+
+    #[test]
+    fn root_has_correct_child_count() {
+        let index = idx(r#"{"a":1,"b":2,"c":3,"d":4,"e":5}"#);
+        assert_eq!(index.get_children_slice(index.root).len(), 5);
+    }
+
+    // ── get_path ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn path_root_object() {
+        let index = idx(r#"{"name":"test"}"#);
+        let name_id = index.get_children_slice(index.root)[0];
+        assert_eq!(index.get_path(name_id), "$.name");
+    }
+
+    #[test]
+    fn path_nested() {
+        let index = idx(r#"{"user":{"age":30}}"#);
+        let user_id = index.get_children_slice(index.root)[0];
+        let age_id = index.get_children_slice(user_id)[0];
+        assert_eq!(index.get_path(age_id), "$.user.age");
+    }
+
+    #[test]
+    fn path_array_element() {
+        let index = idx(r#"{"items":[1,2,3]}"#);
+        let items_id = index.get_children_slice(index.root)[0];
+        let second = index.get_children_slice(items_id)[1];
+        assert_eq!(index.get_path(second), "$.items.1");
+    }
+
+    #[test]
+    fn path_root_node_is_dollar() {
+        let index = idx(r#"{"x":1}"#);
+        assert_eq!(index.get_path(index.root), "$");
+    }
+
+    // ── build_raw (round-trip) ────────────────────────────────────────────────
+
+    fn normalize(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn roundtrip_simple_object() {
+        let src = r#"{"name":"Alice","age":30}"#;
+        let index = idx(src);
+        let raw = index.build_raw(index.root);
+        assert_eq!(normalize(&raw), normalize(src));
+    }
+
+    #[test]
+    fn roundtrip_nested() {
+        let src = r#"{"a":{"b":{"c":42}}}"#;
+        let index = idx(src);
+        assert_eq!(normalize(&index.build_raw(index.root)), normalize(src));
+    }
+
+    #[test]
+    fn roundtrip_array() {
+        let src = r#"[1,2,3,"hello",true,null]"#;
+        let index = idx(src);
+        assert_eq!(normalize(&index.build_raw(index.root)), normalize(src));
+    }
+
+    #[test]
+    fn roundtrip_empty_object() {
+        let src = r#"{}"#;
+        let index = idx(src);
+        assert_eq!(index.build_raw(index.root), "{}");
+    }
+
+    #[test]
+    fn roundtrip_empty_array() {
+        let src = r#"[]"#;
+        let index = idx(src);
+        assert_eq!(index.build_raw(index.root), "[]");
+    }
+
+    #[test]
+    fn roundtrip_string_escaping() {
+        let src = r#"{"msg":"hello\nworld\t\"quoted\""}"#;
+        let index = idx(src);
+        assert_eq!(normalize(&index.build_raw(index.root)), normalize(src));
+    }
+
+    #[test]
+    fn roundtrip_subtree() {
+        let src = r#"{"outer":{"inner":[1,2,3]}}"#;
+        let index = idx(src);
+        let outer_id = index.get_children_slice(index.root)[0];
+        let inner_id = index.get_children_slice(outer_id)[0];
+        assert_eq!(normalize(&index.build_raw(inner_id)), normalize("[1,2,3]"));
+    }
+
+    // ── search ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn search_by_value() {
+        let index = idx(r#"{"name":"Alice","city":"Rome"}"#);
+        let results = index.search("Alice", "values", false, false, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, "$.name");
+    }
+
+    #[test]
+    fn search_by_key() {
+        let index = idx(r#"{"username":"bob","email":"b@b.com"}"#);
+        let results = index.search("email", "keys", false, false, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, "$.email");
+    }
+
+    #[test]
+    fn search_case_insensitive() {
+        let index = idx(r#"{"msg":"Hello World"}"#);
+        let results = index.search("hello", "values", false, false, 10);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_case_sensitive_no_match() {
+        let index = idx(r#"{"msg":"Hello World"}"#);
+        let results = index.search("hello", "values", true, false, 10);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn search_regex() {
+        let index = idx(r#"{"a":"foo123","b":"bar456","c":"baz"}"#);
+        let results = index.search(r"\d+", "values", false, true, 10);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn search_max_results() {
+        let arr: String = (0..20).map(|i| format!("\"item{}\"", i)).collect::<Vec<_>>().join(",");
+        let json = format!("[{}]", arr);
+        let index = idx(&json);
+        let results = index.search("item", "values", false, false, 5);
+        assert_eq!(results.len(), 5);
+    }
+
+    #[test]
+    fn search_no_results() {
+        let index = idx(r#"{"a":"hello"}"#);
+        let results = index.search("xyz", "both", false, false, 10);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn search_both_keys_and_values() {
+        let index = idx(r#"{"target":"other","other":"value"}"#);
+        let results = index.search("other", "both", false, false, 10);
+        // "other" appare come chiave di "other" e come valore di "target"
+        assert_eq!(results.len(), 2);
+    }
+
+    // ── node values ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn node_types_correct() {
+        let index = idx(r#"{"s":"hello","n":42,"b":true,"null":null,"arr":[],"obj":{}}"#);
+        let children = index.get_children_slice(index.root);
+        let type_of = |id: u32| match &index.nodes[id as usize].value {
+            NodeValue::Str(_) => "string",
+            NodeValue::Num(_) => "number",
+            NodeValue::Bool(_) => "bool",
+            NodeValue::Null => "null",
+            NodeValue::Array => "array",
+            NodeValue::Object => "object",
+        };
+        let keys: Vec<&str> = children
+            .iter()
+            .map(|&id| index.keys.get(index.nodes[id as usize].key.unwrap()))
+            .collect();
+        assert_eq!(type_of(children[keys.iter().position(|&k| k == "s").unwrap()]), "string");
+        assert_eq!(type_of(children[keys.iter().position(|&k| k == "n").unwrap()]), "number");
+        assert_eq!(type_of(children[keys.iter().position(|&k| k == "b").unwrap()]), "bool");
+        assert_eq!(type_of(children[keys.iter().position(|&k| k == "null").unwrap()]), "null");
+        assert_eq!(type_of(children[keys.iter().position(|&k| k == "arr").unwrap()]), "array");
+        assert_eq!(type_of(children[keys.iter().position(|&k| k == "obj").unwrap()]), "object");
+    }
+
+    #[test]
+    fn string_pool_deduplicates_keys() {
+        let index = idx(r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#);
+        // "name" deve essere internato una volta sola
+        assert_eq!(index.keys.strings.iter().filter(|s| s.as_str() == "name").count(), 1);
+    }
+}
