@@ -1,5 +1,5 @@
 import { type FC } from "react";
-import { useJsonStore } from "../store";
+import { type NodeDto, useJsonStore } from "../store";
 
 const TYPE_BADGE: Record<string, string> = {
   string:
@@ -34,8 +34,54 @@ function Row({
   );
 }
 
+function NodeRow({
+  node,
+  isSelected,
+  onClick
+}: {
+  node: NodeDto;
+  isSelected: boolean;
+  onClick: () => void;
+}) {
+  const badge = TYPE_BADGE[node.value_type] ?? TYPE_BADGE.null;
+  return (
+    <div
+      onClick={onClick}
+      className={`px-3 py-1.5 border-b border-gray-100 dark:border-gray-800 cursor-pointer flex items-center gap-1.5 min-w-0 ${
+        isSelected
+          ? "bg-blue-50 dark:bg-blue-900/20"
+          : "hover:bg-gray-50 dark:hover:bg-gray-800/50"
+      }`}
+    >
+      {node.key !== null && (
+        <span
+          className={`text-xs font-mono flex-shrink-0 ${
+            isSelected
+              ? "text-blue-700 dark:text-blue-300 font-semibold"
+              : "text-gray-700 dark:text-gray-300"
+          }`}
+        >
+          {node.key}
+        </span>
+      )}
+      <span className={`text-xs px-1 py-px rounded flex-shrink-0 ${badge}`}>
+        {node.value_type}
+      </span>
+      <span className="text-xs font-mono text-gray-500 dark:text-gray-400 truncate">
+        {node.value_preview}
+      </span>
+    </div>
+  );
+}
+
 export const PropertiesPanel: FC = () => {
-  const { selectedNode, selectedNodePath, expandedNodes } = useJsonStore();
+  const {
+    selectedNode,
+    selectedNodePath,
+    expandedNodes,
+    rootChildren,
+    navigateToNode
+  } = useJsonStore();
 
   if (!selectedNode) {
     return (
@@ -45,11 +91,23 @@ export const PropertiesPanel: FC = () => {
     );
   }
 
+  // Trova i fratelli: cerca nei figli di ogni nodo espanso oppure nei rootChildren
+  let siblings: NodeDto[] | null = null;
+  for (const children of expandedNodes.values()) {
+    if (children.some((c) => c.id === selectedNode.id)) {
+      siblings = children;
+      break;
+    }
+  }
+  if (!siblings && rootChildren.some((c) => c.id === selectedNode.id)) {
+    siblings = rootChildren;
+  }
+
   const badge = TYPE_BADGE[selectedNode.value_type] ?? TYPE_BADGE.null;
-  const children = expandedNodes.get(selectedNode.id);
+  const ownChildren = expandedNodes.get(selectedNode.id);
 
   return (
-    <div className="flex flex-col h-full overflow-auto">
+    <div className="flex flex-col h-full overflow-hidden">
       {/* Header */}
       <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 flex items-center gap-2 flex-shrink-0">
         <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${badge}`}>
@@ -60,64 +118,66 @@ export const PropertiesPanel: FC = () => {
         </span>
       </div>
 
-      {/* Path */}
-      {selectedNodePath && (
-        <Row label="Path">
-          <span className="text-blue-600 dark:text-blue-400">
-            {selectedNodePath}
-          </span>
-        </Row>
-      )}
-
-      {/* Valore */}
-      {selectedNode.value_type !== "object" &&
-        selectedNode.value_type !== "array" && (
-          <Row label="Valore">{selectedNode.value_preview}</Row>
+      <div className="overflow-auto flex-1 flex flex-col">
+        {/* Path */}
+        {selectedNodePath && (
+          <Row label="Path">
+            <span className="text-blue-600 dark:text-blue-400">
+              {selectedNodePath}
+            </span>
+          </Row>
         )}
 
-      {/* Dimensione per object/array */}
-      {(selectedNode.value_type === "object" ||
-        selectedNode.value_type === "array") && (
-        <Row
-          label={selectedNode.value_type === "object" ? "Chiavi" : "Elementi"}
-        >
-          {selectedNode.children_count.toLocaleString()}
-        </Row>
-      )}
+        {/* Valore */}
+        {selectedNode.value_type !== "object" &&
+          selectedNode.value_type !== "array" && (
+            <Row label="Valore">{selectedNode.value_preview}</Row>
+          )}
 
-      {/* Figli espansi */}
-      {children && children.length > 0 && (
-        <div className="flex-1 overflow-auto">
-          <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-100 dark:border-gray-800 sticky top-0 bg-white dark:bg-gray-900">
-            Figli ({children.length})
+        {/* Dimensione per object/array */}
+        {(selectedNode.value_type === "object" ||
+          selectedNode.value_type === "array") && (
+          <Row
+            label={selectedNode.value_type === "object" ? "Chiavi" : "Elementi"}
+          >
+            {selectedNode.children_count.toLocaleString()}
+          </Row>
+        )}
+
+        {/* Proprietà sorelle */}
+        {siblings && siblings.length > 1 && (
+          <div className="flex flex-col min-h-0">
+            <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-100 dark:border-gray-800 bg-white dark:bg-gray-900 flex-shrink-0">
+              Proprietà sorelle ({siblings.length})
+            </div>
+            {siblings.map((sib) => (
+              <NodeRow
+                key={sib.id}
+                node={sib}
+                isSelected={sib.id === selectedNode.id}
+                onClick={() => navigateToNode(sib.id)}
+              />
+            ))}
           </div>
-          {children.map((child) => {
-            const childBadge = TYPE_BADGE[child.value_type] ?? TYPE_BADGE.null;
-            return (
-              <div
+        )}
+
+        {/* Figli espansi */}
+        {ownChildren && ownChildren.length > 0 && (
+          <div className="flex flex-col min-h-0">
+            <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-100 dark:border-gray-800 bg-white dark:bg-gray-900 flex-shrink-0">
+              Figli ({ownChildren.length})
+            </div>
+            {ownChildren.map((child) => (
+              <NodeRow
                 key={child.id}
-                className="px-3 py-1.5 border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50"
-              >
-                <div className="flex items-center gap-1.5 min-w-0">
-                  {child.key !== null && (
-                    <span className="text-xs font-mono text-gray-700 dark:text-gray-300 flex-shrink-0">
-                      {child.key}
-                    </span>
-                  )}
-                  <span
-                    className={`text-xs px-1 py-px rounded flex-shrink-0 ${childBadge}`}
-                  >
-                    {child.value_type}
-                  </span>
-                  <span className="text-xs font-mono text-gray-500 dark:text-gray-400 truncate">
-                    {child.value_preview}
-                  </span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+                node={child}
+                isSelected={false}
+                onClick={() => navigateToNode(child.id)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 };
