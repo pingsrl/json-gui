@@ -1,4 +1,4 @@
-![CI](https://github.com/g3z/JsonGUI/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/pingsrl/json-gui/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 # JsonGUI
