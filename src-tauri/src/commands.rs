@@ -1,7 +1,40 @@
 use crate::json_index::{JsonIndex, NodeValue};
 use serde::{Deserialize, Serialize};
+use std::io::{BufReader, Read};
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{Emitter, State};
+
+/// Wrapper attorno a un `Read` che emette una callback ogni volta che la percentuale avanza.
+struct ProgressReader<R: Read, F: Fn(u8)> {
+    inner: R,
+    bytes_read: u64,
+    total_bytes: u64,
+    last_percent: u8,
+    progress_cb: F,
+}
+
+impl<R: Read, F: Fn(u8)> ProgressReader<R, F> {
+    fn new(inner: R, total_bytes: u64, progress_cb: F) -> Self {
+        Self { inner, bytes_read: 0, total_bytes, last_percent: 0, progress_cb }
+    }
+}
+
+impl<R: Read, F: Fn(u8)> Read for ProgressReader<R, F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read += n as u64;
+        let percent = if self.total_bytes > 0 {
+            ((self.bytes_read * 100) / self.total_bytes).min(100) as u8
+        } else {
+            0
+        };
+        if percent != self.last_percent {
+            (self.progress_cb)(percent);
+            self.last_percent = percent;
+        }
+        Ok(n)
+    }
+}
 
 pub struct AppState {
     pub index: Mutex<Option<JsonIndex>>,
@@ -82,11 +115,39 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
     }
 }
 
+const STREAMING_THRESHOLD: u64 = 200 * 1024 * 1024; // 200 MB
+
 #[tauri::command]
-pub async fn open_file(path: String, state: State<'_, AppState>) -> Result<FileInfo, String> {
-    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let size_bytes = content.len();
-    let index = JsonIndex::from_str(&content)?;
+pub async fn open_file(
+    path: String,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<FileInfo, String> {
+    let path_clone = path.clone();
+    let app_clone = app.clone();
+
+    let (index, size_bytes) = tauri::async_runtime::spawn_blocking(move || {
+        let file_size = std::fs::metadata(&path_clone)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let index = if file_size > STREAMING_THRESHOLD {
+            // File >200MB: streaming con progress events
+            let file =
+                std::fs::File::open(&path_clone).map_err(|e| e.to_string())?;
+            let reader = ProgressReader::new(BufReader::new(file), file_size, move |pct| {
+                app_clone.emit("parse-progress", pct).ok();
+            });
+            JsonIndex::from_reader(reader)
+        } else {
+            JsonIndex::from_file(&path_clone)
+        };
+
+        index.map(|idx| (idx, file_size as usize))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
     let node_count = index.nodes.len();
     let root_children: Vec<NodeDto> = index.nodes[index.root as usize]
         .children

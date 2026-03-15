@@ -24,6 +24,18 @@ interface FileInfo {
 }
 
 const MAX_RECENT = 5
+const MAX_CHILDREN_CACHE = 2000
+
+// Cache LRU semplice (FIFO con limite) per i figli già caricati
+const childrenCache = new Map<number, NodeDto[]>()
+
+function cacheSet(id: number, children: NodeDto[]) {
+  if (childrenCache.size >= MAX_CHILDREN_CACHE) {
+    const firstKey = childrenCache.keys().next().value
+    if (firstKey !== undefined) childrenCache.delete(firstKey)
+  }
+  childrenCache.set(id, children)
+}
 
 function loadRecentFiles(): string[] {
   try {
@@ -63,11 +75,12 @@ interface JsonStore {
   recentFiles: string[]
   searchResults: SearchResult[]
   searching: boolean
+  loading: boolean
   openFile: (path: string) => Promise<void>
   toggleNode: (nodeId: number) => Promise<void>
   navigateToNode: (nodeId: number) => Promise<void>
   setFocusedNode: (nodeId: number | null) => void
-  search: (query: string, target: string, caseSensitive: boolean) => Promise<void>
+  search: (query: string, target: string, caseSensitive: boolean, useRegex: boolean) => Promise<void>
   clearSearch: () => void
 }
 
@@ -83,13 +96,15 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   recentFiles: loadRecentFiles(),
   searchResults: [],
   searching: false,
+  loading: false,
 
   openFile: async (path: string) => {
-    const info = await invoke<FileInfo>('open_file', { path })
+    set({ loading: true })
+    const info = await invoke<FileInfo>('open_file', { path }).finally(() => set({ loading: false }))
     const expandedNodes = new Map<number, NodeDto[]>()
     const visibleNodes = buildVisibleNodes(info.root_children, expandedNodes)
+    childrenCache.clear()
 
-    // Update recent files
     const prev = get().recentFiles.filter((f) => f !== path)
     const recentFiles = [path, ...prev].slice(0, MAX_RECENT)
     localStorage.setItem('recentFiles', JSON.stringify(recentFiles))
@@ -115,7 +130,11 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       next = new Map(expandedNodes)
       next.delete(nodeId)
     } else {
-      const children = await invoke<NodeDto[]>('get_children', { nodeId })
+      let children = childrenCache.get(nodeId)
+      if (!children) {
+        children = await invoke<NodeDto[]>('get_children', { nodeId })
+        cacheSet(nodeId, children)
+      }
       next = new Map(expandedNodes)
       next.set(nodeId, children)
     }
@@ -127,7 +146,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     set({ focusedNodeId: nodeId })
   },
 
-  search: async (query: string, target: string, caseSensitive: boolean) => {
+  search: async (query: string, target: string, caseSensitive: boolean, useRegex: boolean) => {
     if (!query.trim()) {
       get().clearSearch()
       return
@@ -139,7 +158,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
           text: query,
           target,
           case_sensitive: caseSensitive,
-          regex: false,
+          regex: useRegex,
           max_results: 500,
         },
       })
@@ -156,6 +175,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     const next = new Map(expandedNodes)
     for (const [id, children] of expansions) {
       next.set(id, children)
+      cacheSet(id, children)
     }
     const visibleNodes = buildVisibleNodes(rootChildren, next)
     set({ expandedNodes: next, selectedNodeId: nodeId, focusedNodeId: nodeId, visibleNodes })

@@ -145,8 +145,8 @@ interface SearchQuery {
 - [x] Ricerca su chiavi / valori / entrambi con opzione case-sensitive
 - [x] Pannello risultati con path JSONPath e preview valore
 - [x] Shortcut Cmd+F / Ctrl+F per focus search bar
-- [ ] Support regex via crate `regex` — non ancora implementato
-- [ ] `expand_to` per navigare automaticamente al risultato selezionato — non ancora implementato
+- [x] Support regex via crate `regex` — implementato in `json_index.rs` con `Regex::new`, checkbox UI in `App.tsx`
+- [x] `expand_to` per navigare automaticamente al risultato selezionato — implementato in `commands.rs` + `store.ts`
 
 ### Fase 3 — UX ✅ completata 2026-03-15
 - [x] Drag & drop apertura file (overlay visivo + Tauri `onDragDropEvent`)
@@ -155,16 +155,16 @@ interface SearchQuery {
 - [x] Navigazione da tastiera completa (ArrowUp/Down/Left/Right/Enter sul tree)
 - [x] Context menu click destro (copia path / copia valore / copia raw JSON)
 - [x] Cronologia file recenti (max 5, persistita in localStorage, dropdown in toolbar)
-- [ ] Tema chiaro/scuro (Tailwind dark mode)
+- [x] Tema chiaro/scuro — `@custom-variant dark` in `index.css`, toggle Sun/Moon in toolbar, persistito in localStorage
 
-### Fase 4 — Performance avanzata (parziale)
+### Fase 4 — Performance avanzata ✅ completata 2026-03-15
 - [x] Integrazione sonic-rs al posto di serde_json per il parsing iniziale (SIMD NEON/AVX2)
   - Nota: compilato e funzionante su macOS ARM (Apple Silicon) con NEON
   - API compatibile con serde_json: `sonic_rs::from_str` restituisce `serde_json::Value`
-- [ ] Memory-mapped I/O per file >50MB
-- [ ] Parsing incrementale/streaming per file >200MB
-- [ ] Worker thread dedicato per non bloccare UI durante il parsing
-- [ ] Cache LRU dei nodi espansi
+- [x] Memory-mapped I/O per file >50MB — `JsonIndex::from_file` con `memmap2` in `json_index.rs`
+- [x] Parsing streaming per file >200MB — `JsonIndex::from_reader` con `serde_json::from_reader` (no allocazione stringa intera); `ProgressReader` in `commands.rs` emette eventi Tauri `parse-progress` (0-100%); progress bar in `App.tsx`
+- [x] Worker thread dedicato per non bloccare UI — `open_file` usa `tauri::async_runtime::spawn_blocking` in `commands.rs`
+- [x] Cache LRU dei nodi espansi — Map FIFO con limite 2000 in `store.ts` (`childrenCache`)
 
 ---
 

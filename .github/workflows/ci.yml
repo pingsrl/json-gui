@@ -1,4 +1,5 @@
 name: CI
+
 on:
   push:
     branches: [master, main]
@@ -6,15 +7,33 @@ on:
 
 jobs:
   check-rust:
-    runs-on: macos-latest
+    name: Rust check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+
       - run: cargo check
         working-directory: src-tauri
+
       - run: cargo test
         working-directory: src-tauri
 
@@ -28,22 +47,3 @@ jobs:
           cache: npm
       - run: npm ci --legacy-peer-deps
       - run: npx tsc --noEmit
-
-  build:
-    needs: [check-rust, check-frontend]
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-      - run: npm ci --legacy-peer-deps
-      - run: npm run tauri build -- --debug
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ""
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""

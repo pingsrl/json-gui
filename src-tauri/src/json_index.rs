@@ -1,5 +1,8 @@
+use memmap2::Mmap;
 use rayon::prelude::*;
+use regex::Regex;
 use sonic_rs;
+use std::fs::File;
 
 #[derive(Debug, Clone)]
 pub enum NodeValue {
@@ -30,6 +33,30 @@ impl JsonIndex {
         let value: serde_json::Value = sonic_rs::from_str(json)
             .map_err(|e| e.to_string())?;
 
+        let mut nodes: Vec<Node> = Vec::new();
+        let root = Self::build_tree(&value, None, None, &mut nodes);
+        Ok(JsonIndex { nodes, root })
+    }
+
+    /// Carica da file, usando memory-map per file 50-200MB, streaming per file >200MB.
+    pub fn from_file(path: &str) -> Result<Self, String> {
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        let size = metadata.len();
+        if size > 50 * 1024 * 1024 {
+            let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
+            let json = std::str::from_utf8(&mmap).map_err(|e| e.to_string())?;
+            Self::from_str(json)
+        } else {
+            let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            Self::from_str(&content)
+        }
+    }
+
+    /// Parsing streaming da qualsiasi reader (usato per file >200MB con progress callback).
+    pub fn from_reader<R: std::io::Read>(reader: R) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_reader(reader).map_err(|e| e.to_string())?;
         let mut nodes: Vec<Node> = Vec::new();
         let root = Self::build_tree(&value, None, None, &mut nodes);
         Ok(JsonIndex { nodes, root })
@@ -84,63 +111,95 @@ impl JsonIndex {
         query: &str,
         target: &str,
         case_sensitive: bool,
-        _use_regex: bool,
+        use_regex: bool,
         max_results: usize,
     ) -> Vec<(u32, String)> {
-        let query_lower = if case_sensitive {
-            query.to_string()
+        let results: Vec<(u32, String)> = if use_regex {
+            let pattern = if case_sensitive {
+                query.to_string()
+            } else {
+                format!("(?i){}", query)
+            };
+            let re = match Regex::new(&pattern) {
+                Ok(r) => r,
+                Err(_) => return vec![],
+            };
+            self.nodes
+                .par_iter()
+                .filter_map(|node| {
+                    let matches_key = (target == "keys" || target == "both")
+                        && node.key.as_ref().map(|k| re.is_match(k)).unwrap_or(false);
+
+                    let matches_value = (target == "values" || target == "both")
+                        && match &node.value {
+                            NodeValue::Str(s) => re.is_match(s),
+                            NodeValue::Num(n) => re.is_match(&n.to_string()),
+                            NodeValue::Bool(b) => re.is_match(&b.to_string()),
+                            _ => false,
+                        };
+
+                    if matches_key || matches_value {
+                        Some((node.id, self.get_path(node.id)))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         } else {
-            query.to_lowercase()
-        };
+            let query_lower = if case_sensitive {
+                query.to_string()
+            } else {
+                query.to_lowercase()
+            };
 
-        let results: Vec<(u32, String)> = self
-            .nodes
-            .par_iter()
-            .filter_map(|node| {
-                let matches_key = if target == "keys" || target == "both" {
-                    node.key
-                        .as_ref()
-                        .map(|k| {
-                            let k_cmp = if case_sensitive {
-                                k.clone()
-                            } else {
-                                k.to_lowercase()
-                            };
-                            k_cmp.contains(&query_lower)
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-
-                let matches_value = if target == "values" || target == "both" {
-                    let val_str = match &node.value {
-                        NodeValue::Str(s) => Some(s.clone()),
-                        NodeValue::Num(n) => Some(n.to_string()),
-                        NodeValue::Bool(b) => Some(b.to_string()),
-                        _ => None,
+            self.nodes
+                .par_iter()
+                .filter_map(|node| {
+                    let matches_key = if target == "keys" || target == "both" {
+                        node.key
+                            .as_ref()
+                            .map(|k| {
+                                let k_cmp = if case_sensitive {
+                                    k.clone()
+                                } else {
+                                    k.to_lowercase()
+                                };
+                                k_cmp.contains(&query_lower)
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        false
                     };
-                    val_str
-                        .map(|v| {
-                            let v_cmp = if case_sensitive {
-                                v.clone()
-                            } else {
-                                v.to_lowercase()
-                            };
-                            v_cmp.contains(&query_lower)
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
 
-                if matches_key || matches_value {
-                    Some((node.id, self.get_path(node.id)))
-                } else {
-                    None
-                }
-            })
-            .collect();
+                    let matches_value = if target == "values" || target == "both" {
+                        let val_str = match &node.value {
+                            NodeValue::Str(s) => Some(s.clone()),
+                            NodeValue::Num(n) => Some(n.to_string()),
+                            NodeValue::Bool(b) => Some(b.to_string()),
+                            _ => None,
+                        };
+                        val_str
+                            .map(|v| {
+                                let v_cmp = if case_sensitive {
+                                    v.clone()
+                                } else {
+                                    v.to_lowercase()
+                                };
+                                v_cmp.contains(&query_lower)
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+
+                    if matches_key || matches_value {
+                        Some((node.id, self.get_path(node.id)))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
 
         results.into_iter().take(max_results).collect()
     }
