@@ -2,9 +2,14 @@ import { useState, useCallback, useEffect, useRef } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { listen } from '@tauri-apps/api/event'
-import { useJsonStore, NodeDto } from './store'
+import { check } from '@tauri-apps/plugin-updater'
+import { relaunch } from '@tauri-apps/plugin-process'
+import { useVirtualizer } from '@tanstack/react-virtual'
+import { useJsonStore } from './store'
 import { TreeNode } from './components/TreeNode'
-import { FolderOpen, Search, X, Clock, Sun, Moon } from 'lucide-react'
+import { ContextMenu } from './components/ContextMenu'
+import { PropertiesPanel } from './components/PropertiesPanel'
+import { FolderOpen, Search, X, Clock, Sun, Moon, Download } from 'lucide-react'
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -25,6 +30,8 @@ export default function App() {
     focusedNodeId,
     visibleNodes,
     recentFiles,
+    selectedNodePath,
+    selectedNodeId,
     openFile,
     navigateToNode,
     search,
@@ -39,37 +46,36 @@ export default function App() {
   const [useRegex, setUseRegex] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   const [recentOpen, setRecentOpen] = useState(false)
-  const [darkMode, setDarkMode] = useState(() => {
-    return localStorage.getItem('theme') !== 'light'
-  })
-  // null = nessun progresso (file piccolo/medio), 0-100 = streaming in corso
+  const [darkMode, setDarkMode] = useState(() => localStorage.getItem('theme') !== 'light')
   const [parseProgress, setParseProgress] = useState<number | null>(null)
+  const [updateAvailable, setUpdateAvailable] = useState(false)
+  const [updating, setUpdating] = useState(false)
   const recentRef = useRef<HTMLDivElement>(null)
+  const treeRef = useRef<HTMLDivElement>(null)
+  const searchTimer = useRef<ReturnType<typeof setTimeout>>()
 
-  // Applica la classe dark/light sull'html
+  // Virtualizer per il tree
+  const rowVirtualizer = useVirtualizer({
+    count: visibleNodes.length,
+    getScrollElement: () => treeRef.current,
+    estimateSize: () => 24,
+    overscan: 20,
+  })
+
+  // Dark mode
   useEffect(() => {
-    if (darkMode) {
-      document.documentElement.classList.add('dark')
-      document.documentElement.classList.remove('light')
-    } else {
-      document.documentElement.classList.remove('dark')
-      document.documentElement.classList.add('light')
-    }
+    document.documentElement.classList.toggle('dark', darkMode)
+    document.documentElement.classList.toggle('light', !darkMode)
     localStorage.setItem('theme', darkMode ? 'dark' : 'light')
   }, [darkMode])
 
-  // Listener per progress events dal backend (file >200MB)
+  // Progress events dal backend (file >200MB)
   useEffect(() => {
     let unlisten: (() => void) | undefined
-    listen<number>('parse-progress', (event) => {
-      setParseProgress(event.payload)
-    }).then((fn) => {
-      unlisten = fn
-    })
+    listen<number>('parse-progress', (e) => setParseProgress(e.payload)).then((fn) => { unlisten = fn })
     return () => unlisten?.()
   }, [])
 
-  // Quando il loading termina, resetta il progress dopo un breve delay
   useEffect(() => {
     if (!loading) {
       const t = setTimeout(() => setParseProgress(null), 400)
@@ -77,19 +83,48 @@ export default function App() {
     }
   }, [loading])
 
-  const handleOpenFile = async () => {
-    const selected = await open({
-      filters: [{ name: 'JSON', extensions: ['json'] }],
-    })
-    if (selected) {
-      await openFile(selected as string)
+  // Controlla aggiornamenti all'avvio (silenzioso)
+  useEffect(() => {
+    check().then((update) => {
+      if (update?.available) setUpdateAvailable(true)
+    }).catch(() => {})
+  }, [])
+
+  // Scroll reattivo: quando cambia il nodo selezionato, scrolla al suo indice
+  useEffect(() => {
+    if (selectedNodeId === null) return
+    const idx = visibleNodes.findIndex(({ node }) => node.id === selectedNodeId)
+    if (idx >= 0) {
+      rowVirtualizer.scrollToIndex(idx, { align: 'center' })
+    }
+  }, [selectedNodeId, visibleNodes, rowVirtualizer])
+
+  const handleUpdate = async () => {
+    setUpdating(true)
+    try {
+      const update = await check()
+      if (update?.available) {
+        await update.downloadAndInstall()
+        await relaunch()
+      }
+    } catch (err) {
+      console.error('Update failed:', err)
+      setUpdating(false)
     }
   }
 
+  const handleOpenFile = async () => {
+    const selected = await open({ filters: [{ name: 'JSON', extensions: ['json'] }] })
+    if (selected) await openFile(selected as string)
+  }
+
   const handleSearch = useCallback(
-    async (q: string) => {
+    (q: string) => {
       setSearchQuery(q)
-      await search(q, searchTarget, caseSensitive, useRegex)
+      clearTimeout(searchTimer.current)
+      searchTimer.current = setTimeout(() => {
+        search(q, searchTarget, caseSensitive, useRegex)
+      }, 150)
     },
     [search, searchTarget, caseSensitive, useRegex],
   )
@@ -99,7 +134,7 @@ export default function App() {
     clearSearch()
   }
 
-  // Keyboard shortcut: Cmd+F / Ctrl+F to focus search
+  // Cmd+F
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
@@ -111,112 +146,93 @@ export default function App() {
     return () => window.removeEventListener('keydown', handler)
   }, [])
 
-  // Close recent dropdown when clicking outside
+  // Chiudi dropdown recenti cliccando fuori
   useEffect(() => {
     if (!recentOpen) return
     const handler = (e: MouseEvent) => {
-      if (recentRef.current && !recentRef.current.contains(e.target as Node)) {
-        setRecentOpen(false)
-      }
+      if (recentRef.current && !recentRef.current.contains(e.target as Node)) setRecentOpen(false)
     }
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
   }, [recentOpen])
 
-  // Keyboard navigation in tree
+  // Navigazione tastiera nel tree
   useEffect(() => {
     if (rootChildren.length === 0) return
     const handler = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement).tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA') return
-
       if (!['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', 'Enter'].includes(e.key)) return
       e.preventDefault()
 
-      const currentId = focusedNodeId
-      const idx = currentId !== null ? visibleNodes.findIndex((n) => n.id === currentId) : -1
+      const idx = focusedNodeId !== null
+        ? visibleNodes.findIndex(({ node }) => node.id === focusedNodeId)
+        : -1
 
       if (e.key === 'ArrowDown') {
-        const next = idx < visibleNodes.length - 1 ? visibleNodes[idx + 1] : visibleNodes[0]
-        if (next) {
-          setFocusedNode(next.id)
-          document.getElementById(`node-${next.id}`)?.scrollIntoView({ block: 'nearest' })
+        const nextVNode = idx < visibleNodes.length - 1 ? visibleNodes[idx + 1] : visibleNodes[0]
+        if (nextVNode) {
+          setFocusedNode(nextVNode.node.id)
+          rowVirtualizer.scrollToIndex(idx < visibleNodes.length - 1 ? idx + 1 : 0, { align: 'nearest' })
         }
       } else if (e.key === 'ArrowUp') {
-        const prev = idx > 0 ? visibleNodes[idx - 1] : visibleNodes[visibleNodes.length - 1]
-        if (prev) {
-          setFocusedNode(prev.id)
-          document.getElementById(`node-${prev.id}`)?.scrollIntoView({ block: 'nearest' })
+        const prevIdx = idx > 0 ? idx - 1 : visibleNodes.length - 1
+        const prevVNode = visibleNodes[prevIdx]
+        if (prevVNode) {
+          setFocusedNode(prevVNode.node.id)
+          rowVirtualizer.scrollToIndex(prevIdx, { align: 'nearest' })
         }
       } else if (e.key === 'ArrowRight') {
-        if (currentId === null) return
-        const node = visibleNodes[idx]
-        if (!node) return
-        if (node.has_children && !expandedNodes.has(node.id)) {
-          toggleNode(node.id)
-        }
+        const vNode = visibleNodes[idx]
+        if (vNode?.node.has_children && !expandedNodes.has(vNode.node.id)) toggleNode(vNode.node.id)
       } else if (e.key === 'ArrowLeft') {
-        if (currentId === null) return
-        const node = visibleNodes[idx]
-        if (!node) return
-        if (expandedNodes.has(node.id)) {
-          toggleNode(node.id)
+        const vNode = visibleNodes[idx]
+        if (!vNode) return
+        if (expandedNodes.has(vNode.node.id)) {
+          toggleNode(vNode.node.id)
         } else {
           for (const [parentId, children] of expandedNodes.entries()) {
-            if (children.some((c) => c.id === node.id)) {
+            if (children.some((c) => c.id === vNode.node.id)) {
               setFocusedNode(parentId)
-              document.getElementById(`node-${parentId}`)?.scrollIntoView({ block: 'nearest' })
+              const parentIdx = visibleNodes.findIndex(({ node }) => node.id === parentId)
+              if (parentIdx >= 0) rowVirtualizer.scrollToIndex(parentIdx, { align: 'nearest' })
               break
             }
           }
         }
       } else if (e.key === 'Enter') {
-        if (currentId === null) return
-        const node = visibleNodes[idx]
-        if (node?.has_children) {
-          toggleNode(node.id)
-        }
+        const vNode = visibleNodes[idx]
+        if (vNode?.node.has_children) toggleNode(vNode.node.id)
       }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [focusedNodeId, visibleNodes, expandedNodes, rootChildren, toggleNode, setFocusedNode])
+  }, [focusedNodeId, visibleNodes, expandedNodes, rootChildren, toggleNode, setFocusedNode, rowVirtualizer])
 
-  // Drag & drop file dalla Finder/OS
+  // Drag & drop
   useEffect(() => {
-    let unlistenFn: (() => void) | undefined
-    getCurrentWebviewWindow()
-      .onDragDropEvent((event) => {
-        if (event.payload.type === 'enter' || event.payload.type === 'over') {
-          setIsDragging(true)
-        } else if (event.payload.type === 'leave') {
-          setIsDragging(false)
-        } else if (event.payload.type === 'drop') {
-          setIsDragging(false)
-          const paths: string[] = (event.payload as { type: 'drop'; paths: string[] }).paths
-          const jsonFile = paths.find((p) => p.toLowerCase().endsWith('.json'))
-          if (jsonFile) openFile(jsonFile)
-        }
-      })
-      .then((unlisten) => {
-        unlistenFn = unlisten
-      })
-    return () => unlistenFn?.()
+    let unlisten: (() => void) | undefined
+    getCurrentWebviewWindow().onDragDropEvent((event) => {
+      if (event.payload.type === 'enter' || event.payload.type === 'over') setIsDragging(true)
+      else if (event.payload.type === 'leave') setIsDragging(false)
+      else if (event.payload.type === 'drop') {
+        setIsDragging(false)
+        const paths = (event.payload as { type: 'drop'; paths: string[] }).paths
+        const jsonFile = paths.find((p) => p.toLowerCase().endsWith('.json'))
+        if (jsonFile) openFile(jsonFile)
+      }
+    }).then((fn) => { unlisten = fn })
+    return () => unlisten?.()
   }, [openFile])
 
   return (
     <div className="h-screen flex flex-col bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 relative">
-      {/* Progress bar caricamento file */}
+      {/* Progress bar */}
       {loading && (
         <div className="absolute inset-x-0 top-0 z-50 h-0.5 bg-gray-200 dark:bg-gray-700">
-          {parseProgress !== null ? (
-            <div
-              className="h-full bg-blue-500 transition-all duration-150"
-              style={{ width: `${parseProgress}%` }}
-            />
-          ) : (
-            <div className="h-full w-full bg-blue-500 animate-pulse" />
-          )}
+          {parseProgress !== null
+            ? <div className="h-full bg-blue-500 transition-all duration-150" style={{ width: `${parseProgress}%` }} />
+            : <div className="h-full w-full bg-blue-500 animate-pulse" />}
         </div>
       )}
 
@@ -226,8 +242,9 @@ export default function App() {
           <div className="text-blue-800 dark:text-blue-200 text-lg font-medium">Rilascia il file JSON</div>
         </div>
       )}
+
       {/* Toolbar */}
-      <div className="flex items-center gap-2 px-3 py-2 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
+      <div className="flex items-center gap-2 px-3 py-2 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
         <button
           onClick={handleOpenFile}
           className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-sm font-medium text-white transition-colors"
@@ -236,7 +253,6 @@ export default function App() {
           Apri file
         </button>
 
-        {/* Recent files dropdown */}
         {recentFiles.length > 0 && (
           <div className="relative" ref={recentRef}>
             <button
@@ -254,10 +270,7 @@ export default function App() {
                     key={rf}
                     className="w-full text-left px-3 py-1.5 text-xs font-mono text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 truncate transition-colors"
                     title={rf}
-                    onClick={() => {
-                      setRecentOpen(false)
-                      openFile(rf)
-                    }}
+                    onClick={() => { setRecentOpen(false); openFile(rf) }}
                   >
                     {rf}
                   </button>
@@ -267,46 +280,40 @@ export default function App() {
           </div>
         )}
 
-        <span className="text-gray-500 dark:text-gray-400 text-sm truncate flex-1">
+        <span className="text-gray-400 dark:text-gray-500 text-sm truncate flex-1">
           {filePath ?? 'Nessun file aperto'}
         </span>
 
-        {/* Theme toggle */}
+        {/* Notifica aggiornamento */}
+        {updateAvailable && (
+          <button
+            onClick={handleUpdate}
+            disabled={updating}
+            className="flex items-center gap-1.5 px-2 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 rounded text-sm text-white transition-colors"
+            title="Aggiornamento disponibile"
+          >
+            <Download size={14} />
+            {updating ? 'Aggiornamento...' : 'Aggiorna'}
+          </button>
+        )}
+
         <button
           onClick={() => setDarkMode((v) => !v)}
           className="p-1.5 rounded text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
-          title={darkMode ? 'Passa al tema chiaro' : 'Passa al tema scuro'}
+          title={darkMode ? 'Tema chiaro' : 'Tema scuro'}
         >
           {darkMode ? <Sun size={16} /> : <Moon size={16} />}
         </button>
       </div>
 
+      {/* Contenuto principale — 3 colonne */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Tree panel */}
-        <div className="flex-1 overflow-auto border-r border-gray-200 dark:border-gray-700">
-          {rootChildren.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-gray-400 dark:text-gray-500 gap-3">
-              <FolderOpen size={40} className="opacity-30" />
-              <span className="text-sm">Apri un file JSON per iniziare</span>
-              <span className="text-xs opacity-50">Supporta file di qualsiasi dimensione</span>
-            </div>
-          ) : (
-            <div className="py-1">
-              {rootChildren.map((node: NodeDto) => (
-                <TreeNode key={node.id} node={node} depth={0} />
-              ))}
-            </div>
-          )}
-        </div>
 
-        {/* Search panel */}
-        <div className="w-80 flex flex-col bg-gray-50 dark:bg-gray-900">
+        {/* Colonna sinistra: Search */}
+        <div className="w-72 flex flex-col border-r border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 flex-shrink-0">
           <div className="p-3 border-b border-gray-200 dark:border-gray-700">
             <div className="relative">
-              <Search
-                size={14}
-                className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-500"
-              />
+              <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-500" />
               <input
                 id="search-input"
                 type="text"
@@ -317,10 +324,7 @@ export default function App() {
                 className="w-full pl-8 pr-8 py-1.5 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded text-sm placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-gray-900 dark:text-gray-100"
               />
               {searchQuery && (
-                <button
-                  onClick={handleClear}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300"
-                >
+                <button onClick={handleClear} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
                   <X size={12} />
                 </button>
               )}
@@ -328,18 +332,8 @@ export default function App() {
 
             <div className="mt-2 flex gap-3 flex-wrap">
               {(['both', 'keys', 'values'] as const).map((t) => (
-                <label
-                  key={t}
-                  className="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 cursor-pointer"
-                >
-                  <input
-                    type="radio"
-                    name="target"
-                    value={t}
-                    checked={searchTarget === t}
-                    onChange={() => setSearchTarget(t)}
-                    className="accent-blue-500"
-                  />
+                <label key={t} className="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 cursor-pointer">
+                  <input type="radio" name="target" value={t} checked={searchTarget === t} onChange={() => setSearchTarget(t)} className="accent-blue-500" />
                   {t === 'both' ? 'entrambi' : t === 'keys' ? 'chiavi' : 'valori'}
                 </label>
               ))}
@@ -347,37 +341,23 @@ export default function App() {
 
             <div className="mt-1.5 flex gap-4">
               <label className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={caseSensitive}
-                  onChange={(e) => setCaseSensitive(e.target.checked)}
-                  className="accent-blue-500"
-                />
+                <input type="checkbox" checked={caseSensitive} onChange={(e) => setCaseSensitive(e.target.checked)} className="accent-blue-500" />
                 case sensitive
               </label>
               <label className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={useRegex}
-                  onChange={(e) => setUseRegex(e.target.checked)}
-                  className="accent-blue-500"
-                />
+                <input type="checkbox" checked={useRegex} onChange={(e) => setUseRegex(e.target.checked)} className="accent-blue-500" />
                 regex
               </label>
             </div>
           </div>
 
           <div className="flex-1 overflow-auto">
-            {searching && (
-              <div className="p-3 text-gray-400 dark:text-gray-500 text-xs">Ricerca in corso...</div>
-            )}
+            {searching && <div className="p-3 text-gray-400 dark:text-gray-500 text-xs">Ricerca in corso...</div>}
             {!searching && searchResults.length > 0 && (
               <div>
                 <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-200 dark:border-gray-700 sticky top-0 bg-gray-50 dark:bg-gray-900">
                   {searchResults.length} risultati
-                  {searchResults.length === 500 && (
-                    <span className="text-yellow-600 ml-1">(limite raggiunto)</span>
-                  )}
+                  {searchResults.length === 500 && <span className="text-yellow-600 ml-1">(limite raggiunto)</span>}
                 </div>
                 {searchResults.map((r) => (
                   <div
@@ -386,9 +366,7 @@ export default function App() {
                     className="px-3 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer border-b border-gray-100 dark:border-gray-800"
                   >
                     <div className="text-xs text-blue-600 dark:text-blue-400 font-mono truncate">{r.path}</div>
-                    <div className="text-xs text-gray-700 dark:text-gray-300 font-mono truncate mt-0.5">
-                      {r.value_preview}
-                    </div>
+                    <div className="text-xs text-gray-700 dark:text-gray-300 font-mono truncate mt-0.5">{r.value_preview}</div>
                   </div>
                 ))}
               </div>
@@ -403,18 +381,66 @@ export default function App() {
             )}
           </div>
         </div>
+
+        {/* Colonna centrale: Tree (virtualizzato) */}
+        <div ref={treeRef} className="flex-1 overflow-auto border-r border-gray-200 dark:border-gray-700">
+          {rootChildren.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-full text-gray-400 dark:text-gray-500 gap-3">
+              <FolderOpen size={40} className="opacity-30" />
+              <span className="text-sm">Apri un file JSON per iniziare</span>
+              <span className="text-xs opacity-50">Supporta file di qualsiasi dimensione</span>
+            </div>
+          ) : (
+            <div
+              style={{ height: `${rowVirtualizer.getTotalSize()}px`, position: 'relative' }}
+            >
+              {rowVirtualizer.getVirtualItems().map((vItem) => {
+                const vNode = visibleNodes[vItem.index]
+                return (
+                  <div
+                    key={vItem.key}
+                    style={{
+                      position: 'absolute',
+                      top: vItem.start,
+                      height: 24,
+                      width: '100%',
+                    }}
+                  >
+                    <TreeNode node={vNode.node} depth={vNode.depth} />
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Colonna destra: Properties */}
+        <div className="w-72 flex flex-col border-l border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 flex-shrink-0">
+          <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 text-xs font-medium text-gray-500 dark:text-gray-400 flex-shrink-0">
+            Proprieta
+          </div>
+          <div className="flex-1 overflow-hidden">
+            <PropertiesPanel />
+          </div>
+        </div>
       </div>
 
       {/* Status bar */}
-      <div className="flex items-center gap-4 px-3 py-1 bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-400 dark:text-gray-500">
+      <div className="flex items-center gap-4 px-3 py-1 bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-400 dark:text-gray-500 flex-shrink-0">
         <span>Nodi: {nodeCount.toLocaleString()}</span>
         <span>Dimensione: {formatBytes(sizeBytes)}</span>
-        {filePath && (
-          <span className="truncate flex-1 text-right" title={filePath}>
-            {filePath}
+        {selectedNodePath && (
+          <span className="font-mono text-blue-600 dark:text-blue-400 truncate flex-1" title={selectedNodePath}>
+            {selectedNodePath}
           </span>
         )}
+        {!selectedNodePath && filePath && (
+          <span className="truncate flex-1 text-right" title={filePath}>{filePath}</span>
+        )}
       </div>
+
+      {/* Context menu centralizzato */}
+      <ContextMenu />
     </div>
   )
 }

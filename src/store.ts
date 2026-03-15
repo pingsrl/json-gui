@@ -10,6 +10,11 @@ export interface NodeDto {
   children_count: number
 }
 
+export interface VNode {
+  node: NodeDto
+  depth: number
+}
+
 export interface SearchResult {
   node_id: number
   path: string
@@ -23,11 +28,20 @@ interface FileInfo {
   root_children: NodeDto[]
 }
 
+interface ExpandToResult {
+  expansions: [number, NodeDto[]][]
+  path: string
+}
+
 const MAX_RECENT = 5
 const MAX_CHILDREN_CACHE = 2000
 
 // Cache LRU semplice (FIFO con limite) per i figli già caricati
 const childrenCache = new Map<number, NodeDto[]>()
+
+// Cache a livello modulo (non reactive) per path e nodi noti
+const pathCache = new Map<number, string>()
+const nodeMapCache = new Map<number, NodeDto>()
 
 function cacheSet(id: number, children: NodeDto[]) {
   if (childrenCache.size >= MAX_CHILDREN_CACHE) {
@@ -48,19 +62,27 @@ function loadRecentFiles(): string[] {
 function buildVisibleNodes(
   rootChildren: NodeDto[],
   expandedNodes: Map<number, NodeDto[]>,
-): NodeDto[] {
-  const result: NodeDto[] = []
-  function traverse(nodes: NodeDto[]) {
+): VNode[] {
+  const result: VNode[] = []
+  function traverse(nodes: NodeDto[], depth: number) {
     for (const node of nodes) {
-      result.push(node)
+      result.push({ node, depth })
       if (expandedNodes.has(node.id)) {
         const children = expandedNodes.get(node.id)!
-        traverse(children)
+        traverse(children, depth + 1)
       }
     }
   }
-  traverse(rootChildren)
+  traverse(rootChildren, 0)
   return result
+}
+
+export interface ContextMenuState {
+  x: number
+  y: number
+  nodeId: number
+  valueType: string
+  valuePreview: string
 }
 
 interface JsonStore {
@@ -70,18 +92,24 @@ interface JsonStore {
   rootChildren: NodeDto[]
   expandedNodes: Map<number, NodeDto[]>
   selectedNodeId: number | null
+  selectedNode: NodeDto | null
+  selectedNodePath: string | null
   focusedNodeId: number | null
-  visibleNodes: NodeDto[]
+  visibleNodes: VNode[]
   recentFiles: string[]
   searchResults: SearchResult[]
   searching: boolean
   loading: boolean
+  contextMenu: ContextMenuState | null
   openFile: (path: string) => Promise<void>
   toggleNode: (nodeId: number) => Promise<void>
+  selectNode: (node: NodeDto) => Promise<void>
   navigateToNode: (nodeId: number) => Promise<void>
   setFocusedNode: (nodeId: number | null) => void
   search: (query: string, target: string, caseSensitive: boolean, useRegex: boolean) => Promise<void>
   clearSearch: () => void
+  showContextMenu: (cm: ContextMenuState) => void
+  hideContextMenu: () => void
 }
 
 export const useJsonStore = create<JsonStore>((set, get) => ({
@@ -91,19 +119,30 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   rootChildren: [],
   expandedNodes: new Map(),
   selectedNodeId: null,
+  selectedNode: null,
+  selectedNodePath: null,
   focusedNodeId: null,
   visibleNodes: [],
   recentFiles: loadRecentFiles(),
   searchResults: [],
   searching: false,
   loading: false,
+  contextMenu: null,
 
   openFile: async (path: string) => {
     set({ loading: true })
     const info = await invoke<FileInfo>('open_file', { path }).finally(() => set({ loading: false }))
     const expandedNodes = new Map<number, NodeDto[]>()
     const visibleNodes = buildVisibleNodes(info.root_children, expandedNodes)
+
     childrenCache.clear()
+    pathCache.clear()
+    nodeMapCache.clear()
+
+    // Popola nodeMapCache con root_children
+    for (const n of info.root_children) {
+      nodeMapCache.set(n.id, n)
+    }
 
     const prev = get().recentFiles.filter((f) => f !== path)
     const recentFiles = [path, ...prev].slice(0, MAX_RECENT)
@@ -116,6 +155,8 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       rootChildren: info.root_children,
       expandedNodes,
       selectedNodeId: null,
+      selectedNode: null,
+      selectedNodePath: null,
       focusedNodeId: null,
       visibleNodes,
       recentFiles,
@@ -135,11 +176,24 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
         children = await invoke<NodeDto[]>('get_children', { nodeId })
         cacheSet(nodeId, children)
       }
+      // Aggiungi i nuovi children a nodeMapCache
+      for (const child of children) {
+        nodeMapCache.set(child.id, child)
+      }
       next = new Map(expandedNodes)
       next.set(nodeId, children)
     }
     const visibleNodes = buildVisibleNodes(rootChildren, next)
     set({ expandedNodes: next, visibleNodes })
+  },
+
+  selectNode: async (node: NodeDto) => {
+    let path = pathCache.get(node.id)
+    if (!path) {
+      path = await invoke<string>('get_path', { nodeId: node.id })
+      pathCache.set(node.id, path)
+    }
+    set({ selectedNodeId: node.id, selectedNode: node, selectedNodePath: path, focusedNodeId: node.id })
   },
 
   setFocusedNode: (nodeId: number | null) => {
@@ -170,19 +224,35 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   },
 
   navigateToNode: async (nodeId: number) => {
-    const expansions = await invoke<[number, NodeDto[]][]>('expand_to', { nodeId })
+    const result = await invoke<ExpandToResult>('expand_to', { nodeId })
     const { expandedNodes, rootChildren } = get()
     const next = new Map(expandedNodes)
-    for (const [id, children] of expansions) {
+    for (const [id, children] of result.expansions) {
       next.set(id, children)
       cacheSet(id, children)
+      // Popola nodeMapCache con i figli espansi
+      for (const child of children) {
+        nodeMapCache.set(child.id, child)
+      }
     }
+    // Salva il path nel cache
+    pathCache.set(nodeId, result.path)
+
     const visibleNodes = buildVisibleNodes(rootChildren, next)
-    set({ expandedNodes: next, selectedNodeId: nodeId, focusedNodeId: nodeId, visibleNodes })
-    setTimeout(() => {
-      document.getElementById(`node-${nodeId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    }, 50)
+    // Trova il NodeDto del nodo target da nodeMapCache
+    const targetNode = nodeMapCache.get(nodeId) ?? null
+    set({
+      expandedNodes: next,
+      selectedNodeId: nodeId,
+      selectedNode: targetNode,
+      selectedNodePath: result.path,
+      focusedNodeId: nodeId,
+      visibleNodes,
+    })
   },
 
   clearSearch: () => set({ searchResults: [], searching: false }),
+
+  showContextMenu: (cm: ContextMenuState) => set({ contextMenu: cm }),
+  hideContextMenu: () => set({ contextMenu: null }),
 }))

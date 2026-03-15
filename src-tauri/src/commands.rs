@@ -74,29 +74,48 @@ pub struct SearchQuery {
     pub max_results: usize,
 }
 
+#[derive(Serialize)]
+pub struct ExpandToResult {
+    pub expansions: Vec<(u32, Vec<NodeDto>)>,
+    pub path: String,
+}
+
+/// Tronca una stringa UTF-8 in modo sicuro al massimo `max_chars` caratteri.
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
     let node = &index.nodes[id as usize];
+    let children_len = node.children_len as usize;
+    let has_children = children_len > 0;
     let (value_type, value_preview) = match &node.value {
         NodeValue::Object => (
             "object".to_string(),
-            if node.children.is_empty() {
+            if !has_children {
                 "{}".to_string()
             } else {
-                format!("{{{} keys}}", node.children.len())
+                format!("{{{} keys}}", children_len)
             },
         ),
         NodeValue::Array => (
             "array".to_string(),
-            if node.children.is_empty() {
+            if !has_children {
                 "[]".to_string()
             } else {
-                format!("[{} items]", node.children.len())
+                format!("[{} items]", children_len)
             },
         ),
         NodeValue::Str(s) => (
             "string".to_string(),
-            if s.len() > 80 {
-                format!("\"{}…\"", &s[..80])
+            if s.chars().count() > 80 {
+                format!("\"{}…\"", truncate_str(s, 80))
             } else {
                 format!("\"{}\"", s)
             },
@@ -107,11 +126,11 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
     };
     NodeDto {
         id,
-        key: node.key.clone(),
+        key: node.key.map(|kid| index.keys.get(kid).to_string()),
         value_type,
         value_preview,
-        has_children: !node.children.is_empty(),
-        children_count: node.children.len(),
+        has_children,
+        children_count: children_len,
     }
 }
 
@@ -149,8 +168,8 @@ pub async fn open_file(
     .map_err(|e| e.to_string())??;
 
     let node_count = index.nodes.len();
-    let root_children: Vec<NodeDto> = index.nodes[index.root as usize]
-        .children
+    let root_children: Vec<NodeDto> = index
+        .get_children_slice(index.root)
         .iter()
         .map(|&id| node_to_dto(&index, id))
         .collect();
@@ -169,8 +188,8 @@ pub async fn get_children(
 ) -> Result<Vec<NodeDto>, String> {
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
-    let children: Vec<NodeDto> = index.nodes[node_id as usize]
-        .children
+    let children: Vec<NodeDto> = index
+        .get_children_slice(node_id)
         .iter()
         .map(|&id| node_to_dto(index, id))
         .collect();
@@ -205,7 +224,7 @@ pub async fn search(
             let value_preview = match &node.value {
                 NodeValue::Str(s) => format!(
                     "\"{}\"",
-                    if s.len() > 60 { &s[..60] } else { s }
+                    truncate_str(s, 60)
                 ),
                 NodeValue::Num(n) => n.to_string(),
                 NodeValue::Bool(b) => b.to_string(),
@@ -216,7 +235,7 @@ pub async fn search(
             SearchResult {
                 node_id: id,
                 path,
-                key: node.key.clone(),
+                key: node.key.map(|kid| index.keys.get(kid).to_string()),
                 value_preview,
             }
         })
@@ -225,12 +244,13 @@ pub async fn search(
 }
 
 /// Restituisce per ogni antenato di node_id (da root a parent) la coppia (id, figli),
-/// così il frontend può espandere l'intero path in un singolo IPC call.
+/// piu' il path del nodo target, così il frontend può espandere l'intero path
+/// e ottenere il path in un singolo IPC call.
 #[tauri::command]
 pub async fn expand_to(
     node_id: u32,
     state: State<'_, AppState>,
-) -> Result<Vec<(u32, Vec<NodeDto>)>, String> {
+) -> Result<ExpandToResult, String> {
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
@@ -248,11 +268,11 @@ pub async fn expand_to(
     }
     chain.reverse(); // da root verso il parent diretto
 
-    let result: Vec<(u32, Vec<NodeDto>)> = chain
+    let expansions: Vec<(u32, Vec<NodeDto>)> = chain
         .into_iter()
         .map(|ancestor_id| {
-            let children = index.nodes[ancestor_id as usize]
-                .children
+            let children = index
+                .get_children_slice(ancestor_id)
                 .iter()
                 .map(|&child_id| node_to_dto(index, child_id))
                 .collect();
@@ -260,42 +280,14 @@ pub async fn expand_to(
         })
         .collect();
 
-    Ok(result)
+    let path = index.get_path(node_id);
+
+    Ok(ExpandToResult { expansions, path })
 }
 
 #[tauri::command]
 pub async fn get_raw(node_id: u32, state: State<'_, AppState>) -> Result<String, String> {
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
-    Ok(build_raw(index, node_id))
-}
-
-fn build_raw(index: &JsonIndex, id: u32) -> String {
-    let node = &index.nodes[id as usize];
-    match &node.value {
-        NodeValue::Object => {
-            let fields: Vec<String> = node
-                .children
-                .iter()
-                .map(|&child_id| {
-                    let child = &index.nodes[child_id as usize];
-                    let key = child.key.as_deref().unwrap_or("");
-                    format!("\"{}\":{}", key, build_raw(index, child_id))
-                })
-                .collect();
-            format!("{{{}}}", fields.join(","))
-        }
-        NodeValue::Array => {
-            let items: Vec<String> = node
-                .children
-                .iter()
-                .map(|&child_id| build_raw(index, child_id))
-                .collect();
-            format!("[{}]", items.join(","))
-        }
-        NodeValue::Str(s) => format!("\"{}\"", s.replace('"', "\\\"")),
-        NodeValue::Num(n) => n.to_string(),
-        NodeValue::Bool(b) => b.to_string(),
-        NodeValue::Null => "null".to_string(),
-    }
+    Ok(index.build_raw(node_id))
 }
