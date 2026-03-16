@@ -72,6 +72,7 @@ pub struct SearchQuery {
     pub target: String,
     pub case_sensitive: bool,
     pub regex: bool,
+    pub exact_match: bool,
     pub max_results: usize,
 }
 
@@ -216,6 +217,7 @@ pub async fn search(
         &query.target,
         query.case_sensitive,
         query.regex,
+        query.exact_match,
         query.max_results,
     );
     let dtos: Vec<SearchResult> = results
@@ -296,4 +298,30 @@ pub async fn get_raw(node_id: u32, state: State<'_, AppState>) -> Result<String,
 #[tauri::command]
 pub fn get_initial_path(state: State<'_, AppState>) -> Option<String> {
     state.initial_path.lock().unwrap().take()
+}
+
+#[tauri::command]
+pub async fn open_from_string(
+    content: String,
+    state: State<'_, AppState>,
+) -> Result<FileInfo, String> {
+    let size_bytes = content.len();
+    let index = tauri::async_runtime::spawn_blocking(move || {
+        JsonIndex::from_str(&content)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let node_count = index.nodes.len();
+    let root_children: Vec<NodeDto> = index
+        .get_children_slice(index.root)
+        .iter()
+        .map(|&id| node_to_dto(&index, id))
+        .collect();
+    *state.index.lock().unwrap() = Some(index);
+    Ok(FileInfo {
+        node_count,
+        size_bytes,
+        root_children,
+    })
 }

@@ -102,6 +102,7 @@ interface JsonStore {
   loading: boolean;
   contextMenu: ContextMenuState | null;
   openFile: (path: string) => Promise<void>;
+  openFromString: (content: string) => Promise<void>;
   toggleNode: (nodeId: number) => Promise<void>;
   selectNode: (node: NodeDto) => Promise<void>;
   navigateToNode: (nodeId: number) => Promise<void>;
@@ -110,7 +111,8 @@ interface JsonStore {
     query: string,
     target: string,
     caseSensitive: boolean,
-    useRegex: boolean
+    useRegex: boolean,
+    exactMatch: boolean
   ) => Promise<void>;
   clearSearch: () => void;
   showContextMenu: (cm: ContextMenuState) => void;
@@ -171,6 +173,37 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     });
   },
 
+  openFromString: async (content: string) => {
+    set({ loading: true });
+    const info = await invoke<FileInfo>("open_from_string", { content }).finally(() =>
+      set({ loading: false })
+    );
+    const expandedNodes = new Map<number, NodeDto[]>();
+    const visibleNodes = buildVisibleNodes(info.root_children, expandedNodes);
+
+    childrenCache.clear();
+    pathCache.clear();
+    nodeMapCache.clear();
+
+    for (const n of info.root_children) {
+      nodeMapCache.set(n.id, n);
+    }
+
+    set({
+      filePath: "(incollato)",
+      nodeCount: info.node_count,
+      sizeBytes: info.size_bytes,
+      rootChildren: info.root_children,
+      expandedNodes,
+      selectedNodeId: null,
+      selectedNode: null,
+      selectedNodePath: null,
+      focusedNodeId: null,
+      visibleNodes,
+      searchResults: []
+    });
+  },
+
   toggleNode: async (nodeId: number) => {
     const { expandedNodes, rootChildren } = get();
     let next: Map<number, NodeDto[]>;
@@ -216,7 +249,8 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     query: string,
     target: string,
     caseSensitive: boolean,
-    useRegex: boolean
+    useRegex: boolean,
+    exactMatch: boolean
   ) => {
     if (!query.trim()) {
       get().clearSearch();
@@ -230,6 +264,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
           target,
           case_sensitive: caseSensitive,
           regex: useRegex,
+          exact_match: exactMatch,
           max_results: 500
         }
       });
