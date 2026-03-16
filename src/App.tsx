@@ -417,22 +417,25 @@ export default function App() {
               Recenti
             </button>
             {recentOpen && (
-              <div className="absolute left-0 top-full mt-1 z-40 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded shadow-lg py-1 min-w-[280px]">
-                {recentFiles.map((rf) => (
+            <div className="absolute left-0 top-full mt-1 z-40 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded shadow-lg py-1 min-w-[320px]">
+              {recentFiles.map((rf) => {
+                const name = rf.split("/").pop() ?? rf;
+                const dir = rf.slice(0, rf.length - name.length).replace(/\/$/, "");
+                return (
                   <button
                     key={rf}
-                    className="w-full text-left px-3 py-1.5 text-xs font-mono text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 truncate transition-colors"
+                    className="w-full text-left px-3 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
                     title={rf}
                     onClick={() => {
                       setRecentOpen(false);
                       openFile(rf);
                     }}
                   >
-                    {rf}
+                    <div className="text-sm text-gray-800 dark:text-gray-100 truncate">{name}</div>
+                    <div className="text-xs text-gray-400 dark:text-gray-500 truncate font-mono">{dir}</div>
                   </button>
-                ))}
-              </div>
-            )}
+                );
+              })}
           </div>
         )}
 
