@@ -3,9 +3,9 @@ mod json_index;
 
 use commands::AppState;
 use std::sync::Mutex;
-use tauri::Emitter;
+use tauri::Manager;
 #[cfg(target_os = "macos")]
-use tauri::{Manager, RunEvent};
+use tauri::{Emitter, RunEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
