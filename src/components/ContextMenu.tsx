@@ -1,9 +1,11 @@
 import { type FC, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useJsonStore } from "../store";
+import { useI18n } from "../i18n";
 
 export const ContextMenu: FC = () => {
   const { contextMenu, hideContextMenu } = useJsonStore();
+  const { t } = useI18n();
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -67,19 +69,19 @@ export const ContextMenu: FC = () => {
         className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
         onClick={copyPath}
       >
-        Copia path
+        {t.copyPath}
       </button>
       <button
         className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
         onClick={copyValue}
       >
-        Copia valore
+        {t.copyValue}
       </button>
       <button
         className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
         onClick={copyRaw}
       >
-        Copia raw JSON
+        {t.copyRaw}
       </button>
     </div>
   );

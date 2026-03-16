@@ -1,5 +1,6 @@
 import { type FC } from "react";
 import { type NodeDto, useJsonStore } from "../store";
+import { useI18n } from "../i18n";
 
 const TYPE_BADGE: Record<string, string> = {
   string:
@@ -88,6 +89,7 @@ export const PropertiesPanel: FC = () => {
     rootChildren,
     navigateToNode
   } = useJsonStore();
+  const { t } = useI18n();
 
   // Trova i fratelli del nodo selezionato
   let siblings: NodeDto[] | null = null;
@@ -123,14 +125,14 @@ export const PropertiesPanel: FC = () => {
                   {parentKey}
                 </span>
               ) : (
-                "Oggetto padre"
+                t.parentObject
               )}{" "}
               <span className="text-gray-400 dark:text-gray-600">
                 ({siblings.length})
               </span>
             </>
           ) : (
-            "Fratelli"
+            t.siblings
           )}
         </div>
         <div className="flex-1 overflow-auto">
@@ -145,7 +147,7 @@ export const PropertiesPanel: FC = () => {
             ))
           ) : (
             <div className="p-3 text-gray-400 dark:text-gray-600 text-xs">
-              {selectedNode ? "Nessun fratello" : "Seleziona un nodo"}
+              {selectedNode ? t.noSiblings : t.selectNode}
             </div>
           )}
         </div>
@@ -172,7 +174,7 @@ export const PropertiesPanel: FC = () => {
 
             {/* Path */}
             {selectedNodePath && (
-              <Row label="Path">
+              <Row label={t.path}>
                 <span className="text-blue-600 dark:text-blue-400">
                   {selectedNodePath}
                 </span>
@@ -182,7 +184,7 @@ export const PropertiesPanel: FC = () => {
             {/* Valore */}
             {selectedNode.value_type !== "object" &&
               selectedNode.value_type !== "array" && (
-                <Row label="Valore">{selectedNode.value_preview}</Row>
+                <Row label={t.value}>{selectedNode.value_preview}</Row>
               )}
 
             {/* Dimensione per object/array */}
@@ -190,7 +192,7 @@ export const PropertiesPanel: FC = () => {
               selectedNode.value_type === "array") && (
               <Row
                 label={
-                  selectedNode.value_type === "object" ? "Chiavi" : "Elementi"
+                  selectedNode.value_type === "object" ? t.keys : t.elements
                 }
               >
                 {selectedNode.children_count.toLocaleString()}
@@ -199,7 +201,7 @@ export const PropertiesPanel: FC = () => {
           </>
         ) : (
           <div className="p-3 text-gray-400 dark:text-gray-600 text-xs">
-            Proprietà
+            {t.propertiesPlaceholder}
           </div>
         )}
       </div>
