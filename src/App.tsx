@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -17,7 +18,8 @@ import {
   Clock,
   Sun,
   Moon,
-  Download
+  Download,
+  Info
 } from "lucide-react";
 
 function formatBytes(bytes: number): string {
@@ -139,6 +141,31 @@ export default function App() {
     }
   }, [selectedNodeId, visibleNodes, rowVirtualizer]);
 
+  // Carica versione app al mount
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => {});
+  }, []);
+
+  const handleManualCheck = async () => {
+    setCheckingUpdate(true);
+    setCheckResult(null);
+    try {
+      const update = await check();
+      if (update?.available) {
+        setCheckResult("available");
+        setUpdateAvailable(true);
+      } else {
+        setCheckResult("up-to-date");
+      }
+    } catch {
+      setCheckResult("up-to-date");
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
   const handleUpdate = async () => {
     setUpdating(true);
     try {
@@ -181,10 +208,16 @@ export default function App() {
     if (searchQuery) {
       search(searchQuery, searchTarget, caseSensitive, useRegex, exactMatch);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchTarget, caseSensitive, useRegex, exactMatch]);
 
   const [pasteError, setPasteError] = useState<string | null>(null);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [checkResult, setCheckResult] = useState<
+    "up-to-date" | "available" | null
+  >(null);
 
   // Cmd+F / Cmd+O / Cmd+R
   useEffect(() => {
@@ -204,7 +237,7 @@ export default function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filePath]);
 
   // Incolla JSON dalla clipboard
@@ -225,7 +258,7 @@ export default function App() {
     };
     window.addEventListener("paste", handler);
     return () => window.removeEventListener("paste", handler);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openFromString]);
 
   // Chiudi dropdown recenti cliccando fuori
@@ -426,6 +459,17 @@ export default function App() {
           title={darkMode ? "Tema chiaro" : "Tema scuro"}
         >
           {darkMode ? <Sun size={16} /> : <Moon size={16} />}
+        </button>
+
+        <button
+          onClick={() => {
+            setAboutOpen(true);
+            setCheckResult(null);
+          }}
+          className="p-1.5 rounded text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+          title="Informazioni"
+        >
+          <Info size={16} />
         </button>
       </div>
 
@@ -629,6 +673,74 @@ export default function App() {
 
       {/* Context menu centralizzato */}
       <ContextMenu />
+
+      {/* Modal About */}
+      {aboutOpen && (
+        <div
+          className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+          onClick={() => setAboutOpen(false)}
+        >
+          <div
+            className="bg-white dark:bg-gray-900 rounded-xl shadow-2xl p-6 w-80 flex flex-col items-center gap-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <img
+              src="/icons/128x128.png"
+              alt="JsonGUI"
+              className="w-20 h-20 rounded-2xl shadow"
+            />
+            <div className="text-center">
+              <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+                JsonGUI
+              </div>
+              <div className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">
+                Versione {appVersion}
+              </div>
+            </div>
+
+            <div className="w-full border-t border-gray-100 dark:border-gray-800 pt-3 flex flex-col gap-2">
+              {checkResult === "up-to-date" && (
+                <div className="text-xs text-center text-emerald-600 dark:text-emerald-400">
+                  Sei già all'ultima versione
+                </div>
+              )}
+              {checkResult === "available" && (
+                <div className="text-xs text-center text-blue-600 dark:text-blue-400">
+                  Aggiornamento disponibile!
+                </div>
+              )}
+              {checkResult === "available" ? (
+                <button
+                  onClick={() => {
+                    setAboutOpen(false);
+                    handleUpdate();
+                  }}
+                  className="w-full py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors flex items-center justify-center gap-2"
+                >
+                  <Download size={14} />
+                  Scarica e installa
+                </button>
+              ) : (
+                <button
+                  onClick={handleManualCheck}
+                  disabled={checkingUpdate}
+                  className="w-full py-1.5 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-60 text-white text-sm font-medium transition-colors"
+                >
+                  {checkingUpdate
+                    ? "Controllo in corso…"
+                    : "Controlla aggiornamenti"}
+                </button>
+              )}
+              <button
+                onClick={() => setAboutOpen(false)}
+                className="w-full py-1.5 rounded text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 text-sm transition-colors"
+              >
+                Chiudi
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Toast errore paste */}
       {pasteError && (
