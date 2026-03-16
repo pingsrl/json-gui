@@ -240,6 +240,20 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filePath]);
 
+  // Eventi menu nativo (Cmd+O, Cmd+R, Recenti via barra dei menu macOS)
+  useEffect(() => {
+    const unlisteners: Array<() => void> = [];
+    Promise.all([
+      listen("menu-open", () => handleOpenFile()),
+      listen("menu-reload", () => {
+        if (filePath) openFile(filePath);
+      }),
+      listen("menu-recent", () => setRecentOpen(true))
+    ]).then((fns) => unlisteners.push(...fns));
+    return () => unlisteners.forEach((fn) => fn());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filePath]);
+
   // Incolla JSON dalla clipboard
   useEffect(() => {
     const handler = async (e: ClipboardEvent) => {
