@@ -149,7 +149,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          echo "$TAURI_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/tauri-signing.key"
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | tr -d '\r' > "$RUNNER_TEMP/tauri-signing.key"
       - name: Build Windows app
         run: npm run tauri build
         env:
@@ -222,7 +222,7 @@ jobs:
       - name: Write signing key to file
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: echo "$TAURI_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/tauri-signing.key"
+        run: printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | tr -d '\r' > "$RUNNER_TEMP/tauri-signing.key"
       - name: Build Linux app
         run: npm run tauri build
         env:
