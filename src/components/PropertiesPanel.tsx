@@ -58,8 +58,7 @@ export const PropertiesPanel: FC = () => {
   const {
     selectedNode,
     selectedNodePath,
-    expandedNodes,
-    rootChildren,
+    selectedNodeSiblings,
     navigateToNode
   } = useJsonStore();
   const { t } = useI18n();
@@ -77,19 +76,7 @@ export const PropertiesPanel: FC = () => {
     });
   }, []);
 
-  // Trova i fratelli del nodo selezionato
-  let siblings: NodeDto[] | null = null;
-  if (selectedNode) {
-    for (const children of expandedNodes.values()) {
-      if (children.some((c) => c.id === selectedNode.id)) {
-        siblings = children;
-        break;
-      }
-    }
-    if (!siblings && rootChildren.some((c) => c.id === selectedNode.id)) {
-      siblings = rootChildren;
-    }
-  }
+  const siblings = selectedNode ? selectedNodeSiblings : null;
 
   // Calcola il nome del genitore dal path
   const pathParts = selectedNodePath?.split(".") ?? [];
