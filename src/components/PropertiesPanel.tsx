@@ -154,7 +154,7 @@ export const PropertiesPanel: FC = () => {
       {/* ── Sezione proprietà (1/5 del totale, max 500px) ── */}
       <div
         className="flex-shrink-0 border-t border-gray-200 dark:border-gray-700 overflow-auto"
-        style={{ maxHeight: "min(20%, 500px)" }}
+        style={{ maxHeight: "max(20%, 500px)" }}
       >
         {selectedNode ? (
           <>
