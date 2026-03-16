@@ -2,7 +2,54 @@ import { create } from "zustand";
 
 export type Lang = "en" | "it" | "zh";
 
-const translations = {
+export interface Translations {
+  openFile: string;
+  recent: string;
+  recentTitle: string;
+  noFileOpen: string;
+  updateAvailable: string;
+  updating: string;
+  update: string;
+  lightTheme: string;
+  darkTheme: string;
+  searchPlaceholder: string;
+  searchBoth: string;
+  searchKeys: string;
+  searchValues: string;
+  caseSensitive: string;
+  regex: string;
+  exactMatch: string;
+  searching: string;
+  results: (n: number) => string;
+  limitReached: string;
+  noResults: string;
+  searchHint: (n: string) => string;
+  expandAll: string;
+  collapseAll: string;
+  openJsonFile: string;
+  anySize: string;
+  propertiesHeader: string;
+  nodes: (n: string) => string;
+  size: (s: string) => string;
+  updateToastAvailable: string;
+  updateToastLatest: string;
+  updateToastError: string;
+  pasteError: string;
+  parentObject: string;
+  siblings: string;
+  noSiblings: string;
+  selectNode: string;
+  path: string;
+  value: string;
+  keys: string;
+  elements: string;
+  propertiesPlaceholder: string;
+  copyPath: string;
+  copyValue: string;
+  copyRaw: string;
+}
+
+const translations: Record<Lang, Translations> = {
   en: {
     openFile: "Open file",
     recent: "Recent",
@@ -142,9 +189,7 @@ const translations = {
     copyValue: "复制值",
     copyRaw: "复制原始 JSON"
   }
-} as const;
-
-export type Translations = typeof translations.en;
+};
 
 function loadLang(): Lang {
   const saved = localStorage.getItem("lang");
