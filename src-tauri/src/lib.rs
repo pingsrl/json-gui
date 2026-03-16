@@ -1,5 +1,6 @@
 mod commands;
 mod json_index;
+mod schema;
 
 use commands::AppState;
 use std::sync::Mutex;
@@ -33,12 +34,15 @@ pub fn run() {
             let recent_i       = MenuItem::with_id(app, "recent",       "Recenti…",                  true, None::<&str>)?;
             let reload_i       = MenuItem::with_id(app, "reload",       "Ricarica",                  true, Some("CmdOrCtrl+R"))?;
             let check_update_i = MenuItem::with_id(app, "check-update", "Controlla aggiornamenti…",  true, None::<&str>)?;
+            let export_i       = MenuItem::with_id(app, "export",       "Esporta tipo…",             true, Some("CmdOrCtrl+Shift+E"))?;
 
             let file_menu = Submenu::with_items(app, "File", true, &[
                 &open_i,
                 &recent_i,
                 &PredefinedMenuItem::separator(app)?,
                 &reload_i,
+                &PredefinedMenuItem::separator(app)?,
+                &export_i,
             ])?;
 
             let edit_menu = Submenu::with_items(app, "Edit", true, &[
@@ -78,6 +82,7 @@ pub fn run() {
                     "reload"       => { app.emit("menu-reload",       ()).ok(); }
                     "recent"       => { app.emit("menu-recent",       ()).ok(); }
                     "check-update" => { app.emit("menu-check-update", ()).ok(); }
+                    "export"       => { app.emit("menu-export",        ()).ok(); }
                     _ => {}
                 }
             });
@@ -94,6 +99,7 @@ pub fn run() {
             commands::expand_all,
             commands::get_initial_path,
             commands::open_from_string,
+            commands::export_types,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

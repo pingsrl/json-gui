@@ -14,6 +14,7 @@ import { StatusBar } from "./components/StatusBar";
 import { ContextMenu } from "./components/ContextMenu";
 import { PropertiesPanel } from "./components/PropertiesPanel";
 import { ResizeHandle } from "./components/ResizeHandle";
+import { ExportModal } from "./components/ExportModal";
 
 const MIN_PANEL = 160;
 const MAX_PANEL = 600;
@@ -57,6 +58,7 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [pasteError, setPasteError] = useState<string | null>(null);
   const [updateToast, setUpdateToast] = useState<string | null>(null);
+  const [showExport, setShowExport] = useState(false);
 
   // Dark mode
   useEffect(() => {
@@ -172,6 +174,14 @@ export default function App() {
           setUpdateToast(useI18n.getState().t.updateToastError);
         }
         setTimeout(() => setUpdateToast(null), 4000);
+      }),
+      listen("menu-export", () => {
+        if (!useJsonStore.getState().filePath) {
+          setUpdateToast(useI18n.getState().t.exportNoFile);
+          setTimeout(() => setUpdateToast(null), 3000);
+        } else {
+          setShowExport(true);
+        }
       })
     ]).then((fns) => unlisteners.push(...fns));
     return () => unlisteners.forEach((fn) => fn());
@@ -257,7 +267,10 @@ export default function App() {
 
       {/* Contenuto principale — 3 colonne */}
       <div className="flex flex-1 overflow-hidden">
-        <div style={{ width: leftWidth }} className="flex-shrink-0 overflow-hidden">
+        <div
+          style={{ width: leftWidth }}
+          className="flex-shrink-0 overflow-hidden"
+        >
           <SearchPanel />
         </div>
 
@@ -268,7 +281,10 @@ export default function App() {
         <ResizeHandle direction="horizontal" onResize={handleRightResize} />
 
         {/* Colonna destra: Properties */}
-        <div style={{ width: rightWidth }} className="flex flex-col border-l border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 flex-shrink-0">
+        <div
+          style={{ width: rightWidth }}
+          className="flex flex-col border-l border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 flex-shrink-0"
+        >
           <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 text-xs font-medium text-gray-500 dark:text-gray-400 flex-shrink-0">
             <PropertiesHeader />
           </div>
@@ -292,6 +308,17 @@ export default function App() {
         <div className="fixed bottom-8 left-1/2 -translate-x-1/2 bg-gray-800 dark:bg-gray-700 text-white text-xs px-4 py-2 rounded shadow-lg z-50">
           {updateToast}
         </div>
+      )}
+
+      {showExport && (
+        <ExportModal
+          filePath={filePath}
+          onClose={() => setShowExport(false)}
+          onError={(msg) => {
+            setUpdateToast(msg);
+            setTimeout(() => setUpdateToast(null), 4000);
+          }}
+        />
       )}
     </div>
   );

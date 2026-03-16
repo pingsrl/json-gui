@@ -1,4 +1,5 @@
 use crate::json_index::{JsonIndex, NodeValue};
+use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::io::{BufReader, Read};
 use std::sync::Mutex;
@@ -322,6 +323,25 @@ pub async fn get_raw(node_id: u32, state: State<'_, AppState>) -> Result<String,
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     Ok(index.build_raw(node_id))
+}
+
+#[tauri::command]
+pub async fn export_types(
+    lang: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("Nessun file aperto")?;
+    let result = match lang.as_str() {
+        "typescript" => schema::generate_typescript(index),
+        "zod" => schema::generate_zod(index),
+        "rust" => schema::generate_rust(index),
+        "go" => schema::generate_go(index),
+        "python" => schema::generate_python(index),
+        "json-schema" => schema::generate_json_schema(index),
+        other => return Err(format!("Linguaggio non supportato: {}", other)),
+    };
+    Ok(result)
 }
 
 #[tauri::command]

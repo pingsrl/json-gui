@@ -47,6 +47,10 @@ export interface Translations {
   copyPath: string;
   copyValue: string;
   copyRaw: string;
+  exportTitle: string;
+  exportSubtitle: string;
+  exportNoFile: string;
+  exportSaveError: string;
 }
 
 const translations: Record<Lang, Translations> = {
@@ -94,7 +98,11 @@ const translations: Record<Lang, Translations> = {
     propertiesPlaceholder: "Properties",
     copyPath: "Copy path",
     copyValue: "Copy value",
-    copyRaw: "Copy raw JSON"
+    copyRaw: "Copy raw JSON",
+    exportTitle: "Export type definition",
+    exportSubtitle: "Select target language",
+    exportNoFile: "No file is open",
+    exportSaveError: "Could not save file"
   },
   it: {
     openFile: "Apri file",
@@ -141,7 +149,11 @@ const translations: Record<Lang, Translations> = {
     propertiesPlaceholder: "Proprietà",
     copyPath: "Copia path",
     copyValue: "Copia valore",
-    copyRaw: "Copia raw JSON"
+    copyRaw: "Copia raw JSON",
+    exportTitle: "Esporta definizione tipo",
+    exportSubtitle: "Seleziona il linguaggio",
+    exportNoFile: "Nessun file aperto",
+    exportSaveError: "Impossibile salvare il file"
   },
   zh: {
     openFile: "打开文件",
@@ -187,7 +199,11 @@ const translations: Record<Lang, Translations> = {
     propertiesPlaceholder: "属性",
     copyPath: "复制路径",
     copyValue: "复制值",
-    copyRaw: "复制原始 JSON"
+    copyRaw: "复制原始 JSON",
+    exportTitle: "导出类型定义",
+    exportSubtitle: "选择目标语言",
+    exportNoFile: "未打开文件",
+    exportSaveError: "无法保存文件"
   }
 };
 
