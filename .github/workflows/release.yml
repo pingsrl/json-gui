@@ -144,10 +144,16 @@ jobs:
             fs.writeFileSync('package.json', JSON.stringify(p, null, 2));
             console.log('Version set to', v);
           "
+      - name: Write signing key to file
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          echo "$TAURI_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/tauri-signing.key"
       - name: Build Windows app
         run: npm run tauri build
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ runner.temp }}/tauri-signing.key
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - name: Upload Windows artifacts
         uses: softprops/action-gh-release@v2.3.2
@@ -213,10 +219,14 @@ jobs:
             fs.writeFileSync('package.json', JSON.stringify(p, null, 2));
             console.log('Version set to', v);
           "
+      - name: Write signing key to file
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: echo "$TAURI_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/tauri-signing.key"
       - name: Build Linux app
         run: npm run tauri build
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ runner.temp }}/tauri-signing.key
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - name: Upload Linux artifacts
         uses: softprops/action-gh-release@v2.3.2
