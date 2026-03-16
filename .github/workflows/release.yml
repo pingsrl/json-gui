@@ -295,21 +295,24 @@ jobs:
           win_sig,   win_url     = load("windows-sig.json")
           linux_sig, linux_url   = load("linux-sig.json")
 
-          if not all([macos_sig, win_sig, linux_sig]):
-              print("::warning::One or more signatures are missing. Skipping latest.json generation.")
-              print("Set TAURI_SIGNING_PRIVATE_KEY in GitHub Secrets to enable auto-updates.")
+          platforms = {}
+          if macos_sig:
+              platforms["darwin-aarch64"] = {"signature": macos_sig, "url": f"{base}/{macos_url}"}
+              platforms["darwin-x86_64"]  = {"signature": macos_sig, "url": f"{base}/{macos_url}"}
+          if linux_sig:
+              platforms["linux-x86_64"]   = {"signature": linux_sig, "url": f"{base}/{linux_url}"}
+          if win_sig:
+              platforms["windows-x86_64"] = {"signature": win_sig,   "url": f"{base}/{win_url}"}
+
+          if not platforms:
+              print("::warning::No signatures available. Skipping latest.json generation.")
               sys.exit(0)
 
           data = {
             "version": version,
             "notes": "",
             "pub_date": pub_date,
-            "platforms": {
-              "darwin-aarch64": {"signature": macos_sig, "url": f"{base}/{macos_url}"},
-              "darwin-x86_64":  {"signature": macos_sig, "url": f"{base}/{macos_url}"},
-              "linux-x86_64":   {"signature": linux_sig, "url": f"{base}/{linux_url}"},
-              "windows-x86_64": {"signature": win_sig,   "url": f"{base}/{win_url}"},
-            }
+            "platforms": platforms,
           }
           with open("latest.json", "w") as f:
               json.dump(data, f, indent=2)
