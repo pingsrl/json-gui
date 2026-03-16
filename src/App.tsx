@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -40,6 +41,7 @@ export default function App() {
     recentFiles,
     selectedNodePath,
     selectedNodeId,
+    selectedNode,
     openFile,
     navigateToNode,
     search,
@@ -98,6 +100,22 @@ export default function App() {
       return () => clearTimeout(t);
     }
   }, [loading]);
+
+  // Apri file passato come argomento CLI (Windows/Linux)
+  useEffect(() => {
+    invoke<string | null>("get_initial_path").then((path) => {
+      if (path) openFile(path);
+    });
+  }, [openFile]);
+
+  // Apri file via "Apri con" / double-click (macOS RunEvent::Opened)
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<string>("open-with", (e) => openFile(e.payload)).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, [openFile]);
 
   // Controlla aggiornamenti all'avvio (silenzioso)
   useEffect(() => {
@@ -480,11 +498,73 @@ export default function App() {
                 Nessun risultato trovato
               </div>
             )}
-            {!searching && !searchQuery && nodeCount > 0 && (
-              <div className="p-3 text-gray-400 dark:text-gray-600 text-xs">
-                Digita per cercare tra {nodeCount.toLocaleString()} nodi
-              </div>
-            )}
+            {!searching && !searchQuery && (() => {
+              if (!selectedNode) {
+                return nodeCount > 0 ? (
+                  <div className="p-3 text-gray-400 dark:text-gray-600 text-xs">
+                    Digita per cercare tra {nodeCount.toLocaleString()} nodi
+                  </div>
+                ) : null;
+              }
+              // Trova i fratelli del nodo selezionato
+              let siblings = null;
+              for (const children of expandedNodes.values()) {
+                if (children.some((c) => c.id === selectedNode.id)) {
+                  siblings = children;
+                  break;
+                }
+              }
+              if (!siblings && rootChildren.some((c) => c.id === selectedNode.id)) {
+                siblings = rootChildren;
+              }
+              if (!siblings || siblings.length <= 1) {
+                return (
+                  <div className="p-3 text-gray-400 dark:text-gray-600 text-xs">
+                    Digita per cercare tra {nodeCount.toLocaleString()} nodi
+                  </div>
+                );
+              }
+              // Trova la chiave del genitore dal path
+              const pathParts = selectedNodePath?.split(".") ?? [];
+              const parentKey = pathParts.length > 1 ? pathParts[pathParts.length - 2] : null;
+              return (
+                <div>
+                  <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-200 dark:border-gray-700 sticky top-0 bg-gray-50 dark:bg-gray-900">
+                    {parentKey ? (
+                      <span className="font-mono text-gray-600 dark:text-gray-400">{parentKey}</span>
+                    ) : "Oggetto padre"}{" "}
+                    <span className="text-gray-400 dark:text-gray-600">({siblings.length})</span>
+                  </div>
+                  {siblings.map((sib) => {
+                    const isSelected = sib.id === selectedNode.id;
+                    return (
+                      <div
+                        key={sib.id}
+                        onClick={() => navigateToNode(sib.id)}
+                        className={`px-3 py-1.5 border-b border-gray-100 dark:border-gray-800 cursor-pointer flex items-center gap-1.5 min-w-0 ${
+                          isSelected
+                            ? "bg-blue-50 dark:bg-blue-900/20"
+                            : "hover:bg-gray-100 dark:hover:bg-gray-700"
+                        }`}
+                      >
+                        {sib.key !== null && (
+                          <span className={`text-xs font-mono truncate flex-1 ${
+                            isSelected
+                              ? "text-blue-700 dark:text-blue-300 font-semibold"
+                              : "text-gray-700 dark:text-gray-300"
+                          }`}>
+                            {sib.key}
+                          </span>
+                        )}
+                        <span className="text-xs font-mono text-gray-400 dark:text-gray-500 truncate flex-shrink-0 max-w-[6rem]">
+                          {sib.value_preview}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
           </div>
         </div>
 

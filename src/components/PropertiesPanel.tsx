@@ -79,7 +79,6 @@ export const PropertiesPanel: FC = () => {
     selectedNode,
     selectedNodePath,
     expandedNodes,
-    rootChildren,
     navigateToNode
   } = useJsonStore();
 
@@ -89,18 +88,6 @@ export const PropertiesPanel: FC = () => {
         Seleziona un nodo per vederne le proprietà
       </div>
     );
-  }
-
-  // Trova i fratelli: cerca nei figli di ogni nodo espanso oppure nei rootChildren
-  let siblings: NodeDto[] | null = null;
-  for (const children of expandedNodes.values()) {
-    if (children.some((c) => c.id === selectedNode.id)) {
-      siblings = children;
-      break;
-    }
-  }
-  if (!siblings && rootChildren.some((c) => c.id === selectedNode.id)) {
-    siblings = rootChildren;
   }
 
   const badge = TYPE_BADGE[selectedNode.value_type] ?? TYPE_BADGE.null;
@@ -142,23 +129,6 @@ export const PropertiesPanel: FC = () => {
           >
             {selectedNode.children_count.toLocaleString()}
           </Row>
-        )}
-
-        {/* Proprietà sorelle */}
-        {siblings && siblings.length > 1 && (
-          <div className="flex flex-col min-h-0">
-            <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-100 dark:border-gray-800 bg-white dark:bg-gray-900 flex-shrink-0">
-              Proprietà sorelle ({siblings.length})
-            </div>
-            {siblings.map((sib) => (
-              <NodeRow
-                key={sib.id}
-                node={sib}
-                isSelected={sib.id === selectedNode.id}
-                onClick={() => navigateToNode(sib.id)}
-              />
-            ))}
-          </div>
         )}
 
         {/* Figli espansi */}

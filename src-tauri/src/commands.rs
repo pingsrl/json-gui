@@ -38,6 +38,7 @@ impl<R: Read, F: Fn(u8)> Read for ProgressReader<R, F> {
 
 pub struct AppState {
     pub index: Mutex<Option<JsonIndex>>,
+    pub initial_path: Mutex<Option<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -290,4 +291,9 @@ pub async fn get_raw(node_id: u32, state: State<'_, AppState>) -> Result<String,
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     Ok(index.build_raw(node_id))
+}
+
+#[tauri::command]
+pub fn get_initial_path(state: State<'_, AppState>) -> Option<String> {
+    state.initial_path.lock().unwrap().take()
 }
