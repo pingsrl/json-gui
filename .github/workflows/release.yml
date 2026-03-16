@@ -132,8 +132,8 @@ jobs:
       - name: Save Windows signature for latest.json
         shell: bash
         run: |
-          SIG_FILE=$(ls src-tauri/target/release/bundle/nsis/*.nsis.zip.sig 2>/dev/null | head -1)
-          ZIP_FILE=$(ls src-tauri/target/release/bundle/nsis/*.nsis.zip 2>/dev/null | head -1)
+          SIG_FILE=$(find src-tauri/target/release/bundle/nsis -maxdepth 1 -name "*.nsis.zip.sig" 2>/dev/null | head -1)
+          ZIP_FILE=$(find src-tauri/target/release/bundle/nsis -maxdepth 1 -name "*.nsis.zip" -not -name "*.sig" 2>/dev/null | head -1)
           if [ -n "$SIG_FILE" ] && [ -n "$ZIP_FILE" ]; then
             SIG=$(cat "$SIG_FILE")
             URL=$(basename "$ZIP_FILE")
