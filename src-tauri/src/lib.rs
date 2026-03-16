@@ -36,6 +36,7 @@ pub fn run() {
             commands::get_raw,
             commands::expand_to,
             commands::get_initial_path,
+            commands::open_from_string,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
