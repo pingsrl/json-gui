@@ -83,6 +83,7 @@ pub struct ExpandToResult {
     pub path: String,
 }
 
+
 /// Tronca una stringa UTF-8 in modo sicuro al massimo `max_chars` caratteri.
 fn truncate_str(s: &str, max_chars: usize) -> &str {
     if s.chars().count() <= max_chars {
@@ -289,12 +290,25 @@ pub async fn expand_to(
     Ok(ExpandToResult { expansions, path })
 }
 
+const EXPAND_CHUNK_SIZE: usize = 1_000;
+
+#[derive(Serialize, Clone)]
+pub struct ExpandChunk {
+    pub expansions: Vec<(u32, Vec<NodeDto>)>,
+    pub progress: u8,
+}
+
 #[tauri::command]
-pub async fn expand_all(state: State<'_, AppState>) -> Result<Vec<(u32, Vec<NodeDto>)>, String> {
+pub async fn expand_all(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
-    let mut result: Vec<(u32, Vec<NodeDto>)> = Vec::new();
+    let total_nodes = index.nodes.len() as u64;
+    let mut total_sent: u64 = 0;
+    let mut chunk: Vec<(u32, Vec<NodeDto>)> = Vec::with_capacity(EXPAND_CHUNK_SIZE);
     let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
 
     for &child_id in index.get_children_slice(index.root) {
@@ -303,19 +317,34 @@ pub async fn expand_all(state: State<'_, AppState>) -> Result<Vec<(u32, Vec<Node
 
     while let Some(node_id) = queue.pop_front() {
         let children_slice = index.get_children_slice(node_id);
-        if !children_slice.is_empty() {
-            let children: Vec<NodeDto> = children_slice
-                .iter()
-                .map(|&id| node_to_dto(index, id))
-                .collect();
-            for &child_id in children_slice {
-                queue.push_back(child_id);
-            }
-            result.push((node_id, children));
+        if children_slice.is_empty() {
+            continue;
+        }
+        let n = children_slice.len() as u64;
+        let children: Vec<NodeDto> =
+            children_slice.iter().map(|&id| node_to_dto(index, id)).collect();
+        for &child_id in children_slice {
+            queue.push_back(child_id);
+        }
+        chunk.push((node_id, children));
+        total_sent += n;
+        if chunk.len() >= EXPAND_CHUNK_SIZE {
+            let progress = ((total_sent * 100) / total_nodes.max(1)).min(99) as u8;
+            app.emit(
+                "expand-chunk",
+                ExpandChunk { expansions: std::mem::take(&mut chunk), progress },
+            )
+            .ok();
+            chunk = Vec::with_capacity(EXPAND_CHUNK_SIZE);
         }
     }
 
-    Ok(result)
+    if !chunk.is_empty() {
+        app.emit("expand-chunk", ExpandChunk { expansions: chunk, progress: 99 }).ok();
+    }
+    app.emit("expand-done", ()).ok();
+
+    Ok(())
 }
 
 #[tauri::command]

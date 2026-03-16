@@ -22,7 +22,7 @@ const DEFAULT_LEFT = 288;
 const DEFAULT_RIGHT = 288;
 
 export default function App() {
-  const { filePath, openFile, openFromString } = useJsonStore();
+  const { filePath, openFile, openFromString, expandProgress } = useJsonStore();
 
   const [darkMode, setDarkMode] = useState(
     () => localStorage.getItem("theme") !== "light"
@@ -236,10 +236,10 @@ export default function App() {
       {/* Progress bar */}
       {loading && (
         <div className="absolute inset-x-0 top-0 z-50 h-0.5 bg-gray-200 dark:bg-gray-700">
-          {parseProgress !== null ? (
+          {(parseProgress ?? expandProgress) !== null ? (
             <div
               className="h-full bg-blue-500 transition-all duration-150"
-              style={{ width: `${parseProgress}%` }}
+              style={{ width: `${parseProgress ?? expandProgress}%` }}
             />
           ) : (
             <div className="h-full w-full bg-blue-500 animate-pulse" />

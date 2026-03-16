@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 export interface NodeDto {
   id: number;
@@ -34,6 +35,8 @@ interface ExpandToResult {
 }
 
 const MAX_RECENT = 5;
+// Contatore generazione per ignorare chunk di expand_all superati da un reload
+let expandGeneration = 0;
 const MAX_CHILDREN_CACHE = 2000;
 
 // Cache LRU semplice (FIFO con limite) per i figli già caricati
@@ -115,6 +118,7 @@ interface JsonStore {
   sizeBytes: number;
   rootChildren: NodeDto[];
   expandedNodes: Map<number, NodeDto[]>;
+  expandProgress: number | null;
   selectedNodeId: number | null;
   selectedNode: NodeDto | null;
   selectedNodePath: string | null;
@@ -152,6 +156,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   sizeBytes: 0,
   rootChildren: [],
   expandedNodes: new Map(),
+  expandProgress: null,
   selectedNodeId: null,
   selectedNode: null,
   selectedNodePath: null,
@@ -342,21 +347,73 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   },
 
   expandAll: async () => {
-    const { rootChildren, selectedNodeId } = get();
+    const { rootChildren } = get();
     if (rootChildren.length === 0) return;
-    const expansions = await invoke<[number, NodeDto[]][]>("expand_all");
+
+    expandGeneration++;
+    const myGen = expandGeneration;
+    set({ loading: true });
+
+    // Accumulatore locale: cresce chunk per chunk
     const next = new Map<number, NodeDto[]>();
-    for (const [id, children] of expansions) {
-      next.set(id, children);
-      cacheSet(id, children);
-      registerChildren(id, children);
-      for (const child of children) nodeMapCache.set(child.id, child);
+    // Chunk ricevuti ma non ancora applicati all'UI
+    let pending: [number, NodeDto[]][] = [];
+    let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    let doneResolve!: () => void;
+    const donePromise = new Promise<void>((r) => { doneResolve = r; });
+
+    // Applica i chunk pendenti e aggiorna l'UI (throttled)
+    const applyPending = () => {
+      throttleTimer = null;
+      if (pending.length === 0) return;
+      const toApply = pending.splice(0);
+      for (const [id, children] of toApply) {
+        next.set(id, children);
+        cacheSet(id, children);
+        registerChildren(id, children);
+        for (const child of children) nodeMapCache.set(child.id, child);
+      }
+      const { rootChildren: rc, selectedNodeId } = get();
+      const visibleNodes = buildVisibleNodes(rc, next);
+      const selectedNodeSiblings =
+        selectedNodeId !== null ? findSiblings(selectedNodeId, rc, next) : null;
+      set({ expandedNodes: new Map(next), visibleNodes, selectedNodeSiblings });
+    };
+
+    const unlistenChunk = await listen<{ expansions: [number, NodeDto[]][], progress: number }>(
+      "expand-chunk",
+      (e) => {
+        if (expandGeneration !== myGen) return;
+        pending.push(...e.payload.expansions);
+        set({ expandProgress: e.payload.progress });
+        if (!throttleTimer) throttleTimer = setTimeout(applyPending, 100);
+      }
+    );
+
+    const unlistenDone = await listen("expand-done", () => {
+      if (expandGeneration !== myGen) { doneResolve(); return; }
+      if (throttleTimer) { clearTimeout(throttleTimer); throttleTimer = null; }
+      // Applica eventuali chunk rimasti
+      applyPending();
+      unlistenChunk();
+      unlistenDone();
+      set({ loading: false, expandProgress: null });
+      doneResolve();
+    });
+
+    try {
+      await invoke("expand_all");
+    } catch (err) {
+      console.error("expand_all failed:", err);
+      if (throttleTimer) clearTimeout(throttleTimer);
+      unlistenChunk();
+      unlistenDone();
+      set({ loading: false, expandProgress: null });
+      doneResolve();
     }
-    const visibleNodes = buildVisibleNodes(rootChildren, next);
-    const selectedNodeSiblings = selectedNodeId !== null
-      ? findSiblings(selectedNodeId, rootChildren, next)
-      : null;
-    set({ expandedNodes: next, visibleNodes, selectedNodeSiblings });
+
+    await donePromise;
   },
 
   collapseAll: () => {
