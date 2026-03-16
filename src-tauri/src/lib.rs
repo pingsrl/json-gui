@@ -91,6 +91,7 @@ pub fn run() {
             commands::search,
             commands::get_raw,
             commands::expand_to,
+            commands::expand_all,
             commands::get_initial_path,
             commands::open_from_string,
         ])

@@ -289,6 +289,35 @@ pub async fn expand_to(
 }
 
 #[tauri::command]
+pub async fn expand_all(state: State<'_, AppState>) -> Result<Vec<(u32, Vec<NodeDto>)>, String> {
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("Nessun file aperto")?;
+
+    let mut result: Vec<(u32, Vec<NodeDto>)> = Vec::new();
+    let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+
+    for &child_id in index.get_children_slice(index.root) {
+        queue.push_back(child_id);
+    }
+
+    while let Some(node_id) = queue.pop_front() {
+        let children_slice = index.get_children_slice(node_id);
+        if !children_slice.is_empty() {
+            let children: Vec<NodeDto> = children_slice
+                .iter()
+                .map(|&id| node_to_dto(index, id))
+                .collect();
+            for &child_id in children_slice {
+                queue.push_back(child_id);
+            }
+            result.push((node_id, children));
+        }
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
 pub async fn get_raw(node_id: u32, state: State<'_, AppState>) -> Result<String, String> {
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;

@@ -114,6 +114,8 @@ interface JsonStore {
     useRegex: boolean,
     exactMatch: boolean
   ) => Promise<void>;
+  expandAll: () => Promise<void>;
+  collapseAll: () => void;
   clearSearch: () => void;
   showContextMenu: (cm: ContextMenuState) => void;
   hideContextMenu: () => void;
@@ -301,6 +303,27 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       focusedNodeId: nodeId,
       visibleNodes
     });
+  },
+
+  expandAll: async () => {
+    const { rootChildren } = get();
+    if (rootChildren.length === 0) return;
+    const expansions = await invoke<[number, NodeDto[]][]>("expand_all");
+    const next = new Map<number, NodeDto[]>();
+    for (const [id, children] of expansions) {
+      next.set(id, children);
+      cacheSet(id, children);
+      for (const child of children) nodeMapCache.set(child.id, child);
+    }
+    const visibleNodes = buildVisibleNodes(rootChildren, next);
+    set({ expandedNodes: next, visibleNodes });
+  },
+
+  collapseAll: () => {
+    const { rootChildren } = get();
+    const next = new Map<number, NodeDto[]>();
+    const visibleNodes = buildVisibleNodes(rootChildren, next);
+    set({ expandedNodes: next, visibleNodes });
   },
 
   clearSearch: () => set({ searchResults: [], searching: false }),

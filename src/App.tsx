@@ -48,7 +48,9 @@ export default function App() {
     clearSearch,
     toggleNode,
     setFocusedNode,
-    openFromString
+    openFromString,
+    expandAll,
+    collapseAll
   } = useJsonStore();
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -222,7 +224,9 @@ export default function App() {
           const update = await check();
           if (update?.available) {
             setUpdateAvailable(true);
-            setUpdateToast("Aggiornamento disponibile! Usa il pulsante in barra.");
+            setUpdateToast(
+              "Aggiornamento disponibile! Usa il pulsante in barra."
+            );
           } else {
             setUpdateToast("Sei già all'ultima versione.");
           }
@@ -456,7 +460,6 @@ export default function App() {
         >
           {darkMode ? <Sun size={16} /> : <Moon size={16} />}
         </button>
-
       </div>
 
       {/* Contenuto principale — 3 colonne */}
@@ -588,43 +591,58 @@ export default function App() {
         </div>
 
         {/* Colonna centrale: Tree (virtualizzato) */}
-        <div
-          ref={treeRef}
-          className="flex-1 overflow-auto border-r border-gray-200 dark:border-gray-700"
-        >
-          {rootChildren.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-gray-400 dark:text-gray-500 gap-3">
-              <FolderOpen size={40} className="opacity-30" />
-              <span className="text-sm">Apri un file JSON per iniziare</span>
-              <span className="text-xs opacity-50">
-                Supporta file di qualsiasi dimensione
-              </span>
-            </div>
-          ) : (
-            <div
-              style={{
-                height: `${rowVirtualizer.getTotalSize()}px`,
-                position: "relative"
-              }}
-            >
-              {rowVirtualizer.getVirtualItems().map((vItem) => {
-                const vNode = visibleNodes[vItem.index];
-                return (
-                  <div
-                    key={vItem.key}
-                    style={{
-                      position: "absolute",
-                      top: vItem.start,
-                      height: 24,
-                      width: "100%"
-                    }}
-                  >
-                    <TreeNode node={vNode.node} depth={vNode.depth} />
-                  </div>
-                );
-              })}
+        <div className="flex-1 flex flex-col border-r border-gray-200 dark:border-gray-700 min-w-0">
+          {rootChildren.length > 0 && (
+            <div className="flex gap-1 px-2 py-1 border-b border-gray-200 dark:border-gray-700 flex-shrink-0">
+              <button
+                onClick={() => expandAll()}
+                className="text-xs px-2 py-0.5 rounded text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
+              >
+                Apri tutto
+              </button>
+              <button
+                onClick={() => collapseAll()}
+                className="text-xs px-2 py-0.5 rounded text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
+              >
+                Chiudi tutto
+              </button>
             </div>
           )}
+          <div ref={treeRef} className="flex-1 overflow-auto">
+            {rootChildren.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full text-gray-400 dark:text-gray-500 gap-3">
+                <FolderOpen size={40} className="opacity-30" />
+                <span className="text-sm">Apri un file JSON per iniziare</span>
+                <span className="text-xs opacity-50">
+                  Supporta file di qualsiasi dimensione
+                </span>
+              </div>
+            ) : (
+              <div
+                style={{
+                  height: `${rowVirtualizer.getTotalSize()}px`,
+                  position: "relative"
+                }}
+              >
+                {rowVirtualizer.getVirtualItems().map((vItem) => {
+                  const vNode = visibleNodes[vItem.index];
+                  return (
+                    <div
+                      key={vItem.key}
+                      style={{
+                        position: "absolute",
+                        top: vItem.start,
+                        height: 24,
+                        width: "100%"
+                      }}
+                    >
+                      <TreeNode node={vNode.node} depth={vNode.depth} />
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Colonna destra: Properties */}
