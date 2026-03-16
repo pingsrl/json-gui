@@ -3,7 +3,9 @@ mod json_index;
 
 use commands::AppState;
 use std::sync::Mutex;
-use tauri::{Emitter, Manager, RunEvent};
+use tauri::Emitter;
+#[cfg(target_os = "macos")]
+use tauri::{Manager, RunEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -39,6 +41,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             // macOS: file aperto via Finder / "Apri con"
+            #[cfg(target_os = "macos")]
             if let RunEvent::Opened { urls } = event {
                 for url in urls {
                     if let Ok(path) = url.to_file_path() {
@@ -48,5 +51,7 @@ pub fn run() {
                     }
                 }
             }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
         });
 }
