@@ -29,9 +29,10 @@ pub fn run() {
             }
 
             // ── Menu nativo ──────────────────────────────────────────────────
-            let open_i   = MenuItem::with_id(app, "open",   "Apri...",  true, Some("CmdOrCtrl+O"))?;
-            let recent_i = MenuItem::with_id(app, "recent", "Recenti…", true, None::<&str>)?;
-            let reload_i = MenuItem::with_id(app, "reload", "Ricarica", true, Some("CmdOrCtrl+R"))?;
+            let open_i         = MenuItem::with_id(app, "open",         "Apri...",                   true, Some("CmdOrCtrl+O"))?;
+            let recent_i       = MenuItem::with_id(app, "recent",       "Recenti…",                  true, None::<&str>)?;
+            let reload_i       = MenuItem::with_id(app, "reload",       "Ricarica",                  true, Some("CmdOrCtrl+R"))?;
+            let check_update_i = MenuItem::with_id(app, "check-update", "Controlla aggiornamenti…",  true, None::<&str>)?;
 
             let file_menu = Submenu::with_items(app, "File", true, &[
                 &open_i,
@@ -53,6 +54,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             let app_menu = Submenu::with_items(app, "JsonGUI", true, &[
                 &PredefinedMenuItem::about(app, None, None)?,
+                &check_update_i,
                 &PredefinedMenuItem::separator(app)?,
                 &PredefinedMenuItem::services(app, None)?,
                 &PredefinedMenuItem::separator(app)?,
@@ -72,9 +74,10 @@ pub fn run() {
 
             app.on_menu_event(|app, event| {
                 match event.id().as_ref() {
-                    "open"   => { app.emit("menu-open",   ()).ok(); }
-                    "reload" => { app.emit("menu-reload", ()).ok(); }
-                    "recent" => { app.emit("menu-recent", ()).ok(); }
+                    "open"         => { app.emit("menu-open",         ()).ok(); }
+                    "reload"       => { app.emit("menu-reload",       ()).ok(); }
+                    "recent"       => { app.emit("menu-recent",       ()).ok(); }
+                    "check-update" => { app.emit("menu-check-update", ()).ok(); }
                     _ => {}
                 }
             });

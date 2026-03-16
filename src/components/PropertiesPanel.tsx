@@ -106,24 +106,28 @@ export const PropertiesPanel: FC = () => {
   const badge = selectedNode
     ? (TYPE_BADGE[selectedNode.value_type] ?? TYPE_BADGE.null)
     : null;
-  const ownChildren = selectedNode ? expandedNodes.get(selectedNode.id) : null;
-
   // Calcola il nome del genitore dal path
   const pathParts = selectedNodePath?.split(".") ?? [];
-  const parentKey = pathParts.length > 1 ? pathParts[pathParts.length - 2] : null;
+  const parentKey =
+    pathParts.length > 1 ? pathParts[pathParts.length - 2] : null;
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
-
       {/* ── Sezione fratelli (flex-1, sempre visibile) ── */}
       <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
         <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 flex-shrink-0">
           {siblings && siblings.length > 0 ? (
             <>
               {parentKey ? (
-                <span className="font-mono text-gray-600 dark:text-gray-400">{parentKey}</span>
-              ) : "Oggetto padre"}{" "}
-              <span className="text-gray-400 dark:text-gray-600">({siblings.length})</span>
+                <span className="font-mono text-gray-600 dark:text-gray-400">
+                  {parentKey}
+                </span>
+              ) : (
+                "Oggetto padre"
+              )}{" "}
+              <span className="text-gray-400 dark:text-gray-600">
+                ({siblings.length})
+              </span>
             </>
           ) : (
             "Fratelli"
@@ -147,16 +151,18 @@ export const PropertiesPanel: FC = () => {
         </div>
       </div>
 
-      {/* ── Sezione proprietà (1/5 del totale, max 400px) ── */}
+      {/* ── Sezione proprietà (1/5 del totale, max 500px) ── */}
       <div
         className="flex-shrink-0 border-t border-gray-200 dark:border-gray-700 overflow-auto"
-        style={{ maxHeight: "min(20%, 400px)" }}
+        style={{ maxHeight: "min(20%, 500px)" }}
       >
         {selectedNode ? (
           <>
             {/* Header */}
             <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 flex items-center gap-2 sticky top-0 bg-white dark:bg-gray-900">
-              <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${badge}`}>
+              <span
+                className={`text-xs font-medium px-1.5 py-0.5 rounded ${badge}`}
+              >
                 {selectedNode.value_type}
               </span>
               <span className="text-sm font-mono text-gray-800 dark:text-gray-200 truncate">
@@ -183,27 +189,12 @@ export const PropertiesPanel: FC = () => {
             {(selectedNode.value_type === "object" ||
               selectedNode.value_type === "array") && (
               <Row
-                label={selectedNode.value_type === "object" ? "Chiavi" : "Elementi"}
+                label={
+                  selectedNode.value_type === "object" ? "Chiavi" : "Elementi"
+                }
               >
                 {selectedNode.children_count.toLocaleString()}
               </Row>
-            )}
-
-            {/* Figli espansi */}
-            {ownChildren && ownChildren.length > 0 && (
-              <>
-                <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-100 dark:border-gray-800">
-                  Figli ({ownChildren.length})
-                </div>
-                {ownChildren.map((child) => (
-                  <NodeRow
-                    key={child.id}
-                    node={child}
-                    isSelected={false}
-                    onClick={() => navigateToNode(child.id)}
-                  />
-                ))}
-              </>
             )}
           </>
         ) : (
