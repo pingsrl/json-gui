@@ -47,13 +47,15 @@ export default function App() {
     search,
     clearSearch,
     toggleNode,
-    setFocusedNode
+    setFocusedNode,
+    openFromString
   } = useJsonStore();
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchTarget, setSearchTarget] = useState("both");
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [useRegex, setUseRegex] = useState(false);
+  const [exactMatch, setExactMatch] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [recentOpen, setRecentOpen] = useState(false);
   const [darkMode, setDarkMode] = useState(
@@ -163,10 +165,10 @@ export default function App() {
       setSearchQuery(q);
       clearTimeout(searchTimer.current);
       searchTimer.current = setTimeout(() => {
-        search(q, searchTarget, caseSensitive, useRegex);
+        search(q, searchTarget, caseSensitive, useRegex, exactMatch);
       }, 150);
     },
-    [search, searchTarget, caseSensitive, useRegex]
+    [search, searchTarget, caseSensitive, useRegex, exactMatch]
   );
 
   const handleClear = () => {
@@ -174,17 +176,57 @@ export default function App() {
     clearSearch();
   };
 
-  // Cmd+F
+  // Ripeti la ricerca quando cambiano le opzioni (se c'è una query attiva)
+  useEffect(() => {
+    if (searchQuery) {
+      search(searchQuery, searchTarget, caseSensitive, useRegex, exactMatch);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchTarget, caseSensitive, useRegex, exactMatch]);
+
+  const [pasteError, setPasteError] = useState<string | null>(null);
+
+  // Cmd+F / Cmd+O / Cmd+R
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "f") {
         e.preventDefault();
         document.getElementById("search-input")?.focus();
       }
+      if ((e.metaKey || e.ctrlKey) && e.key === "o") {
+        e.preventDefault();
+        handleOpenFile();
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "r" && filePath) {
+        e.preventDefault();
+        openFile(filePath);
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filePath]);
+
+  // Incolla JSON dalla clipboard
+  useEffect(() => {
+    const handler = async (e: ClipboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      const text = e.clipboardData?.getData("text/plain")?.trim();
+      if (!text) return;
+      if (!text.startsWith("{") && !text.startsWith("[")) return;
+      try {
+        await openFromString(text);
+        setPasteError(null);
+      } catch {
+        setPasteError("Il testo incollato non è un JSON valido");
+        setTimeout(() => setPasteError(null), 3000);
+      }
+    };
+    window.addEventListener("paste", handler);
+    return () => window.removeEventListener("paste", handler);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openFromString]);
 
   // Chiudi dropdown recenti cliccando fuori
   useEffect(() => {
@@ -439,7 +481,7 @@ export default function App() {
               ))}
             </div>
 
-            <div className="mt-1.5 flex gap-4">
+            <div className="mt-1.5 flex gap-3 flex-wrap">
               <label className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400 cursor-pointer">
                 <input
                   type="checkbox"
@@ -458,6 +500,15 @@ export default function App() {
                 />
                 regex
               </label>
+              <label className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={exactMatch}
+                  onChange={(e) => setExactMatch(e.target.checked)}
+                  className="accent-blue-500"
+                />
+                esatta
+              </label>
             </div>
           </div>
 
@@ -467,7 +518,7 @@ export default function App() {
                 Ricerca in corso...
               </div>
             )}
-            {!searching && searchResults.length > 0 && (
+            {!searching && !selectedNode && searchResults.length > 0 && (
               <div>
                 <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-200 dark:border-gray-700 sticky top-0 bg-gray-50 dark:bg-gray-900">
                   {searchResults.length} risultati
@@ -498,73 +549,11 @@ export default function App() {
                 Nessun risultato trovato
               </div>
             )}
-            {!searching && !searchQuery && (() => {
-              if (!selectedNode) {
-                return nodeCount > 0 ? (
-                  <div className="p-3 text-gray-400 dark:text-gray-600 text-xs">
-                    Digita per cercare tra {nodeCount.toLocaleString()} nodi
-                  </div>
-                ) : null;
-              }
-              // Trova i fratelli del nodo selezionato
-              let siblings = null;
-              for (const children of expandedNodes.values()) {
-                if (children.some((c) => c.id === selectedNode.id)) {
-                  siblings = children;
-                  break;
-                }
-              }
-              if (!siblings && rootChildren.some((c) => c.id === selectedNode.id)) {
-                siblings = rootChildren;
-              }
-              if (!siblings || siblings.length <= 1) {
-                return (
-                  <div className="p-3 text-gray-400 dark:text-gray-600 text-xs">
-                    Digita per cercare tra {nodeCount.toLocaleString()} nodi
-                  </div>
-                );
-              }
-              // Trova la chiave del genitore dal path
-              const pathParts = selectedNodePath?.split(".") ?? [];
-              const parentKey = pathParts.length > 1 ? pathParts[pathParts.length - 2] : null;
-              return (
-                <div>
-                  <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-200 dark:border-gray-700 sticky top-0 bg-gray-50 dark:bg-gray-900">
-                    {parentKey ? (
-                      <span className="font-mono text-gray-600 dark:text-gray-400">{parentKey}</span>
-                    ) : "Oggetto padre"}{" "}
-                    <span className="text-gray-400 dark:text-gray-600">({siblings.length})</span>
-                  </div>
-                  {siblings.map((sib) => {
-                    const isSelected = sib.id === selectedNode.id;
-                    return (
-                      <div
-                        key={sib.id}
-                        onClick={() => navigateToNode(sib.id)}
-                        className={`px-3 py-1.5 border-b border-gray-100 dark:border-gray-800 cursor-pointer flex items-center gap-1.5 min-w-0 ${
-                          isSelected
-                            ? "bg-blue-50 dark:bg-blue-900/20"
-                            : "hover:bg-gray-100 dark:hover:bg-gray-700"
-                        }`}
-                      >
-                        {sib.key !== null && (
-                          <span className={`text-xs font-mono truncate flex-1 ${
-                            isSelected
-                              ? "text-blue-700 dark:text-blue-300 font-semibold"
-                              : "text-gray-700 dark:text-gray-300"
-                          }`}>
-                            {sib.key}
-                          </span>
-                        )}
-                        <span className="text-xs font-mono text-gray-400 dark:text-gray-500 truncate flex-shrink-0 max-w-[6rem]">
-                          {sib.value_preview}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              );
-            })()}
+            {!searching && !searchQuery && nodeCount > 0 && (
+              <div className="p-3 text-gray-400 dark:text-gray-600 text-xs">
+                Digita per cercare tra {nodeCount.toLocaleString()} nodi
+              </div>
+            )}
           </div>
         </div>
 
@@ -640,6 +629,13 @@ export default function App() {
 
       {/* Context menu centralizzato */}
       <ContextMenu />
+
+      {/* Toast errore paste */}
+      {pasteError && (
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 bg-red-600 text-white text-xs px-4 py-2 rounded shadow-lg z-50">
+          {pasteError}
+        </div>
+      )}
     </div>
   );
 }
