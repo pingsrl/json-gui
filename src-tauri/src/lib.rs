@@ -1,9 +1,9 @@
 mod commands;
-mod json_index;
+pub mod json_index;
 mod schema;
 
 use commands::AppState;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 #[cfg(target_os = "macos")]
@@ -17,7 +17,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState {
-            index: Mutex::new(None),
+            index: Arc::new(Mutex::new(None)),
             initial_path: Mutex::new(None),
         })
         .setup(|app| {

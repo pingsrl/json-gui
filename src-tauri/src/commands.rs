@@ -1,9 +1,11 @@
 use crate::json_index::{JsonIndex, NodeValue};
 use crate::schema;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::io::{BufReader, Read};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, State};
+use tokio::sync::mpsc;
 
 /// Wrapper attorno a un `Read` che emette una callback ogni volta che la percentuale avanza.
 struct ProgressReader<R: Read, F: Fn(u8)> {
@@ -38,7 +40,7 @@ impl<R: Read, F: Fn(u8)> Read for ProgressReader<R, F> {
 }
 
 pub struct AppState {
-    pub index: Mutex<Option<JsonIndex>>,
+    pub index: Arc<Mutex<Option<JsonIndex>>>,
     pub initial_path: Mutex<Option<String>>,
 }
 
@@ -46,8 +48,8 @@ pub struct AppState {
 pub struct NodeDto {
     pub id: u32,
     pub key: Option<String>,
-    pub value_type: String,
-    pub value_preview: String,
+    pub value_type: &'static str,
+    pub value_preview: Cow<'static, str>,
     pub has_children: bool,
     pub children_count: usize,
 }
@@ -99,34 +101,35 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
     let node = &index.nodes[id as usize];
     let children_len = node.children_len as usize;
     let has_children = children_len > 0;
-    let (value_type, value_preview) = match &node.value {
+    let (value_type, value_preview): (&'static str, Cow<'static, str>) = match &node.value {
         NodeValue::Object => (
-            "object".to_string(),
+            "object",
             if !has_children {
-                "{}".to_string()
+                Cow::Borrowed("{}")
             } else {
-                format!("{{{} keys}}", children_len)
+                Cow::Owned(format!("{{{} keys}}", children_len))
             },
         ),
         NodeValue::Array => (
-            "array".to_string(),
+            "array",
             if !has_children {
-                "[]".to_string()
+                Cow::Borrowed("[]")
             } else {
-                format!("[{} items]", children_len)
+                Cow::Owned(format!("[{} items]", children_len))
             },
         ),
         NodeValue::Str(s) => (
-            "string".to_string(),
+            "string",
             if s.chars().count() > 80 {
-                format!("\"{}…\"", truncate_str(s, 80))
+                Cow::Owned(format!("\"{}…\"", truncate_str(s, 80)))
             } else {
-                format!("\"{}\"", s)
+                Cow::Owned(format!("\"{}\"", s))
             },
         ),
-        NodeValue::Num(n) => ("number".to_string(), n.to_string()),
-        NodeValue::Bool(b) => ("boolean".to_string(), b.to_string()),
-        NodeValue::Null => ("null".to_string(), "null".to_string()),
+        NodeValue::Num(n) => ("number", Cow::Owned(n.to_string())),
+        NodeValue::Bool(true) => ("boolean", Cow::Borrowed("true")),
+        NodeValue::Bool(false) => ("boolean", Cow::Borrowed("false")),
+        NodeValue::Null => ("null", Cow::Borrowed("null")),
     };
     NodeDto {
         id,
@@ -303,44 +306,65 @@ pub async fn expand_all(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let guard = state.index.lock().unwrap();
-    let index = guard.as_ref().ok_or("Nessun file aperto")?;
+    let index_arc = Arc::clone(&state.index);
+    let (tx, mut rx) = mpsc::channel::<ExpandChunk>(32);
 
-    let total_nodes = index.nodes.len() as u64;
-    let mut total_sent: u64 = 0;
-    let mut chunk: Vec<(u32, Vec<NodeDto>)> = Vec::with_capacity(EXPAND_CHUNK_SIZE);
-    let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+    // BFS + DTO build su un thread dedicato (non blocca il runtime Tokio).
+    // Il Mutex è tenuto solo dentro spawn_blocking, non attraverso await.
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = index_arc.lock().unwrap();
+        let index = match guard.as_ref() {
+            Some(i) => i,
+            None => return,
+        };
 
-    for &child_id in index.get_children_slice(index.root) {
-        queue.push_back(child_id);
-    }
+        let total_nodes = index.nodes.len() as u64;
+        let mut total_sent: u64 = 0;
+        let mut chunk: Vec<(u32, Vec<NodeDto>)> = Vec::with_capacity(EXPAND_CHUNK_SIZE);
+        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
 
-    while let Some(node_id) = queue.pop_front() {
-        let children_slice = index.get_children_slice(node_id);
-        if children_slice.is_empty() {
-            continue;
-        }
-        let n = children_slice.len() as u64;
-        let children: Vec<NodeDto> =
-            children_slice.iter().map(|&id| node_to_dto(index, id)).collect();
-        for &child_id in children_slice {
+        for &child_id in index.get_children_slice(index.root) {
             queue.push_back(child_id);
         }
-        chunk.push((node_id, children));
-        total_sent += n;
-        if chunk.len() >= EXPAND_CHUNK_SIZE {
-            let progress = ((total_sent * 100) / total_nodes.max(1)).min(99) as u8;
-            app.emit(
-                "expand-chunk",
-                ExpandChunk { expansions: std::mem::take(&mut chunk), progress },
-            )
-            .ok();
-            chunk = Vec::with_capacity(EXPAND_CHUNK_SIZE);
-        }
-    }
 
-    if !chunk.is_empty() {
-        app.emit("expand-chunk", ExpandChunk { expansions: chunk, progress: 99 }).ok();
+        while let Some(node_id) = queue.pop_front() {
+            let children_slice = index.get_children_slice(node_id);
+            if children_slice.is_empty() {
+                continue;
+            }
+            let n = children_slice.len() as u64;
+            let children: Vec<NodeDto> =
+                children_slice.iter().map(|&id| node_to_dto(index, id)).collect();
+            for &child_id in children_slice {
+                queue.push_back(child_id);
+            }
+            chunk.push((node_id, children));
+            total_sent += n;
+            if chunk.len() >= EXPAND_CHUNK_SIZE {
+                let progress = ((total_sent * 100) / total_nodes.max(1)).min(99) as u8;
+                if tx
+                    .blocking_send(ExpandChunk {
+                        expansions: std::mem::take(&mut chunk),
+                        progress,
+                    })
+                    .is_err()
+                {
+                    return; // receiver droppato: operazione annullata
+                }
+                chunk = Vec::with_capacity(EXPAND_CHUNK_SIZE);
+            }
+        }
+
+        if !chunk.is_empty() {
+            let _ = tx.blocking_send(ExpandChunk { expansions: chunk, progress: 99 });
+        }
+        // tx droppato qui → rx.recv() restituisce None → loop termina
+    });
+
+    // Emette i chunk verso il frontend man mano che arrivano.
+    // Il thread Tokio è libero (await) → la UI riceve gli eventi in tempo reale.
+    while let Some(chunk) = rx.recv().await {
+        app.emit("expand-chunk", chunk).ok();
     }
     app.emit("expand-done", ()).ok();
 
