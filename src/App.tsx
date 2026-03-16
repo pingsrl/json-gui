@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { listen } from "@tauri-apps/api/event";
@@ -13,6 +13,12 @@ import { TreePanel } from "./components/TreePanel";
 import { StatusBar } from "./components/StatusBar";
 import { ContextMenu } from "./components/ContextMenu";
 import { PropertiesPanel } from "./components/PropertiesPanel";
+import { ResizeHandle } from "./components/ResizeHandle";
+
+const MIN_PANEL = 160;
+const MAX_PANEL = 600;
+const DEFAULT_LEFT = 288;
+const DEFAULT_RIGHT = 288;
 
 export default function App() {
   const { filePath, openFile, openFromString } = useJsonStore();
@@ -20,6 +26,31 @@ export default function App() {
   const [darkMode, setDarkMode] = useState(
     () => localStorage.getItem("theme") !== "light"
   );
+
+  const [leftWidth, setLeftWidth] = useState(() => {
+    const s = localStorage.getItem("panel-left-width");
+    return s ? parseInt(s, 10) : DEFAULT_LEFT;
+  });
+  const [rightWidth, setRightWidth] = useState(() => {
+    const s = localStorage.getItem("panel-right-width");
+    return s ? parseInt(s, 10) : DEFAULT_RIGHT;
+  });
+
+  const handleLeftResize = useCallback((delta: number) => {
+    setLeftWidth((w) => {
+      const next = Math.max(MIN_PANEL, Math.min(MAX_PANEL, w + delta));
+      localStorage.setItem("panel-left-width", String(next));
+      return next;
+    });
+  }, []);
+
+  const handleRightResize = useCallback((delta: number) => {
+    setRightWidth((w) => {
+      const next = Math.max(MIN_PANEL, Math.min(MAX_PANEL, w - delta));
+      localStorage.setItem("panel-right-width", String(next));
+      return next;
+    });
+  }, []);
   const [parseProgress, setParseProgress] = useState<number | null>(null);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [updating, setUpdating] = useState(false);
@@ -226,12 +257,18 @@ export default function App() {
 
       {/* Contenuto principale — 3 colonne */}
       <div className="flex flex-1 overflow-hidden">
-        <SearchPanel />
+        <div style={{ width: leftWidth }} className="flex-shrink-0 overflow-hidden">
+          <SearchPanel />
+        </div>
+
+        <ResizeHandle direction="horizontal" onResize={handleLeftResize} />
 
         <TreePanel />
 
+        <ResizeHandle direction="horizontal" onResize={handleRightResize} />
+
         {/* Colonna destra: Properties */}
-        <div className="w-72 flex flex-col border-l border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 flex-shrink-0">
+        <div style={{ width: rightWidth }} className="flex flex-col border-l border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 flex-shrink-0">
           <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700 text-xs font-medium text-gray-500 dark:text-gray-400 flex-shrink-0">
             <PropertiesHeader />
           </div>

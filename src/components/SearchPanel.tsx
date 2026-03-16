@@ -48,7 +48,7 @@ export const SearchPanel: FC = () => {
   }, [searchTarget, caseSensitive, useRegex, exactMatch]);
 
   return (
-    <div className="w-72 flex flex-col border-r border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 flex-shrink-0">
+    <div className="flex flex-col border-r border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 h-full overflow-hidden">
       <div className="p-3 border-b border-gray-200 dark:border-gray-700">
         <div className="relative">
           <Search

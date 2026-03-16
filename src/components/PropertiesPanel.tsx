@@ -1,7 +1,12 @@
-import { type FC } from "react";
+import { type FC, useState, useCallback } from "react";
 import { type NodeDto, useJsonStore } from "../store";
 import { useI18n } from "../i18n";
 import { DetailPanel } from "./DetailPanel";
+import { ResizeHandle } from "./ResizeHandle";
+
+const MIN_DETAIL = 80;
+const MAX_DETAIL = 600;
+const DEFAULT_DETAIL = 220;
 
 const VALUE_COLORS: Record<string, string> = {
   string: "text-green-600 dark:text-green-400",
@@ -59,6 +64,19 @@ export const PropertiesPanel: FC = () => {
   } = useJsonStore();
   const { t } = useI18n();
 
+  const [detailHeight, setDetailHeight] = useState(() => {
+    const saved = localStorage.getItem("panel-detail-height");
+    return saved ? parseInt(saved, 10) : DEFAULT_DETAIL;
+  });
+
+  const handleDetailResize = useCallback((delta: number) => {
+    setDetailHeight((h) => {
+      const next = Math.max(MIN_DETAIL, Math.min(MAX_DETAIL, h - delta));
+      localStorage.setItem("panel-detail-height", String(next));
+      return next;
+    });
+  }, []);
+
   // Trova i fratelli del nodo selezionato
   let siblings: NodeDto[] | null = null;
   if (selectedNode) {
@@ -80,7 +98,7 @@ export const PropertiesPanel: FC = () => {
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
-      {/* ── Sezione fratelli (flex-1, sempre visibile) ── */}
+      {/* ── Sezione fratelli (flex-1) ── */}
       <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
         <div className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 flex-shrink-0">
           {siblings && siblings.length > 0 ? (
@@ -118,7 +136,14 @@ export const PropertiesPanel: FC = () => {
         </div>
       </div>
 
-      <DetailPanel />
+      <ResizeHandle direction="vertical" onResize={handleDetailResize} />
+
+      <div
+        style={{ height: detailHeight }}
+        className="flex-shrink-0 overflow-hidden"
+      >
+        <DetailPanel />
+      </div>
     </div>
   );
 };

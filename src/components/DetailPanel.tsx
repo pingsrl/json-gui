@@ -58,10 +58,7 @@ export const DetailPanel: FC = () => {
 
   /* ── Sezione proprietà (1/5 del totale, max 500px) ── */
   return (
-    <div
-      className="flex-shrink-0 border-t border-gray-200 dark:border-gray-700 overflow-auto"
-      style={{ maxHeight: "max(20%, 500px)" }}
-    >
+    <div className="h-full border-t border-gray-200 dark:border-gray-700 overflow-auto">
       {selectedNode ? (
         <>
           {/* Header */}
@@ -87,9 +84,7 @@ export const DetailPanel: FC = () => {
 
           {/* Valore */}
           {SCALAR_TYPES.has(selectedNode.value_type) && (
-            <Row label={t.value}>
-              {fullValue ?? selectedNode.value_preview}
-            </Row>
+            <Row label={t.value}>{fullValue ?? selectedNode.value_preview}</Row>
           )}
 
           {/* Dimensione per object/array */}
