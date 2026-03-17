@@ -5,7 +5,7 @@
 ///   cargo bench -- --output-format verbose
 ///
 /// Report HTML in: src-tauri/target/criterion/
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use json_gui_lib::json_index::{JsonIndex, NodeValue};
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -262,10 +262,14 @@ fn read_dotenv(key: &str) -> Option<String> {
     // Cerca in .bench.env nella directory del workspace (due livelli su rispetto a benches/)
     let candidates = ["../.bench.env", ".bench.env"];
     for candidate in candidates {
-        let Ok(content) = std::fs::read_to_string(candidate) else { continue };
+        let Ok(content) = std::fs::read_to_string(candidate) else {
+            continue;
+        };
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with('#') || line.is_empty() { continue }
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
             if let Some(rest) = line.strip_prefix(key) {
                 if let Some(val) = rest.strip_prefix('=') {
                     return Some(val.trim().to_string());
@@ -283,7 +287,9 @@ fn bench_real_file(c: &mut Criterion) {
         .ok()
         .or_else(|| read_dotenv("BENCH_JSON_PATH"));
     let Some(path) = path else {
-        eprintln!("[bench_real_file] Imposta BENCH_JSON_PATH in .bench.env o come variabile d'ambiente");
+        eprintln!(
+            "[bench_real_file] Imposta BENCH_JSON_PATH in .bench.env o come variabile d'ambiente"
+        );
         return;
     };
 

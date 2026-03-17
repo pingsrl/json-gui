@@ -13,6 +13,8 @@ export interface Translations {
   lightTheme: string;
   darkTheme: string;
   searchPlaceholder: string;
+  searchModeText: string;
+  searchModeObjects: string;
   searchScope: string;
   searchFilters: string;
   searchPath: string;
@@ -25,13 +27,27 @@ export interface Translations {
   searchKeys: string;
   searchValues: string;
   caseSensitive: string;
+  caseSensitiveKey: string;
+  caseSensitiveValue: string;
   regex: string;
   exactMatch: string;
   searching: string;
+  apply: string;
+  applyAll: string;
+  resetFilters: string;
+  applied: string;
   results: (n: number) => string;
   limitReached: string;
   noResults: string;
   searchHint: (n: string) => string;
+  objectSearchHint: string;
+  objectPathPlaceholder: string;
+  objectValuePlaceholder: string;
+  objectOperatorContains: string;
+  objectOperatorEquals: string;
+  objectOperatorRegex: string;
+  objectOperatorExists: string;
+  objectFilters: string;
   expandAll: string;
   collapseAll: string;
   openJsonFile: string;
@@ -76,6 +92,8 @@ const translations: Record<Lang, Translations> = {
     lightTheme: "Light theme",
     darkTheme: "Dark theme",
     searchPlaceholder: "Search... (Cmd+F)",
+    searchModeText: "Text",
+    searchModeObjects: "Objects",
     searchScope: "Scope",
     searchFilters: "Filters",
     searchPath: "Path",
@@ -88,13 +106,27 @@ const translations: Record<Lang, Translations> = {
     searchKeys: "keys",
     searchValues: "values",
     caseSensitive: "case sensitive",
+    caseSensitiveKey: "key case sensitive",
+    caseSensitiveValue: "value case sensitive",
     regex: "regex",
     exactMatch: "exact",
     searching: "Searching...",
+    apply: "Apply",
+    applyAll: "Apply all",
+    resetFilters: "Reset",
+    applied: "Applied",
     results: (n: number) => `${n} results`,
     limitReached: "(limit reached)",
     noResults: "No results found",
     searchHint: (n: string) => `Type to search among ${n} nodes`,
+    objectSearchHint: "Add one or more property filters and apply them",
+    objectPathPlaceholder: "key",
+    objectValuePlaceholder: "value",
+    objectOperatorContains: "contains",
+    objectOperatorEquals: "equals",
+    objectOperatorRegex: "regex",
+    objectOperatorExists: "exists",
+    objectFilters: "Object filters",
     expandAll: "Expand all",
     collapseAll: "Collapse all",
     openJsonFile: "Open a JSON file to start",
@@ -137,6 +169,8 @@ const translations: Record<Lang, Translations> = {
     lightTheme: "Tema chiaro",
     darkTheme: "Tema scuro",
     searchPlaceholder: "Cerca... (Cmd+F)",
+    searchModeText: "Testo",
+    searchModeObjects: "Oggetti",
     searchScope: "Ambito",
     searchFilters: "Filtri",
     searchPath: "Path",
@@ -149,13 +183,27 @@ const translations: Record<Lang, Translations> = {
     searchKeys: "chiavi",
     searchValues: "valori",
     caseSensitive: "case sensitive",
+    caseSensitiveKey: "chiave case sensitive",
+    caseSensitiveValue: "valore case sensitive",
     regex: "regex",
     exactMatch: "esatta",
     searching: "Ricerca in corso...",
+    apply: "Applica",
+    applyAll: "Applica tutti",
+    resetFilters: "Reset",
+    applied: "Applicato",
     results: (n: number) => `${n} risultati`,
     limitReached: "(limite raggiunto)",
     noResults: "Nessun risultato trovato",
     searchHint: (n: string) => `Digita per cercare tra ${n} nodi`,
+    objectSearchHint: "Aggiungi uno o più filtri proprietà e applicali",
+    objectPathPlaceholder: "chiave",
+    objectValuePlaceholder: "valore",
+    objectOperatorContains: "contiene",
+    objectOperatorEquals: "uguale",
+    objectOperatorRegex: "regex",
+    objectOperatorExists: "esiste",
+    objectFilters: "Filtri oggetto",
     expandAll: "Apri tutto",
     collapseAll: "Chiudi tutto",
     openJsonFile: "Apri un file JSON per iniziare",
@@ -199,6 +247,8 @@ const translations: Record<Lang, Translations> = {
     lightTheme: "浅色主题",
     darkTheme: "深色主题",
     searchPlaceholder: "搜索... (Cmd+F)",
+    searchModeText: "文本",
+    searchModeObjects: "对象",
     searchScope: "范围",
     searchFilters: "筛选",
     searchPath: "路径",
@@ -211,13 +261,27 @@ const translations: Record<Lang, Translations> = {
     searchKeys: "键",
     searchValues: "值",
     caseSensitive: "区分大小写",
+    caseSensitiveKey: "键区分大小写",
+    caseSensitiveValue: "值区分大小写",
     regex: "正则",
     exactMatch: "精确",
     searching: "搜索中...",
+    apply: "应用",
+    applyAll: "全部应用",
+    resetFilters: "重置",
+    applied: "已应用",
     results: (n: number) => `${n} 个结果`,
     limitReached: "（已达上限）",
     noResults: "未找到结果",
     searchHint: (n: string) => `输入以搜索 ${n} 个节点`,
+    objectSearchHint: "添加一个或多个属性过滤器并应用",
+    objectPathPlaceholder: "键",
+    objectValuePlaceholder: "值",
+    objectOperatorContains: "包含",
+    objectOperatorEquals: "等于",
+    objectOperatorRegex: "正则",
+    objectOperatorExists: "存在",
+    objectFilters: "对象过滤器",
     expandAll: "全部展开",
     collapseAll: "全部折叠",
     openJsonFile: "打开 JSON 文件以开始",

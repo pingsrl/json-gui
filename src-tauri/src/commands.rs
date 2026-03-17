@@ -1,4 +1,7 @@
-use crate::json_index::{JsonIndex, NodeValue, VisibleSliceRow};
+use crate::json_index::{
+    JsonIndex, NodeValue, ObjectSearchFilter as IndexObjectSearchFilter, ObjectSearchOperator,
+    VisibleSliceRow,
+};
 use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -21,7 +24,13 @@ struct ProgressReader<R: Read, F: Fn(u8)> {
 
 impl<R: Read, F: Fn(u8)> ProgressReader<R, F> {
     fn new(inner: R, total_bytes: u64, progress_cb: F) -> Self {
-        Self { inner, bytes_read: 0, total_bytes, last_percent: 0, progress_cb }
+        Self {
+            inner,
+            bytes_read: 0,
+            total_bytes,
+            last_percent: 0,
+            progress_cb,
+        }
     }
 }
 
@@ -72,6 +81,8 @@ pub struct SearchResult {
     pub path: String,
     pub key: Option<String>,
     pub value_preview: String,
+    pub kind: &'static str,
+    pub match_preview: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +92,24 @@ pub struct SearchQuery {
     pub case_sensitive: bool,
     pub regex: bool,
     pub exact_match: bool,
+    pub max_results: usize,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ObjectSearchFilterInput {
+    pub path: String,
+    pub operator: String,
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ObjectSearchQuery {
+    pub filters: Vec<ObjectSearchFilterInput>,
+    pub key_case_sensitive: bool,
+    pub value_case_sensitive: bool,
     pub max_results: usize,
     #[serde(default)]
     pub path: Option<String>,
@@ -104,7 +133,6 @@ pub struct ExpandedSliceResult {
     pub total_count: usize,
     pub rows: Vec<VisibleNode>,
 }
-
 
 /// Tronca una stringa UTF-8 in modo sicuro al massimo `max_chars` caratteri.
 fn truncate_str(s: &str, max_chars: usize) -> &str {
@@ -174,14 +202,11 @@ pub async fn open_file(
     let app_clone = app.clone();
 
     let (index, size_bytes) = tauri::async_runtime::spawn_blocking(move || {
-        let file_size = std::fs::metadata(&path_clone)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = std::fs::metadata(&path_clone).map(|m| m.len()).unwrap_or(0);
 
         let index = if file_size > STREAMING_THRESHOLD {
             // File >200MB: streaming con progress events
-            let file =
-                std::fs::File::open(&path_clone).map_err(|e| e.to_string())?;
+            let file = std::fs::File::open(&path_clone).map_err(|e| e.to_string())?;
             let reader = ProgressReader::new(BufReader::new(file), file_size, move |pct| {
                 app_clone.emit("parse-progress", pct).ok();
             });
@@ -252,10 +277,7 @@ pub async fn search(
         .map(|(id, path)| {
             let node = &index.nodes[id as usize];
             let value_preview = match &node.value {
-                NodeValue::Str(s) => format!(
-                    "\"{}\"",
-                    truncate_str(s, 60)
-                ),
+                NodeValue::Str(s) => format!("\"{}\"", truncate_str(s, 60)),
                 NodeValue::Num(n) => n.to_string(),
                 NodeValue::Bool(b) => b.to_string(),
                 NodeValue::Null => "null".to_string(),
@@ -268,20 +290,113 @@ pub async fn search(
                 path,
                 key: node.key.map(|kid| index.keys.get(kid).to_string()),
                 value_preview,
+                kind: "node",
+                match_preview: None,
             }
         })
         .collect();
     Ok(dtos)
 }
 
+fn parse_object_search_operator(operator: &str) -> Option<ObjectSearchOperator> {
+    match operator {
+        "contains" => Some(ObjectSearchOperator::Contains),
+        "equals" => Some(ObjectSearchOperator::Equals),
+        "regex" => Some(ObjectSearchOperator::Regex),
+        "exists" => Some(ObjectSearchOperator::Exists),
+        _ => None,
+    }
+}
+
+fn build_object_match_preview(filters: &[ObjectSearchFilterInput]) -> String {
+    filters
+        .iter()
+        .map(|filter| match filter.operator.as_str() {
+            "exists" => format!("{} exists", filter.path.trim()),
+            "equals" => format!(
+                "{} = {}",
+                filter.path.trim(),
+                filter.value.as_deref().unwrap_or("").trim()
+            ),
+            "regex" => format!(
+                "{} ~= {}",
+                filter.path.trim(),
+                filter.value.as_deref().unwrap_or("").trim()
+            ),
+            _ => format!(
+                "{} contains {}",
+                filter.path.trim(),
+                filter.value.as_deref().unwrap_or("").trim()
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+#[tauri::command]
+pub async fn search_objects(
+    query: ObjectSearchQuery,
+    state: State<'_, AppState>,
+) -> Result<Vec<SearchResult>, String> {
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("Nessun file aperto")?;
+
+    let filters: Vec<IndexObjectSearchFilter> = query
+        .filters
+        .iter()
+        .map(|filter| {
+            let operator = parse_object_search_operator(&filter.operator)
+                .ok_or_else(|| format!("Operatore non supportato: {}", filter.operator))?;
+            Ok(IndexObjectSearchFilter {
+                path: filter.path.clone(),
+                operator,
+                value: filter.value.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let match_preview = build_object_match_preview(&query.filters);
+    let ids = index.search_objects(
+        &filters,
+        query.key_case_sensitive,
+        query.value_case_sensitive,
+        query.max_results,
+        query.path.as_deref(),
+    );
+    let dtos = ids
+        .into_iter()
+        .map(|id| {
+            let node = &index.nodes[id as usize];
+            SearchResult {
+                node_id: id,
+                file_order: node.preorder_index,
+                path: index.get_path(id),
+                key: node.key.map(|kid| index.keys.get(kid).to_string()),
+                value_preview: node_to_dto(index, id).value_preview.into_owned(),
+                kind: "object",
+                match_preview: Some(match_preview.clone()),
+            }
+        })
+        .collect();
+    Ok(dtos)
+}
+
+#[tauri::command]
+pub async fn suggest_property_paths(
+    prefix: String,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("Nessun file aperto")?;
+    Ok(index.suggest_property_paths(&prefix, limit))
+}
+
 /// Restituisce per ogni antenato di node_id (da root a parent) la coppia (id, figli),
 /// piu' il path del nodo target, così il frontend può espandere l'intero path
 /// e ottenere il path in un singolo IPC call.
 #[tauri::command]
-pub async fn expand_to(
-    node_id: u32,
-    state: State<'_, AppState>,
-) -> Result<ExpandToResult, String> {
+pub async fn expand_to(node_id: u32, state: State<'_, AppState>) -> Result<ExpandToResult, String> {
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
@@ -344,8 +459,7 @@ pub async fn get_expanded_slice(
 const EXPAND_FIRST_CHUNK_NODE_TARGET: usize = 1_000;
 const EXPAND_CHUNK_NODE_TARGET: usize = 10_000;
 const EXPAND_CHUNK_MAX_LATENCY_MS: u64 = 250;
-const EXPAND_CHUNK_MAX_LATENCY: Duration =
-    Duration::from_millis(EXPAND_CHUNK_MAX_LATENCY_MS);
+const EXPAND_CHUNK_MAX_LATENCY: Duration = Duration::from_millis(EXPAND_CHUNK_MAX_LATENCY_MS);
 const EXPAND_FIRST_EMIT_PAUSE_MS: u64 = 12;
 const EXPAND_EMIT_PAUSE_MS: u64 = 1;
 
@@ -409,10 +523,7 @@ where
 }
 
 #[tauri::command]
-pub async fn expand_all(
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
+pub async fn expand_all(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
     let index_arc = Arc::clone(&state.index);
     let (tx, mut rx) = mpsc::channel::<ExpandChunk>(32);
 
@@ -433,8 +544,10 @@ pub async fn expand_all(
         let mut last_flush = Instant::now();
         let completed = walk_expandable_nodes_breadth_first(index, |node_id, children_slice| {
             let n = children_slice.len() as u64;
-            let children: Vec<NodeDto> =
-                children_slice.iter().map(|&id| node_to_dto(index, id)).collect();
+            let children: Vec<NodeDto> = children_slice
+                .iter()
+                .map(|&id| node_to_dto(index, id))
+                .collect();
             chunk.push((node_id, children));
             chunk_nodes += n as usize;
             total_sent += n;
@@ -463,7 +576,10 @@ pub async fn expand_all(
 
         if !chunk.is_empty() {
             let progress = ((total_sent * 100) / total_nodes.max(1)).min(99) as u8;
-            let _ = tx.blocking_send(ExpandChunk { expansions: chunk, progress });
+            let _ = tx.blocking_send(ExpandChunk {
+                expansions: chunk,
+                progress,
+            });
         }
         // tx droppato qui → rx.recv() restituisce None → loop termina
     });
@@ -583,10 +699,7 @@ pub async fn get_raw(node_id: u32, state: State<'_, AppState>) -> Result<String,
 }
 
 #[tauri::command]
-pub async fn export_types(
-    lang: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+pub async fn export_types(lang: String, state: State<'_, AppState>) -> Result<String, String> {
     let guard = state.index.lock().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let result = match lang.as_str() {
@@ -612,11 +725,9 @@ pub async fn open_from_string(
     state: State<'_, AppState>,
 ) -> Result<FileInfo, String> {
     let size_bytes = content.len();
-    let index = tauri::async_runtime::spawn_blocking(move || {
-        JsonIndex::from_str(&content)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let index = tauri::async_runtime::spawn_blocking(move || JsonIndex::from_str(&content))
+        .await
+        .map_err(|e| e.to_string())??;
 
     let node_count = index.nodes.len();
     let root_children: Vec<NodeDto> = index

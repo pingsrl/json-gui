@@ -210,6 +210,7 @@ function makeSearchResult(
   fileOrder: number,
   key: string | null,
   valuePreview: string,
+  kind: 'node' | 'object' = 'node',
 ): SearchResult {
   return {
     node_id: nodeId,
@@ -217,6 +218,7 @@ function makeSearchResult(
     key,
     path: `$.${key ?? nodeId}`,
     value_preview: valuePreview,
+    kind,
   }
 }
 
@@ -239,6 +241,17 @@ describe('sortSearchResults', () => {
     ]
 
     const sorted = sortSearchResults(results, 'title', 'file')
+
+    expect(sorted.map((r) => r.node_id)).toEqual([2, 1])
+  })
+
+  it("ordina sempre per ordine nel file per i risultati object search", () => {
+    const results = [
+      makeSearchResult(1, 20, null, '{2 keys}', 'object'),
+      makeSearchResult(2, 10, null, '{3 keys}', 'object'),
+    ]
+
+    const sorted = sortSearchResults(results, 'title', 'relevance')
 
     expect(sorted.map((r) => r.node_id)).toEqual([2, 1])
   })

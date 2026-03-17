@@ -29,7 +29,7 @@ export const ContextMenu: FC = () => {
 
   const focusSearchInput = () => {
     requestAnimationFrame(() => {
-      document.getElementById("search-input")?.focus();
+      document.getElementById("primary-search-input")?.focus();
     });
   };
 

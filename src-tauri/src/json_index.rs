@@ -33,6 +33,10 @@ impl StringPool {
     pub fn get(&self, id: u32) -> &str {
         &self.strings[id as usize]
     }
+
+    pub fn id_of(&self, s: &str) -> Option<u32> {
+        self.map.get(s).copied()
+    }
 }
 
 // ---- NodeValue ----
@@ -85,6 +89,34 @@ pub struct VisibleSliceRow {
     pub depth: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectSearchOperator {
+    Contains,
+    Equals,
+    Regex,
+    Exists,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectSearchFilter {
+    pub path: String,
+    pub operator: ObjectSearchOperator,
+    pub value: Option<String>,
+}
+
+struct CompiledObjectSearchFilter {
+    path_segments: Vec<CompiledPathSegment>,
+    operator: ObjectSearchOperator,
+    value_cmp: Option<String>,
+    regex: Option<Regex>,
+}
+
+struct CompiledPathSegment {
+    raw: String,
+    lower: String,
+    exact_id: Option<u32>,
+}
+
 impl JsonIndex {
     pub fn get_children_slice(&self, node_id: u32) -> &[u32] {
         let node = &self.nodes[node_id as usize];
@@ -94,8 +126,7 @@ impl JsonIndex {
     }
 
     pub fn from_str(json: &str) -> Result<Self, String> {
-        let value: serde_json::Value =
-            sonic_rs::from_str(json).map_err(|e| e.to_string())?;
+        let value: serde_json::Value = sonic_rs::from_str(json).map_err(|e| e.to_string())?;
         Self::build_index(value)
     }
 
@@ -218,11 +249,10 @@ impl JsonIndex {
                 let end = start + node.children_len as usize;
                 children[start..end].to_vec()
             };
-            let subtree_len = 1
-                + child_ids
-                    .iter()
-                    .map(|&child_id| nodes[child_id as usize].subtree_len)
-                    .sum::<u32>();
+            let subtree_len = 1 + child_ids
+                .iter()
+                .map(|&child_id| nodes[child_id as usize].subtree_len)
+                .sum::<u32>();
             nodes[idx].subtree_len = subtree_len;
         }
 
@@ -235,9 +265,7 @@ impl JsonIndex {
     }
 
     pub fn expanded_visible_count(&self) -> usize {
-        self.nodes[self.root as usize]
-            .subtree_len
-            .saturating_sub(1) as usize
+        self.nodes[self.root as usize].subtree_len.saturating_sub(1) as usize
     }
 
     pub fn get_expanded_slice(&self, offset: usize, limit: usize) -> Vec<VisibleSliceRow> {
@@ -503,7 +531,11 @@ impl JsonIndex {
                                 } else {
                                     k.to_lowercase()
                                 };
-                                if exact_match { k_cmp == query_lower } else { k_cmp.contains(&query_lower) }
+                                if exact_match {
+                                    k_cmp == query_lower
+                                } else {
+                                    k_cmp.contains(&query_lower)
+                                }
                             })
                             .unwrap_or(false)
                     } else {
@@ -524,7 +556,11 @@ impl JsonIndex {
                                 } else {
                                     v.to_lowercase()
                                 };
-                                if exact_match { v_cmp == query_lower } else { v_cmp.contains(&query_lower) }
+                                if exact_match {
+                                    v_cmp == query_lower
+                                } else {
+                                    v_cmp.contains(&query_lower)
+                                }
                             })
                             .unwrap_or(false)
                     } else {
@@ -549,7 +585,9 @@ impl JsonIndex {
             return Some(self.root);
         }
 
-        let normalized = trimmed.strip_prefix("$.").or_else(|| trimmed.strip_prefix('$'))?;
+        let normalized = trimmed
+            .strip_prefix("$.")
+            .or_else(|| trimmed.strip_prefix('$'))?;
         if normalized.is_empty() {
             return Some(self.root);
         }
@@ -580,6 +618,262 @@ impl JsonIndex {
             current = self.nodes[id as usize].parent;
         }
         false
+    }
+
+    fn compile_object_search_filters(
+        &self,
+        filters: &[ObjectSearchFilter],
+        key_case_sensitive: bool,
+        value_case_sensitive: bool,
+    ) -> Option<Vec<CompiledObjectSearchFilter>> {
+        let mut compiled = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let path = filter.path.trim();
+            if path.is_empty() {
+                return None;
+            }
+
+            let mut path_segments = Vec::new();
+            for segment in path.split('.').filter(|segment| !segment.is_empty()) {
+                let exact_id = self.keys.id_of(segment);
+                if key_case_sensitive && exact_id.is_none() {
+                    return None;
+                }
+                path_segments.push(CompiledPathSegment {
+                    raw: segment.to_string(),
+                    lower: segment.to_lowercase(),
+                    exact_id,
+                });
+            }
+            if path_segments.is_empty() {
+                return None;
+            }
+
+            let value = filter.value.as_ref().map(|value| value.trim().to_string());
+            let value_cmp = match filter.operator {
+                ObjectSearchOperator::Exists => None,
+                ObjectSearchOperator::Regex => None,
+                ObjectSearchOperator::Contains | ObjectSearchOperator::Equals => {
+                    let value = value.as_ref()?;
+                    Some(if value_case_sensitive {
+                        value.clone()
+                    } else {
+                        value.to_lowercase()
+                    })
+                }
+            };
+            let regex = match filter.operator {
+                ObjectSearchOperator::Regex => {
+                    let pattern = value.as_ref()?;
+                    let pattern = if value_case_sensitive {
+                        pattern.clone()
+                    } else {
+                        format!("(?i){pattern}")
+                    };
+                    Some(Regex::new(&pattern).ok()?)
+                }
+                _ => None,
+            };
+
+            compiled.push(CompiledObjectSearchFilter {
+                path_segments,
+                operator: filter.operator.clone(),
+                value_cmp,
+                regex,
+            });
+        }
+        Some(compiled)
+    }
+
+    fn resolve_relative_path(
+        &self,
+        start_node_id: u32,
+        path_segments: &[CompiledPathSegment],
+        key_case_sensitive: bool,
+    ) -> Option<u32> {
+        let mut current = start_node_id;
+        for segment in path_segments {
+            current = self
+                .get_children_slice(current)
+                .iter()
+                .copied()
+                .find(|&child_id| {
+                    let Some(child_key_id) = self.nodes[child_id as usize].key else {
+                        return false;
+                    };
+                    if key_case_sensitive {
+                        return Some(child_key_id) == segment.exact_id;
+                    }
+                    let child_key = self.keys.get(child_key_id);
+                    child_key.eq_ignore_ascii_case(&segment.raw)
+                        || child_key.to_lowercase() == segment.lower
+                })?;
+        }
+        Some(current)
+    }
+
+    fn scalar_value_for_filter(&self, node_id: u32) -> Option<String> {
+        match &self.nodes[node_id as usize].value {
+            NodeValue::Str(s) => Some(s.clone()),
+            NodeValue::Num(n) => Some(n.to_string()),
+            NodeValue::Bool(b) => Some(b.to_string()),
+            NodeValue::Null => Some("null".to_string()),
+            NodeValue::Object | NodeValue::Array => None,
+        }
+    }
+
+    fn object_filter_matches(
+        &self,
+        object_id: u32,
+        filter: &CompiledObjectSearchFilter,
+        key_case_sensitive: bool,
+        value_case_sensitive: bool,
+    ) -> bool {
+        let Some(target_id) =
+            self.resolve_relative_path(object_id, &filter.path_segments, key_case_sensitive)
+        else {
+            return false;
+        };
+
+        match filter.operator {
+            ObjectSearchOperator::Exists => true,
+            ObjectSearchOperator::Regex => self
+                .scalar_value_for_filter(target_id)
+                .and_then(|value| filter.regex.as_ref().map(|regex| regex.is_match(&value)))
+                .unwrap_or(false),
+            ObjectSearchOperator::Contains | ObjectSearchOperator::Equals => self
+                .scalar_value_for_filter(target_id)
+                .map(|value| {
+                    let value_cmp = if value_case_sensitive {
+                        value
+                    } else {
+                        value.to_lowercase()
+                    };
+                    let needle = filter.value_cmp.as_deref().unwrap_or_default();
+                    if filter.operator == ObjectSearchOperator::Equals {
+                        value_cmp == needle
+                    } else {
+                        value_cmp.contains(needle)
+                    }
+                })
+                .unwrap_or(false),
+        }
+    }
+
+    pub fn search_objects(
+        &self,
+        filters: &[ObjectSearchFilter],
+        key_case_sensitive: bool,
+        value_case_sensitive: bool,
+        max_results: usize,
+        path: Option<&str>,
+    ) -> Vec<u32> {
+        if filters.is_empty() || max_results == 0 {
+            return vec![];
+        }
+
+        let scope_node_id = match path.map(str::trim).filter(|path| !path.is_empty()) {
+            Some(path) => match self.resolve_path(path) {
+                Some(node_id) => Some(node_id),
+                None => return vec![],
+            },
+            None => None,
+        };
+
+        let Some(compiled_filters) =
+            self.compile_object_search_filters(filters, key_case_sensitive, value_case_sensitive)
+        else {
+            return vec![];
+        };
+
+        let mut matched_ids: Vec<u32> = self
+            .nodes
+            .par_iter()
+            .filter_map(|node| {
+                if !matches!(node.value, NodeValue::Object) {
+                    return None;
+                }
+                if let Some(scope_id) = scope_node_id {
+                    if !self.is_descendant_or_self(node.id, scope_id) {
+                        return None;
+                    }
+                }
+                if compiled_filters
+                    .iter()
+                    .all(|filter| {
+                        self.object_filter_matches(
+                            node.id,
+                            filter,
+                            key_case_sensitive,
+                            value_case_sensitive,
+                        )
+                    })
+                {
+                    Some(node.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        matched_ids
+            .par_sort_unstable_by_key(|&node_id| self.nodes[node_id as usize].preorder_index);
+        matched_ids.truncate(max_results);
+        matched_ids
+    }
+
+    pub fn suggest_property_paths(&self, prefix: &str, limit: usize) -> Vec<String> {
+        let trimmed = prefix.trim();
+        if limit == 0 {
+            return vec![];
+        }
+
+        let (base, segment_prefix) = match trimmed.rfind('.') {
+            Some(idx) => (&trimmed[..=idx], &trimmed[idx + 1..]),
+            None => ("", trimmed),
+        };
+        let prefix_lower = segment_prefix.to_lowercase();
+
+        let mut suggestions: Vec<&str> = self
+            .keys
+            .strings
+            .iter()
+            .map(String::as_str)
+            .filter(|candidate| {
+                if segment_prefix.is_empty() {
+                    true
+                } else if candidate.starts_with(segment_prefix) {
+                    true
+                } else {
+                    candidate.to_lowercase().starts_with(&prefix_lower)
+                }
+            })
+            .collect();
+
+        suggestions.sort_unstable_by(|a, b| {
+            let a_is_numeric = a.chars().all(|ch| ch.is_ascii_digit());
+            let b_is_numeric = b.chars().all(|ch| ch.is_ascii_digit());
+            let a_rank = (
+                !a.starts_with(segment_prefix),
+                segment_prefix.is_empty() && a_is_numeric,
+                a.len(),
+                *a,
+            );
+            let b_rank = (
+                !b.starts_with(segment_prefix),
+                segment_prefix.is_empty() && b_is_numeric,
+                b.len(),
+                *b,
+            );
+            a_rank.cmp(&b_rank)
+        });
+        suggestions.dedup();
+
+        suggestions
+            .into_iter()
+            .take(limit)
+            .map(|candidate| format!("{base}{candidate}"))
+            .collect()
     }
 }
 
@@ -778,7 +1072,10 @@ mod tests {
 
     #[test]
     fn search_max_results() {
-        let arr: String = (0..20).map(|i| format!("\"item{}\"", i)).collect::<Vec<_>>().join(",");
+        let arr: String = (0..20)
+            .map(|i| format!("\"item{}\"", i))
+            .collect::<Vec<_>>()
+            .join(",");
         let json = format!("[{}]", arr);
         let index = idx(&json);
         let results = index.search("item", "values", false, false, false, 5, None);
@@ -821,8 +1118,115 @@ mod tests {
     #[test]
     fn search_invalid_path_returns_empty_results() {
         let index = idx(r#"{"users":[{"name":"Alice"}]}"#);
-        let results = index.search("Alice", "values", false, false, false, 10, Some("$.missing"));
+        let results = index.search(
+            "Alice",
+            "values",
+            false,
+            false,
+            false,
+            10,
+            Some("$.missing"),
+        );
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_objects_by_single_property() {
+        let index = idx(
+            r#"{"items":[{"marketing_lingua":"Acciaio Anticato Lucido","title":"A"},{"marketing_lingua":"Ottone","title":"B"}]}"#,
+        );
+        let results = index.search_objects(
+            &[ObjectSearchFilter {
+                path: "marketing_lingua".to_string(),
+                operator: ObjectSearchOperator::Contains,
+                value: Some("Acciaio".to_string()),
+            }],
+            false,
+            false,
+            10,
+            None,
+        );
+        let paths: Vec<String> = results.into_iter().map(|id| index.get_path(id)).collect();
+        assert_eq!(paths, vec!["$.items.0"]);
+    }
+
+    #[test]
+    fn search_objects_matches_all_filters() {
+        let index = idx(
+            r#"{"items":[{"marketing_lingua":"Acciaio Anticato Lucido","finish":"Satinato"},{"marketing_lingua":"Acciaio Anticato Lucido","finish":"Lucido"}]}"#,
+        );
+        let results = index.search_objects(
+            &[
+                ObjectSearchFilter {
+                    path: "marketing_lingua".to_string(),
+                    operator: ObjectSearchOperator::Contains,
+                    value: Some("Acciaio".to_string()),
+                },
+                ObjectSearchFilter {
+                    path: "finish".to_string(),
+                    operator: ObjectSearchOperator::Equals,
+                    value: Some("Lucido".to_string()),
+                },
+            ],
+            false,
+            false,
+            10,
+            None,
+        );
+        let paths: Vec<String> = results.into_iter().map(|id| index.get_path(id)).collect();
+        assert_eq!(paths, vec!["$.items.1"]);
+    }
+
+    #[test]
+    fn search_objects_is_limited_to_scope_path() {
+        let index =
+            idx(r#"{"catalog":{"items":[{"code":"A1"}]},"archive":{"items":[{"code":"A1"}]}}"#);
+        let results = index.search_objects(
+            &[ObjectSearchFilter {
+                path: "code".to_string(),
+                operator: ObjectSearchOperator::Equals,
+                value: Some("A1".to_string()),
+            }],
+            true,
+            true,
+            10,
+            Some("$.catalog.items"),
+        );
+        let paths: Vec<String> = results.into_iter().map(|id| index.get_path(id)).collect();
+        assert_eq!(paths, vec!["$.catalog.items.0"]);
+    }
+
+    #[test]
+    fn suggest_property_paths_uses_existing_keys() {
+        let index = idx(r#"{"content":{"mainImage":{"url":"x"}},"marketing_lingua":"it"}"#);
+        let suggestions = index.suggest_property_paths("content.ma", 5);
+        assert!(suggestions.contains(&"content.mainImage".to_string()));
+    }
+
+    #[test]
+    fn search_objects_can_match_keys_case_insensitively() {
+        let index = idx(r#"{"items":[{"Marketing_Lingua":"Acciaio"}]}"#);
+        let results = index.search_objects(
+            &[ObjectSearchFilter {
+                path: "marketing_lingua".to_string(),
+                operator: ObjectSearchOperator::Equals,
+                value: Some("Acciaio".to_string()),
+            }],
+            false,
+            true,
+            10,
+            None,
+        );
+        let paths: Vec<String> = results.into_iter().map(|id| index.get_path(id)).collect();
+        assert_eq!(paths, vec!["$.items.0"]);
+    }
+
+    #[test]
+    fn suggest_property_paths_returns_initial_suggestions_on_empty_prefix() {
+        let index = idx(r#"{"content":{"mainImage":{"url":"x"}},"marketing_lingua":"it"}"#);
+        let suggestions = index.suggest_property_paths("", 5);
+        assert!(!suggestions.is_empty());
+        assert!(suggestions.contains(&"content".to_string()));
     }
 
     #[test]
@@ -832,8 +1236,12 @@ mod tests {
         let b_id = index.get_children_slice(index.root)[1];
         let x_id = index.get_children_slice(a_id)[0];
 
-        assert!(index.nodes[a_id as usize].preorder_index < index.nodes[x_id as usize].preorder_index);
-        assert!(index.nodes[x_id as usize].preorder_index < index.nodes[b_id as usize].preorder_index);
+        assert!(
+            index.nodes[a_id as usize].preorder_index < index.nodes[x_id as usize].preorder_index
+        );
+        assert!(
+            index.nodes[x_id as usize].preorder_index < index.nodes[b_id as usize].preorder_index
+        );
     }
 
     // ── node values ───────────────────────────────────────────────────────────
@@ -854,19 +1262,45 @@ mod tests {
             .iter()
             .map(|&id| index.keys.get(index.nodes[id as usize].key.unwrap()))
             .collect();
-        assert_eq!(type_of(children[keys.iter().position(|&k| k == "s").unwrap()]), "string");
-        assert_eq!(type_of(children[keys.iter().position(|&k| k == "n").unwrap()]), "number");
-        assert_eq!(type_of(children[keys.iter().position(|&k| k == "b").unwrap()]), "bool");
-        assert_eq!(type_of(children[keys.iter().position(|&k| k == "null").unwrap()]), "null");
-        assert_eq!(type_of(children[keys.iter().position(|&k| k == "arr").unwrap()]), "array");
-        assert_eq!(type_of(children[keys.iter().position(|&k| k == "obj").unwrap()]), "object");
+        assert_eq!(
+            type_of(children[keys.iter().position(|&k| k == "s").unwrap()]),
+            "string"
+        );
+        assert_eq!(
+            type_of(children[keys.iter().position(|&k| k == "n").unwrap()]),
+            "number"
+        );
+        assert_eq!(
+            type_of(children[keys.iter().position(|&k| k == "b").unwrap()]),
+            "bool"
+        );
+        assert_eq!(
+            type_of(children[keys.iter().position(|&k| k == "null").unwrap()]),
+            "null"
+        );
+        assert_eq!(
+            type_of(children[keys.iter().position(|&k| k == "arr").unwrap()]),
+            "array"
+        );
+        assert_eq!(
+            type_of(children[keys.iter().position(|&k| k == "obj").unwrap()]),
+            "object"
+        );
     }
 
     #[test]
     fn string_pool_deduplicates_keys() {
         let index = idx(r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#);
         // "name" deve essere internato una volta sola
-        assert_eq!(index.keys.strings.iter().filter(|s| s.as_str() == "name").count(), 1);
+        assert_eq!(
+            index
+                .keys
+                .strings
+                .iter()
+                .filter(|s| s.as_str() == "name")
+                .count(),
+            1
+        );
     }
 
     #[test]

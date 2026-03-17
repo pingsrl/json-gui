@@ -8,6 +8,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { useJsonStore } from "./store";
 import { useI18n } from "./i18n";
 import { Toolbar } from "./components/Toolbar";
+import { SearchBar } from "./components/SearchBar";
 import { SearchPanel } from "./components/SearchPanel";
 import { TreePanel } from "./components/TreePanel";
 import { StatusBar } from "./components/StatusBar";
@@ -137,7 +138,7 @@ export default function App() {
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "f") {
         e.preventDefault();
-        document.getElementById("search-input")?.focus();
+        document.getElementById("primary-search-input")?.focus();
       }
       if ((e.metaKey || e.ctrlKey) && e.key === "o") {
         e.preventDefault();
@@ -264,6 +265,8 @@ export default function App() {
         darkMode={darkMode}
         onDarkModeToggle={() => setDarkMode((v) => !v)}
       />
+
+      <SearchBar />
 
       {/* Contenuto principale — 3 colonne */}
       <div className="flex flex-1 overflow-hidden">

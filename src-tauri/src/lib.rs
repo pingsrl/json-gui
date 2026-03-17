@@ -4,10 +4,10 @@ mod schema;
 
 use commands::AppState;
 use std::sync::{Arc, Mutex};
-use tauri::{Emitter, Manager};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -30,44 +30,71 @@ pub fn run() {
             }
 
             // ── Menu nativo ──────────────────────────────────────────────────
-            let open_i         = MenuItem::with_id(app, "open",         "Apri...",                   true, Some("CmdOrCtrl+O"))?;
-            let recent_i       = MenuItem::with_id(app, "recent",       "Recenti…",                  true, None::<&str>)?;
-            let reload_i       = MenuItem::with_id(app, "reload",       "Ricarica",                  true, Some("CmdOrCtrl+R"))?;
-            let check_update_i = MenuItem::with_id(app, "check-update", "Controlla aggiornamenti…",  true, None::<&str>)?;
-            let export_i       = MenuItem::with_id(app, "export",       "Esporta tipo…",             true, Some("CmdOrCtrl+Shift+E"))?;
+            let open_i = MenuItem::with_id(app, "open", "Apri...", true, Some("CmdOrCtrl+O"))?;
+            let recent_i = MenuItem::with_id(app, "recent", "Recenti…", true, None::<&str>)?;
+            let reload_i = MenuItem::with_id(app, "reload", "Ricarica", true, Some("CmdOrCtrl+R"))?;
+            let check_update_i = MenuItem::with_id(
+                app,
+                "check-update",
+                "Controlla aggiornamenti…",
+                true,
+                None::<&str>,
+            )?;
+            let export_i = MenuItem::with_id(
+                app,
+                "export",
+                "Esporta tipo…",
+                true,
+                Some("CmdOrCtrl+Shift+E"),
+            )?;
 
-            let file_menu = Submenu::with_items(app, "File", true, &[
-                &open_i,
-                &recent_i,
-                &PredefinedMenuItem::separator(app)?,
-                &reload_i,
-                &PredefinedMenuItem::separator(app)?,
-                &export_i,
-            ])?;
+            let file_menu = Submenu::with_items(
+                app,
+                "File",
+                true,
+                &[
+                    &open_i,
+                    &recent_i,
+                    &PredefinedMenuItem::separator(app)?,
+                    &reload_i,
+                    &PredefinedMenuItem::separator(app)?,
+                    &export_i,
+                ],
+            )?;
 
-            let edit_menu = Submenu::with_items(app, "Edit", true, &[
-                &PredefinedMenuItem::undo(app, None)?,
-                &PredefinedMenuItem::redo(app, None)?,
-                &PredefinedMenuItem::separator(app)?,
-                &PredefinedMenuItem::cut(app, None)?,
-                &PredefinedMenuItem::copy(app, None)?,
-                &PredefinedMenuItem::paste(app, None)?,
-                &PredefinedMenuItem::select_all(app, None)?,
-            ])?;
+            let edit_menu = Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?;
 
             #[cfg(target_os = "macos")]
-            let app_menu = Submenu::with_items(app, "JsonGUI", true, &[
-                &PredefinedMenuItem::about(app, None, None)?,
-                &check_update_i,
-                &PredefinedMenuItem::separator(app)?,
-                &PredefinedMenuItem::services(app, None)?,
-                &PredefinedMenuItem::separator(app)?,
-                &PredefinedMenuItem::hide(app, None)?,
-                &PredefinedMenuItem::hide_others(app, None)?,
-                &PredefinedMenuItem::show_all(app, None)?,
-                &PredefinedMenuItem::separator(app)?,
-                &PredefinedMenuItem::quit(app, None)?,
-            ])?;
+            let app_menu = Submenu::with_items(
+                app,
+                "JsonGUI",
+                true,
+                &[
+                    &PredefinedMenuItem::about(app, None, None)?,
+                    &check_update_i,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::services(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::show_all(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::quit(app, None)?,
+                ],
+            )?;
 
             #[cfg(target_os = "macos")]
             let menu = Menu::with_items(app, &[&app_menu, &file_menu, &edit_menu])?;
@@ -76,15 +103,23 @@ pub fn run() {
 
             app.set_menu(menu)?;
 
-            app.on_menu_event(|app, event| {
-                match event.id().as_ref() {
-                    "open"         => { app.emit("menu-open",         ()).ok(); }
-                    "reload"       => { app.emit("menu-reload",       ()).ok(); }
-                    "recent"       => { app.emit("menu-recent",       ()).ok(); }
-                    "check-update" => { app.emit("menu-check-update", ()).ok(); }
-                    "export"       => { app.emit("menu-export",        ()).ok(); }
-                    _ => {}
+            app.on_menu_event(|app, event| match event.id().as_ref() {
+                "open" => {
+                    app.emit("menu-open", ()).ok();
                 }
+                "reload" => {
+                    app.emit("menu-reload", ()).ok();
+                }
+                "recent" => {
+                    app.emit("menu-recent", ()).ok();
+                }
+                "check-update" => {
+                    app.emit("menu-check-update", ()).ok();
+                }
+                "export" => {
+                    app.emit("menu-export", ()).ok();
+                }
+                _ => {}
             });
 
             Ok(())
@@ -94,6 +129,8 @@ pub fn run() {
             commands::get_children,
             commands::get_path,
             commands::search,
+            commands::search_objects,
+            commands::suggest_property_paths,
             commands::get_raw,
             commands::expand_to,
             commands::get_expanded_slice,

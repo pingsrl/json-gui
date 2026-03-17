@@ -22,9 +22,18 @@ export interface SearchResult {
   path: string;
   key: string | null;
   value_preview: string;
+  kind: "node" | "object";
+  match_preview?: string | null;
 }
 
 export type SearchSortMode = "relevance" | "file";
+export type SearchMode = "text" | "object";
+
+export interface ObjectSearchFilter {
+  path: string;
+  operator: "contains" | "equals" | "regex" | "exists";
+  value?: string;
+}
 
 interface FileInfo {
   node_count: number;
@@ -172,7 +181,7 @@ export function sortSearchResults(
 ): SearchResult[] {
   const sorted = results.slice();
   sorted.sort((a, b) => {
-    if (sortMode === "file") {
+    if (sortMode === "file" || a.kind === "object" || b.kind === "object") {
       return a.file_order - b.file_order;
     }
     const relevanceDelta =
@@ -200,6 +209,9 @@ interface JsonStore {
   visibleNodes: VNode[];
   selectedNodeSiblings: NodeDto[] | null;
   recentFiles: string[];
+  searchMode: SearchMode;
+  activeSearchMode: SearchMode | null;
+  hasActiveSearch: boolean;
   searchScopePath: string;
   searchSort: SearchSortMode;
   lastSearchQuery: string;
@@ -221,6 +233,13 @@ interface JsonStore {
     exactMatch: boolean,
     path: string
   ) => Promise<void>;
+  searchObjects: (
+    filters: ObjectSearchFilter[],
+    keyCaseSensitive: boolean,
+    valueCaseSensitive: boolean,
+    path: string
+  ) => Promise<void>;
+  setSearchMode: (mode: SearchMode) => void;
   setSearchScopePath: (path: string) => void;
   setSearchSort: (sortMode: SearchSortMode) => void;
   expandAll: () => Promise<void>;
@@ -248,6 +267,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   visibleNodes: [],
   selectedNodeSiblings: null,
   recentFiles: loadRecentFiles(),
+  searchMode: "text",
+  activeSearchMode: null,
+  hasActiveSearch: false,
   searchScopePath: "",
   searchSort: "relevance",
   lastSearchQuery: "",
@@ -295,6 +317,8 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       focusedNodeId: null,
       visibleNodes,
       recentFiles,
+      activeSearchMode: null,
+      hasActiveSearch: false,
       searchScopePath: "",
       lastSearchQuery: "",
       searchResults: []
@@ -334,6 +358,8 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       selectedNodeSiblings: null,
       focusedNodeId: null,
       visibleNodes,
+      activeSearchMode: null,
+      hasActiveSearch: false,
       searchScopePath: "",
       lastSearchQuery: "",
       searchResults: []
@@ -430,7 +456,13 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       get().clearSearch();
       return;
     }
-    set({ searching: true, selectedNode: null, selectedNodeId: null });
+    set({
+      searching: true,
+      selectedNode: null,
+      selectedNodeId: null,
+      activeSearchMode: "text",
+      hasActiveSearch: true
+    });
     try {
       const results = await invoke<SearchResult[]>("search", {
         query: {
@@ -447,13 +479,61 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       set({
         searchResults: sortedResults,
         searching: false,
-        lastSearchQuery: query
+        lastSearchQuery: query,
+        activeSearchMode: "text",
+        hasActiveSearch: true
       });
     } catch (err) {
       console.error("Search error:", err);
-      set({ searching: false });
+      set({ searching: false, activeSearchMode: "text", hasActiveSearch: true });
     }
   },
+
+  searchObjects: async (
+    filters: ObjectSearchFilter[],
+    keyCaseSensitive: boolean,
+    valueCaseSensitive: boolean,
+    path: string
+  ) => {
+    if (filters.length === 0) {
+      get().clearSearch();
+      return;
+    }
+    set({
+      searching: true,
+      selectedNode: null,
+      selectedNodeId: null,
+      activeSearchMode: "object",
+      hasActiveSearch: true
+    });
+    try {
+      const results = await invoke<SearchResult[]>("search_objects", {
+        query: {
+          filters,
+          key_case_sensitive: keyCaseSensitive,
+          value_case_sensitive: valueCaseSensitive,
+          max_results: 500,
+          path: path.trim() || null
+        }
+      });
+      set({
+        searchResults: sortSearchResults(results, "", "file"),
+        searching: false,
+        lastSearchQuery: "",
+        activeSearchMode: "object",
+        hasActiveSearch: true
+      });
+    } catch (err) {
+      console.error("Object search error:", err);
+      set({
+        searching: false,
+        activeSearchMode: "object",
+        hasActiveSearch: true
+      });
+    }
+  },
+
+  setSearchMode: (searchMode: SearchMode) => set({ searchMode }),
 
   setSearchScopePath: (path: string) => {
     set({ searchScopePath: path });
@@ -588,7 +668,13 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   },
 
   clearSearch: () =>
-    set({ searchResults: [], searching: false, lastSearchQuery: "" }),
+    set({
+      searchResults: [],
+      searching: false,
+      lastSearchQuery: "",
+      activeSearchMode: null,
+      hasActiveSearch: false
+    }),
 
   showContextMenu: (cm: ContextMenuState) => set({ contextMenu: cm }),
   hideContextMenu: () => set({ contextMenu: null })

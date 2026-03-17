@@ -81,7 +81,10 @@ fn merge_object_array(index: &JsonIndex, ids: &[u32]) -> Schema {
         .into_iter()
         .map(|(key, (schemas, count))| {
             let opt = count < total;
-            let merged = schemas.into_iter().reduce(merge_schemas).unwrap_or(Schema::Any);
+            let merged = schemas
+                .into_iter()
+                .reduce(merge_schemas)
+                .unwrap_or(Schema::Any);
             (key, merged, opt)
         })
         .collect();
@@ -101,10 +104,7 @@ fn merge_schemas(a: Schema, b: Schema) -> Schema {
     }
 }
 
-fn merge_obj_fields(
-    a: Vec<(String, Schema, bool)>,
-    b: Vec<(String, Schema, bool)>,
-) -> Schema {
+fn merge_obj_fields(a: Vec<(String, Schema, bool)>, b: Vec<(String, Schema, bool)>) -> Schema {
     let mut map: BTreeMap<String, (Schema, bool)> = BTreeMap::new();
     let b_keys: HashSet<String> = b.iter().map(|(k, _, _)| k.clone()).collect();
 
@@ -149,13 +149,19 @@ struct Namer {
 
 impl Namer {
     fn new() -> Self {
-        Self { used: HashMap::new() }
+        Self {
+            used: HashMap::new(),
+        }
     }
     fn next(&mut self, hint: &str) -> String {
         let base = to_pascal(hint);
         let n = self.used.entry(base.clone()).or_insert(0);
         *n += 1;
-        if *n == 1 { base } else { format!("{}{}", base, n) }
+        if *n == 1 {
+            base
+        } else {
+            format!("{}{}", base, n)
+        }
     }
 }
 
@@ -216,7 +222,10 @@ fn collect_schema(
                 let tr = collect_schema(s, key, out, namer);
                 resolved.push((key.clone(), tr, *opt));
             }
-            out.push(NamedObj { name: name.clone(), fields: resolved });
+            out.push(NamedObj {
+                name: name.clone(),
+                fields: resolved,
+            });
             TypeRef::Ref(name)
         }
     }
@@ -269,24 +278,21 @@ fn to_snake(s: &str) -> String {
         }
     }
     // Rimuovi underscore consecutivi
-    let deduped: String = result
-        .chars()
-        .fold(String::new(), |mut acc, c| {
-            if c == '_' && acc.ends_with('_') {
-            } else {
-                acc.push(c);
-            }
-            acc
-        });
+    let deduped: String = result.chars().fold(String::new(), |mut acc, c| {
+        if c == '_' && acc.ends_with('_') {
+        } else {
+            acc.push(c);
+        }
+        acc
+    });
     let trimmed = deduped.trim_matches('_').to_string();
     // Parole riservate Rust
     const RUST_KW: &[&str] = &[
-        "type", "fn", "struct", "enum", "match", "use", "mod", "impl", "pub",
-        "crate", "self", "super", "where", "let", "mut", "ref", "move", "dyn",
-        "trait", "for", "in", "if", "else", "loop", "while", "return", "break",
-        "continue", "as", "const", "static", "unsafe", "extern", "box", "yield",
-        "async", "await", "try", "abstract", "become", "do", "final", "macro",
-        "override", "priv", "typeof", "unsized", "virtual",
+        "type", "fn", "struct", "enum", "match", "use", "mod", "impl", "pub", "crate", "self",
+        "super", "where", "let", "mut", "ref", "move", "dyn", "trait", "for", "in", "if", "else",
+        "loop", "while", "return", "break", "continue", "as", "const", "static", "unsafe",
+        "extern", "box", "yield", "async", "await", "try", "abstract", "become", "do", "final",
+        "macro", "override", "priv", "typeof", "unsized", "virtual",
     ];
     if RUST_KW.contains(&trimmed.as_str()) {
         format!("r#{}", trimmed)
@@ -335,7 +341,12 @@ pub fn generate_typescript(index: &JsonIndex) -> String {
         out.push_str(&c);
     }
     if !matches!(&root_ref, TypeRef::Ref(_)) {
-        writeln!(out, "export type Root = {};\n", format_typeref_ts(&root_ref)).ok();
+        writeln!(
+            out,
+            "export type Root = {};\n",
+            format_typeref_ts(&root_ref)
+        )
+        .ok();
     }
 
     for obj in &types {
@@ -366,7 +377,11 @@ fn format_typeref_zod(tr: &TypeRef, opt: bool) -> String {
         TypeRef::Arr(inner) => format!("z.array({})", format_typeref_zod(inner, false)),
         TypeRef::Ref(name) => format!("{}Schema", name),
     };
-    if opt { format!("{}.optional()", inner) } else { inner }
+    if opt {
+        format!("{}.optional()", inner)
+    } else {
+        inner
+    }
 }
 
 pub fn generate_zod(index: &JsonIndex) -> String {
@@ -389,12 +404,22 @@ pub fn generate_zod(index: &JsonIndex) -> String {
 
     // Export inferred types
     for obj in &types {
-        writeln!(out, "export type {} = z.infer<typeof {}Schema>;", obj.name, obj.name).ok();
+        writeln!(
+            out,
+            "export type {} = z.infer<typeof {}Schema>;",
+            obj.name, obj.name
+        )
+        .ok();
     }
 
     // Root alias if array
     if !matches!(&root_ref, TypeRef::Ref(_)) {
-        writeln!(out, "\nexport const RootSchema = {};", format_typeref_zod(&root_ref, false)).ok();
+        writeln!(
+            out,
+            "\nexport const RootSchema = {};",
+            format_typeref_zod(&root_ref, false)
+        )
+        .ok();
         writeln!(out, "export type Root = z.infer<typeof RootSchema>;").ok();
     }
 
@@ -412,7 +437,11 @@ fn format_typeref_rs(tr: &TypeRef, opt: bool) -> String {
         TypeRef::Arr(inner) => format!("Vec<{}>", format_typeref_rs(inner, false)),
         TypeRef::Ref(name) => name.clone(),
     };
-    if opt { format!("Option<{}>", inner) } else { inner }
+    if opt {
+        format!("Option<{}>", inner)
+    } else {
+        inner
+    }
 }
 
 pub fn generate_rust(index: &JsonIndex) -> String {
@@ -430,10 +459,19 @@ pub fn generate_rust(index: &JsonIndex) -> String {
         for (key, tr, opt) in &obj.fields {
             let field = to_snake(key);
             if field != *key {
-                writeln!(out, "    #[serde(rename = \"{}\")]", key.replace('"', "\\\"")).ok();
+                writeln!(
+                    out,
+                    "    #[serde(rename = \"{}\")]",
+                    key.replace('"', "\\\"")
+                )
+                .ok();
             }
             if *opt {
-                writeln!(out, "    #[serde(skip_serializing_if = \"Option::is_none\")]").ok();
+                writeln!(
+                    out,
+                    "    #[serde(skip_serializing_if = \"Option::is_none\")]"
+                )
+                .ok();
             }
             writeln!(out, "    pub {}: {},", field, format_typeref_rs(tr, *opt)).ok();
         }
@@ -489,7 +527,11 @@ fn format_typeref_py(tr: &TypeRef, opt: bool) -> String {
         TypeRef::Arr(inner) => format!("list[{}]", format_typeref_py(inner, false)),
         TypeRef::Ref(name) => name.clone(),
     };
-    if opt { format!("NotRequired[{}]", inner) } else { inner }
+    if opt {
+        format!("NotRequired[{}]", inner)
+    } else {
+        inner
+    }
 }
 
 pub fn generate_python(index: &JsonIndex) -> String {
@@ -566,7 +608,10 @@ pub fn generate_json_schema(index: &JsonIndex) -> String {
         if !required.is_empty() {
             def.insert("required".into(), serde_json::Value::Array(required));
         }
-        def.insert("additionalProperties".into(), serde_json::Value::Bool(false));
+        def.insert(
+            "additionalProperties".into(),
+            serde_json::Value::Bool(false),
+        );
         defs.insert(obj.name.clone(), serde_json::Value::Object(def));
     }
 
