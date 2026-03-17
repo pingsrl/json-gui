@@ -39,13 +39,15 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
 
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
+    e.stopPropagation();
+    void selectNode(node);
     showContextMenu({
       x: e.clientX,
       y: e.clientY,
       nodeId: node.id,
       parentId: node.parent_id ?? null,
-      valueType: node.value_type,
-      valuePreview: node.value_preview
+      nodeKey: node.key,
+      valueType: node.value_type
     });
   };
 

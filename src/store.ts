@@ -146,8 +146,8 @@ export interface ContextMenuState {
   y: number;
   nodeId: number;
   parentId: number | null;
+  nodeKey: string | null;
   valueType: string;
-  valuePreview: string;
 }
 
 function getSearchRelevanceScore(result: SearchResult, query: string): number {

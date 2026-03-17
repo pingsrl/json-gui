@@ -21,12 +21,29 @@ export const ContextMenu: FC = () => {
 
   if (!contextMenu) return null;
 
-  const { x, y, nodeId, parentId, valueType, valuePreview } = contextMenu;
+  const { x, y, nodeId, parentId, nodeKey, valueType } = contextMenu;
+  const hasNodeKey = nodeKey !== null;
+  const hasParentNode = parentId !== null;
+  const itemClassName =
+    "w-full text-left px-3 py-1.5 transition-colors hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent";
 
   const focusSearchInput = () => {
     requestAnimationFrame(() => {
       document.getElementById("search-input")?.focus();
     });
+  };
+
+  const copyKey = async () => {
+    if (!hasNodeKey) {
+      hideContextMenu();
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(nodeKey);
+    } catch (err) {
+      console.error("copyKey error:", err);
+    }
+    hideContextMenu();
   };
 
   const copyPath = async () => {
@@ -42,11 +59,11 @@ export const ContextMenu: FC = () => {
 
   const copyValue = async () => {
     try {
-      if (valueType === "object" || valueType === "array") {
-        const raw = await invoke<string>("get_raw", { nodeId });
-        await navigator.clipboard.writeText(raw);
+      const raw = await invoke<string>("get_raw", { nodeId });
+      if (valueType === "string") {
+        await navigator.clipboard.writeText(JSON.parse(raw));
       } else {
-        await navigator.clipboard.writeText(valuePreview);
+        await navigator.clipboard.writeText(raw);
       }
     } catch (err) {
       console.error("copyValue error:", err);
@@ -87,32 +104,46 @@ export const ContextMenu: FC = () => {
       style={{ left: x, top: y }}
     >
       <button
-        className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+        type="button"
+        className={itemClassName}
         onClick={() => searchInScope(nodeId)}
       >
         {t.searchInNode}
       </button>
       <button
-        className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+        type="button"
+        className={itemClassName}
         onClick={() => searchInScope(parentId)}
+        disabled={!hasParentNode}
       >
         {t.searchInParentNode}
       </button>
       <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
       <button
-        className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+        type="button"
+        className={itemClassName}
+        onClick={copyKey}
+        disabled={!hasNodeKey}
+      >
+        {t.copyKey}
+      </button>
+      <button
+        type="button"
+        className={itemClassName}
         onClick={copyPath}
       >
         {t.copyPath}
       </button>
       <button
-        className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+        type="button"
+        className={itemClassName}
         onClick={copyValue}
       >
         {t.copyValue}
       </button>
       <button
-        className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+        type="button"
+        className={itemClassName}
         onClick={copyRaw}
       >
         {t.copyRaw}

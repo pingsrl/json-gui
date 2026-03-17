@@ -52,6 +52,7 @@ export interface Translations {
   keys: string;
   elements: string;
   propertiesPlaceholder: string;
+  copyKey: string;
   copyPath: string;
   copyValue: string;
   copyRaw: string;
@@ -114,6 +115,7 @@ const translations: Record<Lang, Translations> = {
     keys: "Keys",
     elements: "Elements",
     propertiesPlaceholder: "Properties",
+    copyKey: "Copy key",
     copyPath: "Copy path",
     copyValue: "Copy value",
     copyRaw: "Copy raw JSON",
@@ -175,6 +177,7 @@ const translations: Record<Lang, Translations> = {
     keys: "Chiavi",
     elements: "Elementi",
     propertiesPlaceholder: "Proprietà",
+    copyKey: "Copia chiave",
     copyPath: "Copia path",
     copyValue: "Copia valore",
     copyRaw: "Copia raw JSON",
@@ -235,6 +238,7 @@ const translations: Record<Lang, Translations> = {
     keys: "键",
     elements: "元素",
     propertiesPlaceholder: "属性",
+    copyKey: "复制键名",
     copyPath: "复制路径",
     copyValue: "复制值",
     copyRaw: "复制原始 JSON",
