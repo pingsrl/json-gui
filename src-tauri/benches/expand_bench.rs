@@ -260,13 +260,13 @@ fn bench_build_raw(c: &mut Criterion) {
 /// Misura il BFS su un file JSON reale.
 /// Usa BENCH_JSON_PATH o il path di default se presente.
 fn bench_real_file(c: &mut Criterion) {
-    let path = std::env::var("BENCH_JSON_PATH").unwrap_or_else(|_| {
-        "/Users/g3z/Sviluppo/Mobile/baxter-catalogo/htdocs/dev/data/configurations.json"
-            .to_string()
-    });
+    let Ok(path) = std::env::var("BENCH_JSON_PATH") else {
+        eprintln!("[bench_real_file] Imposta BENCH_JSON_PATH=/path/to/large.json per eseguire questo benchmark");
+        return;
+    };
 
     if !std::path::Path::new(&path).exists() {
-        eprintln!("[bench_real_file] File non trovato: {path} — skip");
+        eprintln!("[bench_real_file] File non trovato: {path}");
         return;
     }
 
