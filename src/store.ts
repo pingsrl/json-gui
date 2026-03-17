@@ -370,8 +370,14 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
 
   selectNode: async (node: NodeDto) => {
     const { expandAllActive, rootChildren, expandedNodes } = get();
+    const isRootChild = rootChildren.some((child) => child.id === node.id);
+    const parentId = node.parent_id ?? null;
     const selectedNodeSiblings = expandAllActive
-      ? null
+      ? isRootChild
+        ? rootChildren
+        : parentId !== null
+          ? childrenCache.get(parentId) ?? null
+          : null
       : findSiblings(node.id, rootChildren, expandedNodes);
     const cachedPath = pathCache.get(node.id) ?? null;
     set({
@@ -381,6 +387,21 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       selectedNodeSiblings,
       focusedNodeId: node.id
     });
+    if (expandAllActive && !isRootChild && parentId !== null && !selectedNodeSiblings) {
+      try {
+        const siblings = await invoke<NodeDto[]>("get_children", { nodeId: parentId });
+        cacheSet(parentId, siblings);
+        registerChildren(parentId, siblings);
+        for (const sibling of siblings) {
+          nodeMapCache.set(sibling.id, sibling);
+        }
+        if (get().selectedNodeId === node.id) {
+          set({ selectedNodeSiblings: siblings });
+        }
+      } catch (err) {
+        console.error("selectNode siblings error:", err);
+      }
+    }
     if (cachedPath) return;
     try {
       const path = await invoke<string>("get_path", { nodeId: node.id });
