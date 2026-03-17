@@ -4,7 +4,7 @@
 # JsonGUI
 
 A fast, native desktop app for exploring and searching large JSON files.
-Built with Tauri 2 + React 18 + TypeScript.
+Built with Tauri 2 + React 19 + TypeScript.
 
 <img src="docs/screenshot.jpg" alt="JsonGUI screenshot" width="800" />
 
