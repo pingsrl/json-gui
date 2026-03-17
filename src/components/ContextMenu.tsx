@@ -4,7 +4,7 @@ import { useJsonStore } from "../store";
 import { useI18n } from "../i18n";
 
 export const ContextMenu: FC = () => {
-  const { contextMenu, hideContextMenu } = useJsonStore();
+  const { contextMenu, hideContextMenu, setSearchScopePath } = useJsonStore();
   const { t } = useI18n();
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -21,7 +21,13 @@ export const ContextMenu: FC = () => {
 
   if (!contextMenu) return null;
 
-  const { x, y, nodeId, valueType, valuePreview } = contextMenu;
+  const { x, y, nodeId, parentId, valueType, valuePreview } = contextMenu;
+
+  const focusSearchInput = () => {
+    requestAnimationFrame(() => {
+      document.getElementById("search-input")?.focus();
+    });
+  };
 
   const copyPath = async () => {
     try {
@@ -59,12 +65,40 @@ export const ContextMenu: FC = () => {
     hideContextMenu();
   };
 
+  const searchInScope = async (scopeNodeId: number | null) => {
+    if (scopeNodeId === null) {
+      hideContextMenu();
+      return;
+    }
+    try {
+      const path = await invoke<string>("get_path", { nodeId: scopeNodeId });
+      setSearchScopePath(path);
+      focusSearchInput();
+    } catch (err) {
+      console.error("searchInScope error:", err);
+    }
+    hideContextMenu();
+  };
+
   return (
     <div
       ref={menuRef}
       className="fixed z-50 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded shadow-lg py-1 text-sm text-gray-800 dark:text-gray-200 min-w-[160px]"
       style={{ left: x, top: y }}
     >
+      <button
+        className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+        onClick={() => searchInScope(nodeId)}
+      >
+        {t.searchInNode}
+      </button>
+      <button
+        className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+        onClick={() => searchInScope(parentId)}
+      >
+        {t.searchInParentNode}
+      </button>
+      <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
       <button
         className="w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
         onClick={copyPath}

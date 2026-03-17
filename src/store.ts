@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 export interface NodeDto {
   id: number;
+  parent_id?: number | null;
   key: string | null;
   value_type: string;
   value_preview: string;
@@ -17,10 +18,13 @@ export interface VNode {
 
 export interface SearchResult {
   node_id: number;
+  file_order: number;
   path: string;
   key: string | null;
   value_preview: string;
 }
+
+export type SearchSortMode = "relevance" | "file";
 
 interface FileInfo {
   node_count: number;
@@ -141,8 +145,42 @@ export interface ContextMenuState {
   x: number;
   y: number;
   nodeId: number;
+  parentId: number | null;
   valueType: string;
   valuePreview: string;
+}
+
+function getSearchRelevanceScore(result: SearchResult, query: string): number {
+  const key = result.key ?? "";
+  const value = result.value_preview;
+  const queryLower = query.toLowerCase();
+  const keyLower = key.toLowerCase();
+  const valueLower = value.toLowerCase();
+
+  if (key === query || value === query) return 0;
+  if (keyLower === queryLower || valueLower === queryLower) return 1;
+  if (key.startsWith(query) || value.startsWith(query)) return 2;
+  if (keyLower.startsWith(queryLower) || valueLower.startsWith(queryLower))
+    return 3;
+  return 4;
+}
+
+export function sortSearchResults(
+  results: SearchResult[],
+  query: string,
+  sortMode: SearchSortMode
+): SearchResult[] {
+  const sorted = results.slice();
+  sorted.sort((a, b) => {
+    if (sortMode === "file") {
+      return a.file_order - b.file_order;
+    }
+    const relevanceDelta =
+      getSearchRelevanceScore(a, query) - getSearchRelevanceScore(b, query);
+    if (relevanceDelta !== 0) return relevanceDelta;
+    return a.file_order - b.file_order;
+  });
+  return sorted;
 }
 
 interface JsonStore {
@@ -162,6 +200,9 @@ interface JsonStore {
   visibleNodes: VNode[];
   selectedNodeSiblings: NodeDto[] | null;
   recentFiles: string[];
+  searchScopePath: string;
+  searchSort: SearchSortMode;
+  lastSearchQuery: string;
   searchResults: SearchResult[];
   searching: boolean;
   loading: boolean;
@@ -177,8 +218,11 @@ interface JsonStore {
     target: string,
     caseSensitive: boolean,
     useRegex: boolean,
-    exactMatch: boolean
+    exactMatch: boolean,
+    path: string
   ) => Promise<void>;
+  setSearchScopePath: (path: string) => void;
+  setSearchSort: (sortMode: SearchSortMode) => void;
   expandAll: () => Promise<void>;
   fetchExpandedSlice: (offset: number, limit: number) => Promise<void>;
   collapseAll: () => void;
@@ -204,6 +248,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   visibleNodes: [],
   selectedNodeSiblings: null,
   recentFiles: loadRecentFiles(),
+  searchScopePath: "",
+  searchSort: "relevance",
+  lastSearchQuery: "",
   searchResults: [],
   searching: false,
   loading: false,
@@ -248,6 +295,8 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       focusedNodeId: null,
       visibleNodes,
       recentFiles,
+      searchScopePath: "",
+      lastSearchQuery: "",
       searchResults: []
     });
   },
@@ -285,6 +334,8 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       selectedNodeSiblings: null,
       focusedNodeId: null,
       visibleNodes,
+      searchScopePath: "",
+      lastSearchQuery: "",
       searchResults: []
     });
   },
@@ -345,7 +396,8 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     target: string,
     caseSensitive: boolean,
     useRegex: boolean,
-    exactMatch: boolean
+    exactMatch: boolean,
+    path: string
   ) => {
     if (!query.trim()) {
       get().clearSearch();
@@ -360,23 +412,32 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
           case_sensitive: caseSensitive,
           regex: useRegex,
           exact_match: exactMatch,
-          max_results: 500
+          max_results: 500,
+          path: path.trim() || null
         }
       });
-      const qLow = query.toLowerCase();
-      const score = (r: SearchResult): number => {
-        const key = r.key ?? "";
-        const val = r.value_preview;
-        if (key === query || val === query) return 0;
-        if (key.toLowerCase() === qLow || val.toLowerCase() === qLow) return 1;
-        return 2;
-      };
-      results.sort((a, b) => score(a) - score(b));
-      set({ searchResults: results, searching: false });
+      const sortedResults = sortSearchResults(results, query, get().searchSort);
+      set({
+        searchResults: sortedResults,
+        searching: false,
+        lastSearchQuery: query
+      });
     } catch (err) {
       console.error("Search error:", err);
       set({ searching: false });
     }
+  },
+
+  setSearchScopePath: (path: string) => {
+    set({ searchScopePath: path });
+  },
+
+  setSearchSort: (searchSort: SearchSortMode) => {
+    const { searchResults, lastSearchQuery } = get();
+    set({
+      searchSort,
+      searchResults: sortSearchResults(searchResults, lastSearchQuery, searchSort)
+    });
   },
 
   navigateToNode: async (nodeId: number) => {
@@ -499,7 +560,8 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     });
   },
 
-  clearSearch: () => set({ searchResults: [], searching: false }),
+  clearSearch: () =>
+    set({ searchResults: [], searching: false, lastSearchQuery: "" }),
 
   showContextMenu: (cm: ContextMenuState) => set({ contextMenu: cm }),
   hideContextMenu: () => set({ contextMenu: null })

@@ -43,6 +43,7 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
       x: e.clientX,
       y: e.clientY,
       nodeId: node.id,
+      parentId: node.parent_id ?? null,
       valueType: node.value_type,
       valuePreview: node.value_preview
     });

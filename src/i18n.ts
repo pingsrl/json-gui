@@ -13,6 +13,14 @@ export interface Translations {
   lightTheme: string;
   darkTheme: string;
   searchPlaceholder: string;
+  searchScope: string;
+  searchFilters: string;
+  searchPath: string;
+  searchPathPlaceholder: string;
+  clearSearchScope: string;
+  searchSort: string;
+  searchSortRelevance: string;
+  searchSortFileOrder: string;
   searchBoth: string;
   searchKeys: string;
   searchValues: string;
@@ -47,6 +55,8 @@ export interface Translations {
   copyPath: string;
   copyValue: string;
   copyRaw: string;
+  searchInNode: string;
+  searchInParentNode: string;
   exportTitle: string;
   exportSubtitle: string;
   exportNoFile: string;
@@ -65,6 +75,14 @@ const translations: Record<Lang, Translations> = {
     lightTheme: "Light theme",
     darkTheme: "Dark theme",
     searchPlaceholder: "Search... (Cmd+F)",
+    searchScope: "Scope",
+    searchFilters: "Filters",
+    searchPath: "Path",
+    searchPathPlaceholder: "$.users.0",
+    clearSearchScope: "Clear path filter",
+    searchSort: "Sort",
+    searchSortRelevance: "relevance",
+    searchSortFileOrder: "file order",
     searchBoth: "both",
     searchKeys: "keys",
     searchValues: "values",
@@ -99,6 +117,8 @@ const translations: Record<Lang, Translations> = {
     copyPath: "Copy path",
     copyValue: "Copy value",
     copyRaw: "Copy raw JSON",
+    searchInNode: "Search in this node",
+    searchInParentNode: "Search in parent node",
     exportTitle: "Export type definition",
     exportSubtitle: "Select target language",
     exportNoFile: "No file is open",
@@ -115,6 +135,14 @@ const translations: Record<Lang, Translations> = {
     lightTheme: "Tema chiaro",
     darkTheme: "Tema scuro",
     searchPlaceholder: "Cerca... (Cmd+F)",
+    searchScope: "Ambito",
+    searchFilters: "Filtri",
+    searchPath: "Path",
+    searchPathPlaceholder: "$.users.0",
+    clearSearchScope: "Rimuovi filtro path",
+    searchSort: "Ordina",
+    searchSortRelevance: "pertinenza",
+    searchSortFileOrder: "ordine file",
     searchBoth: "entrambi",
     searchKeys: "chiavi",
     searchValues: "valori",
@@ -150,6 +178,8 @@ const translations: Record<Lang, Translations> = {
     copyPath: "Copia path",
     copyValue: "Copia valore",
     copyRaw: "Copia raw JSON",
+    searchInNode: "Cerca in questo nodo",
+    searchInParentNode: "Cerca nel nodo padre",
     exportTitle: "Esporta definizione tipo",
     exportSubtitle: "Seleziona il linguaggio",
     exportNoFile: "Nessun file aperto",
@@ -166,6 +196,14 @@ const translations: Record<Lang, Translations> = {
     lightTheme: "浅色主题",
     darkTheme: "深色主题",
     searchPlaceholder: "搜索... (Cmd+F)",
+    searchScope: "范围",
+    searchFilters: "筛选",
+    searchPath: "路径",
+    searchPathPlaceholder: "$.users.0",
+    clearSearchScope: "清除路径过滤",
+    searchSort: "排序",
+    searchSortRelevance: "相关性",
+    searchSortFileOrder: "文件顺序",
     searchBoth: "全部",
     searchKeys: "键",
     searchValues: "值",
@@ -200,6 +238,8 @@ const translations: Record<Lang, Translations> = {
     copyPath: "复制路径",
     copyValue: "复制值",
     copyRaw: "复制原始 JSON",
+    searchInNode: "在此节点中搜索",
+    searchInParentNode: "在父节点中搜索",
     exportTitle: "导出类型定义",
     exportSubtitle: "选择目标语言",
     exportNoFile: "未打开文件",

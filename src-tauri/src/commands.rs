@@ -50,6 +50,7 @@ pub struct AppState {
 #[derive(Serialize, Clone)]
 pub struct NodeDto {
     pub id: u32,
+    pub parent_id: Option<u32>,
     pub key: Option<String>,
     pub value_type: &'static str,
     pub value_preview: Cow<'static, str>,
@@ -67,6 +68,7 @@ pub struct FileInfo {
 #[derive(Serialize)]
 pub struct SearchResult {
     pub node_id: u32,
+    pub file_order: u32,
     pub path: String,
     pub key: Option<String>,
     pub value_preview: String,
@@ -80,6 +82,8 @@ pub struct SearchQuery {
     pub regex: bool,
     pub exact_match: bool,
     pub max_results: usize,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -149,6 +153,7 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
     };
     NodeDto {
         id,
+        parent_id: node.parent,
         key: node.key.map(|kid| index.keys.get(kid).to_string()),
         value_type,
         value_preview,
@@ -240,6 +245,7 @@ pub async fn search(
         query.regex,
         query.exact_match,
         query.max_results,
+        query.path.as_deref(),
     );
     let dtos: Vec<SearchResult> = results
         .into_iter()
@@ -258,6 +264,7 @@ pub async fn search(
             };
             SearchResult {
                 node_id: id,
+                file_order: node.preorder_index,
                 path,
                 key: node.key.map(|kid| index.keys.get(kid).to_string()),
                 value_preview,

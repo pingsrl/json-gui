@@ -58,6 +58,7 @@ pub struct Node {
     pub children_start: u32,
     pub children_len: u32,
     pub subtree_len: u32,
+    pub preorder_index: u32,
 }
 
 // ---- TempNode used during BFS build ----
@@ -192,7 +193,22 @@ impl JsonIndex {
                 children_start,
                 children_len,
                 subtree_len: 1,
+                preorder_index: 0,
             });
+        }
+
+        let mut next_preorder_index = 0u32;
+        let mut stack = vec![0u32];
+        while let Some(node_id) = stack.pop() {
+            nodes[node_id as usize].preorder_index = next_preorder_index;
+            next_preorder_index += 1;
+
+            let node = &nodes[node_id as usize];
+            let start = node.children_start as usize;
+            let end = start + node.children_len as usize;
+            for &child_id in children[start..end].iter().rev() {
+                stack.push(child_id);
+            }
         }
 
         for idx in (0..nodes.len()).rev() {
@@ -414,7 +430,16 @@ impl JsonIndex {
         use_regex: bool,
         exact_match: bool,
         max_results: usize,
+        path: Option<&str>,
     ) -> Vec<(u32, String)> {
+        let scope_node_id = match path.map(str::trim).filter(|path| !path.is_empty()) {
+            Some(path) => match self.resolve_path(path) {
+                Some(node_id) => Some(node_id),
+                None => return vec![],
+            },
+            None => None,
+        };
+
         let results: Vec<(u32, String)> = if use_regex {
             let pattern = if case_sensitive {
                 query.to_string()
@@ -428,6 +453,12 @@ impl JsonIndex {
             self.nodes
                 .par_iter()
                 .filter_map(|node| {
+                    if let Some(scope_id) = scope_node_id {
+                        if !self.is_descendant_or_self(node.id, scope_id) {
+                            return None;
+                        }
+                    }
+
                     let key_str: Option<&str> = node.key.map(|kid| self.keys.get(kid));
                     let matches_key = (target == "keys" || target == "both")
                         && key_str.map(|k| re.is_match(k)).unwrap_or(false);
@@ -457,6 +488,12 @@ impl JsonIndex {
             self.nodes
                 .par_iter()
                 .filter_map(|node| {
+                    if let Some(scope_id) = scope_node_id {
+                        if !self.is_descendant_or_self(node.id, scope_id) {
+                            return None;
+                        }
+                    }
+
                     let key_str: Option<&str> = node.key.map(|kid| self.keys.get(kid));
                     let matches_key = if target == "keys" || target == "both" {
                         key_str
@@ -504,6 +541,45 @@ impl JsonIndex {
         };
 
         results.into_iter().take(max_results).collect()
+    }
+
+    pub fn resolve_path(&self, path: &str) -> Option<u32> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() || trimmed == "$" {
+            return Some(self.root);
+        }
+
+        let normalized = trimmed.strip_prefix("$.").or_else(|| trimmed.strip_prefix('$'))?;
+        if normalized.is_empty() {
+            return Some(self.root);
+        }
+
+        let mut current = self.root;
+        for segment in normalized.split('.').filter(|segment| !segment.is_empty()) {
+            current = self
+                .get_children_slice(current)
+                .iter()
+                .copied()
+                .find(|&child_id| {
+                    self.nodes[child_id as usize]
+                        .key
+                        .map(|kid| self.keys.get(kid) == segment)
+                        .unwrap_or(false)
+                })?;
+        }
+
+        Some(current)
+    }
+
+    fn is_descendant_or_self(&self, node_id: u32, ancestor_id: u32) -> bool {
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            if id == ancestor_id {
+                return true;
+            }
+            current = self.nodes[id as usize].parent;
+        }
+        false
     }
 }
 
@@ -666,7 +742,7 @@ mod tests {
     #[test]
     fn search_by_value() {
         let index = idx(r#"{"name":"Alice","city":"Rome"}"#);
-        let results = index.search("Alice", "values", false, false, false, 10);
+        let results = index.search("Alice", "values", false, false, false, 10, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, "$.name");
     }
@@ -674,7 +750,7 @@ mod tests {
     #[test]
     fn search_by_key() {
         let index = idx(r#"{"username":"bob","email":"b@b.com"}"#);
-        let results = index.search("email", "keys", false, false, false, 10);
+        let results = index.search("email", "keys", false, false, false, 10, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, "$.email");
     }
@@ -682,21 +758,21 @@ mod tests {
     #[test]
     fn search_case_insensitive() {
         let index = idx(r#"{"msg":"Hello World"}"#);
-        let results = index.search("hello", "values", false, false, false, 10);
+        let results = index.search("hello", "values", false, false, false, 10, None);
         assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn search_case_sensitive_no_match() {
         let index = idx(r#"{"msg":"Hello World"}"#);
-        let results = index.search("hello", "values", true, false, false, 10);
+        let results = index.search("hello", "values", true, false, false, 10, None);
         assert_eq!(results.len(), 0);
     }
 
     #[test]
     fn search_regex() {
         let index = idx(r#"{"a":"foo123","b":"bar456","c":"baz"}"#);
-        let results = index.search(r"\d+", "values", false, true, false, 10);
+        let results = index.search(r"\d+", "values", false, true, false, 10, None);
         assert_eq!(results.len(), 2);
     }
 
@@ -705,21 +781,21 @@ mod tests {
         let arr: String = (0..20).map(|i| format!("\"item{}\"", i)).collect::<Vec<_>>().join(",");
         let json = format!("[{}]", arr);
         let index = idx(&json);
-        let results = index.search("item", "values", false, false, false, 5);
+        let results = index.search("item", "values", false, false, false, 5, None);
         assert_eq!(results.len(), 5);
     }
 
     #[test]
     fn search_no_results() {
         let index = idx(r#"{"a":"hello"}"#);
-        let results = index.search("xyz", "both", false, false, false, 10);
+        let results = index.search("xyz", "both", false, false, false, 10, None);
         assert_eq!(results.len(), 0);
     }
 
     #[test]
     fn search_both_keys_and_values() {
         let index = idx(r#"{"target":"other","other":"value"}"#);
-        let results = index.search("other", "both", false, false, false, 10);
+        let results = index.search("other", "both", false, false, false, 10, None);
         // "other" appare come chiave di "other" e come valore di "target"
         assert_eq!(results.len(), 2);
     }
@@ -727,11 +803,37 @@ mod tests {
     #[test]
     fn search_exact_match() {
         let index = idx(r#"{"a":"hello world","b":"hello","c":"say hello"}"#);
-        let exact = index.search("hello", "values", false, false, true, 10);
+        let exact = index.search("hello", "values", false, false, true, 10, None);
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].1, "$.b");
-        let partial = index.search("hello", "values", false, false, false, 10);
+        let partial = index.search("hello", "values", false, false, false, 10, None);
         assert_eq!(partial.len(), 3);
+    }
+
+    #[test]
+    fn search_limited_to_path() {
+        let index = idx(r#"{"users":[{"name":"Alice"},{"name":"Bob"}],"meta":{"name":"Catalog"}}"#);
+        let results = index.search("name", "keys", false, false, false, 10, Some("$.users.0"));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, "$.users.0.name");
+    }
+
+    #[test]
+    fn search_invalid_path_returns_empty_results() {
+        let index = idx(r#"{"users":[{"name":"Alice"}]}"#);
+        let results = index.search("Alice", "values", false, false, false, 10, Some("$.missing"));
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn preorder_index_matches_file_order() {
+        let index = idx(r#"{"a":{"x":1},"b":2}"#);
+        let a_id = index.get_children_slice(index.root)[0];
+        let b_id = index.get_children_slice(index.root)[1];
+        let x_id = index.get_children_slice(a_id)[0];
+
+        assert!(index.nodes[a_id as usize].preorder_index < index.nodes[x_id as usize].preorder_index);
+        assert!(index.nodes[x_id as usize].preorder_index < index.nodes[b_id as usize].preorder_index);
     }
 
     // ── node values ───────────────────────────────────────────────────────────

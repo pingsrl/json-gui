@@ -7,8 +7,8 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { buildVisibleNodes, insertVisibleChildren } from './store'
-import type { NodeDto, VNode } from './store'
+import { buildVisibleNodes, insertVisibleChildren, sortSearchResults } from './store'
+import type { NodeDto, SearchResult, VNode } from './store'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -202,5 +202,44 @@ describe('VNode shape', () => {
     const result: VNode[] = buildVisibleNodes([root], new Map())
     expect(result[0]).toHaveProperty('node')
     expect(result[0]).toHaveProperty('depth')
+  })
+})
+
+function makeSearchResult(
+  nodeId: number,
+  fileOrder: number,
+  key: string | null,
+  valuePreview: string,
+): SearchResult {
+  return {
+    node_id: nodeId,
+    file_order: fileOrder,
+    key,
+    path: `$.${key ?? nodeId}`,
+    value_preview: valuePreview,
+  }
+}
+
+describe('sortSearchResults', () => {
+  it("ordina per pertinenza prima dell'ordine nel file", () => {
+    const results = [
+      makeSearchResult(1, 20, 'titleLong', 'something'),
+      makeSearchResult(2, 10, 'title', 'something else'),
+    ]
+
+    const sorted = sortSearchResults(results, 'title', 'relevance')
+
+    expect(sorted.map((r) => r.node_id)).toEqual([2, 1])
+  })
+
+  it("ordina per ordine nel file quando richiesto", () => {
+    const results = [
+      makeSearchResult(1, 20, 'title', 'value'),
+      makeSearchResult(2, 10, 'title', 'value'),
+    ]
+
+    const sorted = sortSearchResults(results, 'title', 'file')
+
+    expect(sorted.map((r) => r.node_id)).toEqual([2, 1])
   })
 })

@@ -1,5 +1,6 @@
 import { FC, useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Copy } from "lucide-react";
 import { useJsonStore } from "../store";
 import { useI18n } from "../i18n";
 
@@ -24,11 +25,11 @@ function Row({
   children: React.ReactNode;
 }) {
   return (
-    <div className="px-3 py-2 border-b border-gray-100 dark:border-gray-800">
-      <div className="text-xs text-gray-400 dark:text-gray-500 mb-0.5">
+    <div className="px-3 py-2 border-b border-gray-100 dark:border-gray-800 select-none">
+      <div className="text-xs text-gray-400 dark:text-gray-500 mb-0.5 select-none">
         {label}
       </div>
-      <div className="text-xs font-mono text-gray-800 dark:text-gray-200 break-all">
+      <div className="text-xs font-mono text-gray-800 dark:text-gray-200 break-all select-text">
         {children}
       </div>
     </div>
@@ -36,6 +37,19 @@ function Row({
 }
 
 const SCALAR_TYPES = new Set(["string", "number", "boolean", "null"]);
+
+function formatScalarValue(value: string | null, valueType: string): string | null {
+  if (value === null || valueType !== "string") return value;
+  try {
+    const parsed = JSON.parse(value);
+    return typeof parsed === "string" ? parsed : value;
+  } catch {
+    if (value.startsWith('"') && value.endsWith('"')) {
+      return value.slice(1, -1);
+    }
+    return value;
+  }
+}
 
 export const DetailPanel: FC = () => {
   const { selectedNode, selectedNodePath } = useJsonStore();
@@ -55,6 +69,23 @@ export const DetailPanel: FC = () => {
   const badge = selectedNode
     ? (TYPE_BADGE[selectedNode.value_type] ?? TYPE_BADGE.null)
     : null;
+  const displayValue = selectedNode
+    ? formatScalarValue(fullValue ?? selectedNode.value_preview, selectedNode.value_type)
+    : null;
+
+  const handleCopyValue = async () => {
+    if (!selectedNode) return;
+    try {
+      if (SCALAR_TYPES.has(selectedNode.value_type)) {
+        await navigator.clipboard.writeText(displayValue ?? "");
+        return;
+      }
+      const raw = await invoke<string>("get_raw", { nodeId: selectedNode.id });
+      await navigator.clipboard.writeText(raw);
+    } catch (err) {
+      console.error("detail copyValue error:", err);
+    }
+  };
 
   /* ── Sezione proprietà (1/5 del totale, max 500px) ── */
   return (
@@ -71,6 +102,14 @@ export const DetailPanel: FC = () => {
             <span className="text-sm font-mono text-gray-800 dark:text-gray-200 truncate">
               {selectedNode.key ?? "(root)"}
             </span>
+            <button
+              onClick={handleCopyValue}
+              className="ml-auto inline-flex h-7 w-7 items-center justify-center rounded text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
+              title={t.copyValue}
+              aria-label={t.copyValue}
+            >
+              <Copy size={14} />
+            </button>
           </div>
 
           {/* Path */}
@@ -84,7 +123,7 @@ export const DetailPanel: FC = () => {
 
           {/* Valore */}
           {SCALAR_TYPES.has(selectedNode.value_type) && (
-            <Row label={t.value}>{fullValue ?? selectedNode.value_preview}</Row>
+            <Row label={t.value}>{displayValue}</Row>
           )}
 
           {/* Dimensione per object/array */}
