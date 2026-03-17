@@ -51,8 +51,12 @@ npm run tauri:dev
 Build a release bundle:
 
 ```bash
-npm run tauri:build
+npm run tauri build
 ```
+
+On macOS, `npm run tauri build` now creates the `.app` with Tauri and then
+generates the `.dmg` from an external staging directory to avoid the `create-dmg`
+temporary-image recursion issue.
 
 ---
 
