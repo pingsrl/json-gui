@@ -358,26 +358,33 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     const next = new Map<number, NodeDto[]>();
     // Chunk ricevuti ma non ancora applicati all'UI
     let pending: [number, NodeDto[]][] = [];
-    let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+    // Primo chunk già applicato (per feedback immediato)
+    let firstApplied = false;
 
     let doneResolve!: () => void;
     const donePromise = new Promise<void>((r) => { doneResolve = r; });
 
-    // Applica i chunk pendenti e aggiorna l'UI (throttled)
-    const applyPending = () => {
-      throttleTimer = null;
-      if (pending.length === 0) return;
-      const toApply = pending.splice(0);
-      for (const [id, children] of toApply) {
+    // Svuota pending in next (solo accumulo, senza rebuild visibleNodes).
+    const drainPending = () => {
+      for (const [id, children] of pending) {
         next.set(id, children);
         cacheSet(id, children);
         registerChildren(id, children);
         for (const child of children) nodeMapCache.set(child.id, child);
       }
+      pending = [];
+    };
+
+    // Rebuild completo: chiamato solo al primo chunk e a expand-done.
+    // buildVisibleNodes è O(visible) — con milioni di nodi blocca il thread JS
+    // se chiamato ad ogni chunk. Lo chiamiamo il meno possibile.
+    const applyFull = () => {
+      drainPending();
       const { rootChildren: rc, selectedNodeId } = get();
       const visibleNodes = buildVisibleNodes(rc, next);
       const selectedNodeSiblings =
         selectedNodeId !== null ? findSiblings(selectedNodeId, rc, next) : null;
+      // new Map(next) crea una nuova reference per triggerare Zustand
       set({ expandedNodes: new Map(next), visibleNodes, selectedNodeSiblings });
     };
 
@@ -387,15 +394,22 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
         if (expandGeneration !== myGen) return;
         pending.push(...e.payload.expansions);
         set({ expandProgress: e.payload.progress });
-        if (!throttleTimer) throttleTimer = setTimeout(applyPending, 100);
+
+        if (!firstApplied) {
+          // Primo chunk: rebuild immediato → l'utente vede l'albero espandersi
+          // entro pochi ms senza aspettare tutti i nodi
+          firstApplied = true;
+          applyFull();
+        }
+        // Chunk successivi: solo accumulati in pending.
+        // Il rebuild finale avviene a expand-done.
       }
     );
 
     const unlistenDone = await listen("expand-done", () => {
       if (expandGeneration !== myGen) { doneResolve(); return; }
-      if (throttleTimer) { clearTimeout(throttleTimer); throttleTimer = null; }
-      // Applica eventuali chunk rimasti
-      applyPending();
+      // Rebuild finale con tutti i chunk rimasti
+      applyFull();
       unlistenChunk();
       unlistenDone();
       set({ loading: false, expandProgress: null });
@@ -406,7 +420,6 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       await invoke("expand_all");
     } catch (err) {
       console.error("expand_all failed:", err);
-      if (throttleTimer) clearTimeout(throttleTimer);
       unlistenChunk();
       unlistenDone();
       set({ loading: false, expandProgress: null });
