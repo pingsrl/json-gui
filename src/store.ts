@@ -311,6 +311,15 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
           max_results: 500
         }
       });
+      const qLow = query.toLowerCase();
+      const score = (r: SearchResult): number => {
+        const key = r.key ?? "";
+        const val = r.value_preview;
+        if (key === query || val === query) return 0;
+        if (key.toLowerCase() === qLow || val.toLowerCase() === qLow) return 1;
+        return 2;
+      };
+      results.sort((a, b) => score(a) - score(b));
       set({ searchResults: results, searching: false });
     } catch (err) {
       console.error("Search error:", err);
