@@ -105,7 +105,7 @@ export const PropertiesPanel: FC = () => {
             t.siblings
           )}
         </div>
-        <div className="flex-1 overflow-auto">
+        <div className="flex-1 overflow-auto app-scrollbar">
           {siblings && siblings.length > 0 ? (
             siblings.map((sib) => (
               <NodeRow

@@ -89,7 +89,7 @@ export const DetailPanel: FC = () => {
 
   /* ── Sezione proprietà (1/5 del totale, max 500px) ── */
   return (
-    <div className="h-full border-t border-gray-200 dark:border-gray-700 overflow-auto">
+    <div className="h-full border-t border-gray-200 dark:border-gray-700 overflow-auto app-scrollbar">
       {selectedNode ? (
         <>
           {/* Header */}

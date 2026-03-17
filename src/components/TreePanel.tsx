@@ -179,7 +179,7 @@ export const TreePanel: FC = () => {
           </button>
         </div>
       )}
-      <div ref={treeRef} className="flex-1 overflow-auto">
+      <div ref={treeRef} className="flex-1 overflow-auto app-scrollbar">
         {rootChildren.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-400 dark:text-gray-500 gap-3">
             <FolderOpen size={40} className="opacity-30" />

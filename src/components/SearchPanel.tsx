@@ -343,7 +343,7 @@ export const SearchPanel: FC = () => {
             )}
           </div>
         )}
-        <div className="flex-1 overflow-auto">
+        <div className="flex-1 overflow-auto app-scrollbar">
           {searching && (
             <div className="p-3 text-gray-400 dark:text-gray-500 text-xs">
               {t.searching}
