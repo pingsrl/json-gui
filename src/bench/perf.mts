@@ -151,7 +151,7 @@ for (const size of [1_000, 5_000, 10_000, 50_000, 100_000, 500_000]) {
   bench(
     `Map copia di ${(size / 1000).toFixed(0)}k entries`,
     () => {
-      const _m = new Map(src);
+      new Map(src);
     },
     size > 200_000 ? 10 : 50
   );
