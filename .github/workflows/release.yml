@@ -127,6 +127,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+    env:
+      HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -152,7 +154,7 @@ jobs:
             console.log('Version set to', v);
           "
       - name: Write signing key to file
-        if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        if: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -161,7 +163,7 @@ jobs:
       - name: Build Windows app
         run: npm run tauri build
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && format('{0}/tauri-signing.key', runner.temp) || '' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' && format('{0}/tauri-signing.key', runner.temp) || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - name: Upload Windows artifacts
         uses: softprops/action-gh-release@v2.6.1
@@ -172,7 +174,7 @@ jobs:
       - name: Save Windows signature for latest.json
         shell: bash
         env:
-          HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          HAS_TAURI_SIGNING_KEY: ${{ env.HAS_TAURI_SIGNING_KEY }}
         run: |
           if [ "$HAS_TAURI_SIGNING_KEY" != "true" ]; then
             echo '{"ok":false,"expected":false}' > windows-sig.json
@@ -202,6 +204,8 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    env:
+      HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
     steps:
       - uses: actions/checkout@v6
       - name: Install system dependencies
@@ -235,14 +239,14 @@ jobs:
             console.log('Version set to', v);
           "
       - name: Write signing key to file
-        if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        if: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | tr -d '\r' > "$RUNNER_TEMP/tauri-signing.key"
       - name: Build Linux app
         run: npm run tauri build
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && format('{0}/tauri-signing.key', runner.temp) || '' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' && format('{0}/tauri-signing.key', runner.temp) || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - name: Upload Linux artifacts
         uses: softprops/action-gh-release@v2.6.1
@@ -252,7 +256,7 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb
       - name: Save Linux signature for latest.json
         env:
-          HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          HAS_TAURI_SIGNING_KEY: ${{ env.HAS_TAURI_SIGNING_KEY }}
         run: |
           if [ "$HAS_TAURI_SIGNING_KEY" != "true" ]; then
             echo '{"ok":false,"expected":false}' > linux-sig.json
