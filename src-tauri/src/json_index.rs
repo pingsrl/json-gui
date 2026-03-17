@@ -798,17 +798,14 @@ impl JsonIndex {
                         return None;
                     }
                 }
-                if compiled_filters
-                    .iter()
-                    .all(|filter| {
-                        self.object_filter_matches(
-                            node.id,
-                            filter,
-                            key_case_sensitive,
-                            value_case_sensitive,
-                        )
-                    })
-                {
+                if compiled_filters.iter().all(|filter| {
+                    self.object_filter_matches(
+                        node.id,
+                        filter,
+                        key_case_sensitive,
+                        value_case_sensitive,
+                    )
+                }) {
                     Some(node.id)
                 } else {
                     None

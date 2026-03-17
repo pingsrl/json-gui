@@ -3,11 +3,113 @@ pub mod json_index;
 mod schema;
 
 use commands::AppState;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewWindow, WindowEvent};
+
+const WINDOW_STATE_FILE: &str = "window-state.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedWindowState {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    maximized: bool,
+}
+
+fn window_state_path<R: tauri::Runtime>(window: &WebviewWindow<R>) -> Option<PathBuf> {
+    let mut path = window.app_handle().path().app_config_dir().ok()?;
+    if fs::create_dir_all(&path).is_err() {
+        return None;
+    }
+    path.push(WINDOW_STATE_FILE);
+    Some(path)
+}
+
+fn load_window_state<R: tauri::Runtime>(window: &WebviewWindow<R>) -> Option<PersistedWindowState> {
+    let path = window_state_path(window)?;
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn capture_window_state<R: tauri::Runtime>(
+    window: &WebviewWindow<R>,
+    persisted: Option<PersistedWindowState>,
+) -> Option<PersistedWindowState> {
+    let maximized = window.is_maximized().ok()?;
+    let mut state = persisted.unwrap_or(PersistedWindowState {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        maximized,
+    });
+
+    if !maximized || state.width == 0 || state.height == 0 {
+        let position = window.outer_position().ok()?;
+        let size = window.outer_size().ok()?;
+        if size.width == 0 || size.height == 0 {
+            return None;
+        }
+
+        state.x = position.x;
+        state.y = position.y;
+        state.width = size.width;
+        state.height = size.height;
+    }
+
+    state.maximized = maximized;
+    Some(state)
+}
+
+fn save_window_state<R: tauri::Runtime>(window: &WebviewWindow<R>) {
+    let Some(path) = window_state_path(window) else {
+        return;
+    };
+    let state = capture_window_state(window, load_window_state(window));
+    let Some(state) = state else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(&state) else {
+        return;
+    };
+    let _ = fs::write(path, bytes);
+}
+
+fn restore_window_state<R: tauri::Runtime>(window: &WebviewWindow<R>) {
+    let Some(state) = load_window_state(window) else {
+        return;
+    };
+    if state.width == 0 || state.height == 0 {
+        return;
+    }
+
+    let _ = window.set_size(PhysicalSize::new(state.width, state.height));
+    let _ = window.set_position(PhysicalPosition::new(state.x, state.y));
+
+    if state.maximized {
+        let _ = window.maximize();
+    }
+}
+
+fn setup_window_state_persistence<R: tauri::Runtime>(window: &WebviewWindow<R>) {
+    restore_window_state(window);
+
+    let listener_window = window.clone();
+    window.clone().on_window_event(move |event| match event {
+        WindowEvent::Moved(_)
+        | WindowEvent::Resized(_)
+        | WindowEvent::CloseRequested { .. }
+        | WindowEvent::Destroyed => save_window_state(&listener_window),
+        _ => {}
+    });
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -121,6 +223,13 @@ pub fn run() {
                 }
                 _ => {}
             });
+
+            if let Some(main_window) = app
+                .get_webview_window("main")
+                .or_else(|| app.webview_windows().into_values().next())
+            {
+                setup_window_state_persistence(&main_window);
+            }
 
             Ok(())
         })
