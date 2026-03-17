@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { buildVisibleNodes } from './store'
+import { buildVisibleNodes, insertVisibleChildren } from './store'
 import type { NodeDto, VNode } from './store'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -144,6 +144,38 @@ describe('buildVisibleNodes', () => {
     expect(result[1].node.key).toBe('0')
     expect(result[2].node.key).toBe('1')
     expect(result[3].node.key).toBe('2')
+  })
+})
+
+describe('insertVisibleChildren', () => {
+  it('inserisce i figli subito dopo il parent mantenendo depth +1', () => {
+    const parent = makeNode(1, 'parent', 'object', true, 2)
+    const sibling = makeNode(2, 'sibling')
+    const child1 = makeNode(10, 'c1')
+    const child2 = makeNode(11, 'c2')
+
+    const result = insertVisibleChildren(
+      buildVisibleNodes([parent, sibling], new Map()),
+      [[1, [child1, child2]]],
+    )
+
+    expect(result.map((v) => v.node.id)).toEqual([1, 10, 11, 2])
+    expect(result.map((v) => v.depth)).toEqual([0, 1, 1, 0])
+  })
+
+  it('gestisce espansioni successive su livelli già visibili', () => {
+    const parent = makeNode(1, 'parent', 'object', true, 1)
+    const child = makeNode(10, 'child', 'object', true, 1)
+    const grandchild = makeNode(100, 'gc')
+
+    const withChild = insertVisibleChildren(
+      buildVisibleNodes([parent], new Map()),
+      [[1, [child]]],
+    )
+    const withGrandchild = insertVisibleChildren(withChild, [[10, [grandchild]]])
+
+    expect(withGrandchild.map((v) => v.node.id)).toEqual([1, 10, 100])
+    expect(withGrandchild.map((v) => v.depth)).toEqual([0, 1, 2])
   })
 })
 

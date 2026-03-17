@@ -9,32 +9,64 @@ export const TreePanel: FC = () => {
   const {
     rootChildren,
     visibleNodes,
+    expandAllActive,
+    expandAllTotalCount,
+    expandAllRows,
     selectedNodeId,
     focusedNodeId,
     expandedNodes,
     expandAll,
     collapseAll,
+    fetchExpandedSlice,
     toggleNode,
     setFocusedNode
   } = useJsonStore();
   const { t } = useI18n();
   const treeRef = useRef<HTMLDivElement>(null);
+  const visibleCount = expandAllActive ? expandAllTotalCount : visibleNodes.length;
+  const getVNodeAt = (index: number) =>
+    expandAllActive ? (expandAllRows.get(index) ?? null) : (visibleNodes[index] ?? null);
 
   const rowVirtualizer = useVirtualizer({
-    count: visibleNodes.length,
+    count: visibleCount,
     getScrollElement: () => treeRef.current,
     estimateSize: () => 24,
     overscan: 20
   });
+  const virtualItems = rowVirtualizer.getVirtualItems();
+  const firstVirtualIndex = virtualItems[0]?.index ?? 0;
+  const lastVirtualIndex =
+    virtualItems.length > 0 ? virtualItems[virtualItems.length - 1].index : 0;
+
+  useEffect(() => {
+    if (!expandAllActive || visibleCount === 0) return;
+    const start = Math.max(0, firstVirtualIndex - 40);
+    const limit = Math.max(1, lastVirtualIndex - start + 41);
+    void fetchExpandedSlice(start, limit);
+  }, [
+    expandAllActive,
+    visibleCount,
+    firstVirtualIndex,
+    lastVirtualIndex,
+    fetchExpandedSlice
+  ]);
 
   // Scroll al nodo selezionato
   useEffect(() => {
     if (selectedNodeId === null) return;
-    const idx = visibleNodes.findIndex(
-      ({ node }) => node.id === selectedNodeId
-    );
+    const idx = expandAllActive
+      ? [...expandAllRows.entries()].find(
+          ([, vNode]) => vNode.node.id === selectedNodeId
+        )?.[0] ?? -1
+      : visibleNodes.findIndex(({ node }) => node.id === selectedNodeId);
     if (idx >= 0) rowVirtualizer.scrollToIndex(idx, { align: "center" });
-  }, [selectedNodeId, visibleNodes, rowVirtualizer]);
+  }, [
+    expandAllActive,
+    expandAllRows,
+    selectedNodeId,
+    visibleNodes,
+    rowVirtualizer
+  ]);
 
   // Navigazione tastiera
   useEffect(() => {
@@ -49,37 +81,49 @@ export const TreePanel: FC = () => {
       )
         return;
       e.preventDefault();
+      if (visibleCount === 0) return;
 
       const idx =
         focusedNodeId !== null
-          ? visibleNodes.findIndex(({ node }) => node.id === focusedNodeId)
+          ? expandAllActive
+            ? [...expandAllRows.entries()].find(
+                ([, vNode]) => vNode.node.id === focusedNodeId
+              )?.[0] ?? -1
+            : visibleNodes.findIndex(({ node }) => node.id === focusedNodeId)
           : -1;
 
       if (e.key === "ArrowDown") {
-        const next =
-          idx < visibleNodes.length - 1
-            ? visibleNodes[idx + 1]
-            : visibleNodes[0];
+        const nextIdx = idx < visibleCount - 1 ? idx + 1 : 0;
+        const next = getVNodeAt(nextIdx);
+        if (!next && expandAllActive) {
+          void fetchExpandedSlice(nextIdx, 80);
+          rowVirtualizer.scrollToIndex(nextIdx, { align: "auto" });
+          return;
+        }
         if (next) {
           setFocusedNode(next.node.id);
-          rowVirtualizer.scrollToIndex(
-            idx < visibleNodes.length - 1 ? idx + 1 : 0,
-            { align: "auto" }
-          );
+          rowVirtualizer.scrollToIndex(nextIdx, { align: "auto" });
         }
       } else if (e.key === "ArrowUp") {
-        const prevIdx = idx > 0 ? idx - 1 : visibleNodes.length - 1;
-        const prev = visibleNodes[prevIdx];
+        const prevIdx = idx > 0 ? idx - 1 : visibleCount - 1;
+        const prev = getVNodeAt(prevIdx);
+        if (!prev && expandAllActive) {
+          void fetchExpandedSlice(prevIdx, 80);
+          rowVirtualizer.scrollToIndex(prevIdx, { align: "auto" });
+          return;
+        }
         if (prev) {
           setFocusedNode(prev.node.id);
           rowVirtualizer.scrollToIndex(prevIdx, { align: "auto" });
         }
+      } else if (expandAllActive) {
+        return;
       } else if (e.key === "ArrowRight") {
-        const vNode = visibleNodes[idx];
+        const vNode = getVNodeAt(idx);
         if (vNode?.node.has_children && !expandedNodes.has(vNode.node.id))
           toggleNode(vNode.node.id);
       } else if (e.key === "ArrowLeft") {
-        const vNode = visibleNodes[idx];
+        const vNode = getVNodeAt(idx);
         if (!vNode) return;
         if (expandedNodes.has(vNode.node.id)) {
           toggleNode(vNode.node.id);
@@ -97,15 +141,19 @@ export const TreePanel: FC = () => {
           }
         }
       } else if (e.key === "Enter") {
-        const vNode = visibleNodes[idx];
+        const vNode = getVNodeAt(idx);
         if (vNode?.node.has_children) toggleNode(vNode.node.id);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [
+    expandAllActive,
+    expandAllRows,
+    fetchExpandedSlice,
     focusedNodeId,
     visibleNodes,
+    visibleCount,
     expandedNodes,
     rootChildren,
     toggleNode,
@@ -145,8 +193,8 @@ export const TreePanel: FC = () => {
               position: "relative"
             }}
           >
-            {rowVirtualizer.getVirtualItems().map((vItem) => {
-              const vNode = visibleNodes[vItem.index];
+            {virtualItems.map((vItem) => {
+              const vNode = getVNodeAt(vItem.index);
               return (
                 <div
                   key={vItem.key}
@@ -157,7 +205,11 @@ export const TreePanel: FC = () => {
                     width: "100%"
                   }}
                 >
-                  <TreeNode node={vNode.node} depth={vNode.depth} />
+                  {vNode ? (
+                    <TreeNode node={vNode.node} depth={vNode.depth} />
+                  ) : (
+                    <div className="h-6 mx-2 rounded bg-gray-100/70 dark:bg-gray-800/70" />
+                  )}
                 </div>
               );
             })}

@@ -1,11 +1,14 @@
-use crate::json_index::{JsonIndex, NodeValue};
+use crate::json_index::{JsonIndex, NodeValue, VisibleSliceRow};
 use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::io::{BufReader, Read};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 /// Wrapper attorno a un `Read` che emette una callback ogni volta che la percentuale avanza.
 struct ProgressReader<R: Read, F: Fn(u8)> {
@@ -83,6 +86,19 @@ pub struct SearchQuery {
 pub struct ExpandToResult {
     pub expansions: Vec<(u32, Vec<NodeDto>)>,
     pub path: String,
+}
+
+#[derive(Serialize)]
+pub struct VisibleNode {
+    pub node: NodeDto,
+    pub depth: usize,
+}
+
+#[derive(Serialize)]
+pub struct ExpandedSliceResult {
+    pub offset: usize,
+    pub total_count: usize,
+    pub rows: Vec<VisibleNode>,
 }
 
 
@@ -293,14 +309,96 @@ pub async fn expand_to(
     Ok(ExpandToResult { expansions, path })
 }
 
-// 10k nodi/chunk → ~100 chiamate IPC per 1M nodi (vs 1000 con chunk=1k)
-// Riduce l'overhead IPC 10x mantenendo feedback visivo ogni ~500ms
-const EXPAND_CHUNK_SIZE: usize = 10_000;
+#[tauri::command]
+pub async fn get_expanded_slice(
+    offset: usize,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<ExpandedSliceResult, String> {
+    let guard = state.index.lock().unwrap();
+    let index = guard.as_ref().ok_or("Nessun file aperto")?;
+    let rows = index
+        .get_expanded_slice(offset, limit)
+        .into_iter()
+        .map(|VisibleSliceRow { id, depth }| VisibleNode {
+            node: node_to_dto(index, id),
+            depth,
+        })
+        .collect();
+    Ok(ExpandedSliceResult {
+        offset,
+        total_count: index.expanded_visible_count(),
+        rows,
+    })
+}
+
+// Primo chunk piccolo per mostrare subito l'espansione in UI, poi chunk più grandi
+// per mantenere basso l'overhead IPC sul resto dell'operazione.
+const EXPAND_FIRST_CHUNK_NODE_TARGET: usize = 1_000;
+const EXPAND_CHUNK_NODE_TARGET: usize = 10_000;
+const EXPAND_CHUNK_MAX_LATENCY_MS: u64 = 250;
+const EXPAND_CHUNK_MAX_LATENCY: Duration =
+    Duration::from_millis(EXPAND_CHUNK_MAX_LATENCY_MS);
+const EXPAND_FIRST_EMIT_PAUSE_MS: u64 = 12;
+const EXPAND_EMIT_PAUSE_MS: u64 = 1;
 
 #[derive(Serialize, Clone)]
 pub struct ExpandChunk {
     pub expansions: Vec<(u32, Vec<NodeDto>)>,
     pub progress: u8,
+}
+
+fn expand_chunk_target(first_chunk_sent: bool) -> usize {
+    if first_chunk_sent {
+        EXPAND_CHUNK_NODE_TARGET
+    } else {
+        EXPAND_FIRST_CHUNK_NODE_TARGET
+    }
+}
+
+fn should_flush_expand_chunk(
+    chunk_nodes: usize,
+    first_chunk_sent: bool,
+    elapsed: Duration,
+) -> bool {
+    chunk_nodes > 0
+        && (chunk_nodes >= expand_chunk_target(first_chunk_sent)
+            || elapsed >= EXPAND_CHUNK_MAX_LATENCY)
+}
+
+fn flush_expand_chunk(
+    tx: &mpsc::Sender<ExpandChunk>,
+    chunk: &mut Vec<(u32, Vec<NodeDto>)>,
+    total_sent: u64,
+    total_nodes: u64,
+) -> bool {
+    let progress = ((total_sent * 100) / total_nodes.max(1)).min(99) as u8;
+    tx.blocking_send(ExpandChunk {
+        expansions: std::mem::take(chunk),
+        progress,
+    })
+    .is_ok()
+}
+
+fn walk_expandable_nodes_breadth_first<F>(index: &JsonIndex, mut visit: F) -> bool
+where
+    F: FnMut(u32, &[u32]) -> bool,
+{
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    queue.extend(index.get_children_slice(index.root).iter().copied());
+
+    while let Some(node_id) = queue.pop_front() {
+        let children_slice = index.get_children_slice(node_id);
+        if children_slice.is_empty() {
+            continue;
+        }
+        if !visit(node_id, children_slice) {
+            return false;
+        }
+        queue.extend(children_slice.iter().copied());
+    }
+
+    true
 }
 
 #[tauri::command]
@@ -311,7 +409,7 @@ pub async fn expand_all(
     let index_arc = Arc::clone(&state.index);
     let (tx, mut rx) = mpsc::channel::<ExpandChunk>(32);
 
-    // BFS + DTO build su un thread dedicato (non blocca il runtime Tokio).
+    // BFS orizzontale + DTO build su un thread dedicato.
     // Il Mutex è tenuto solo dentro spawn_blocking, non attraverso await.
     tauri::async_runtime::spawn_blocking(move || {
         let guard = index_arc.lock().unwrap();
@@ -322,55 +420,152 @@ pub async fn expand_all(
 
         let total_nodes = index.nodes.len() as u64;
         let mut total_sent: u64 = 0;
-        let mut chunk: Vec<(u32, Vec<NodeDto>)> = Vec::with_capacity(EXPAND_CHUNK_SIZE);
-        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
-
-        for &child_id in index.get_children_slice(index.root) {
-            queue.push_back(child_id);
-        }
-
-        while let Some(node_id) = queue.pop_front() {
-            let children_slice = index.get_children_slice(node_id);
-            if children_slice.is_empty() {
-                continue;
-            }
+        let mut chunk: Vec<(u32, Vec<NodeDto>)> = Vec::new();
+        let mut chunk_nodes: usize = 0;
+        let mut first_chunk_sent = false;
+        let mut last_flush = Instant::now();
+        let completed = walk_expandable_nodes_breadth_first(index, |node_id, children_slice| {
             let n = children_slice.len() as u64;
             let children: Vec<NodeDto> =
                 children_slice.iter().map(|&id| node_to_dto(index, id)).collect();
-            for &child_id in children_slice {
-                queue.push_back(child_id);
-            }
             chunk.push((node_id, children));
+            chunk_nodes += n as usize;
             total_sent += n;
-            if chunk.len() >= EXPAND_CHUNK_SIZE {
-                let progress = ((total_sent * 100) / total_nodes.max(1)).min(99) as u8;
-                if tx
-                    .blocking_send(ExpandChunk {
-                        expansions: std::mem::take(&mut chunk),
-                        progress,
-                    })
-                    .is_err()
-                {
-                    return; // receiver droppato: operazione annullata
+            if !first_chunk_sent {
+                if !flush_expand_chunk(&tx, &mut chunk, total_sent, total_nodes) {
+                    return false; // receiver droppato: operazione annullata
                 }
-                chunk = Vec::with_capacity(EXPAND_CHUNK_SIZE);
+                chunk_nodes = 0;
+                first_chunk_sent = true;
+                last_flush = Instant::now();
+                return true;
             }
+            if should_flush_expand_chunk(chunk_nodes, first_chunk_sent, last_flush.elapsed()) {
+                if !flush_expand_chunk(&tx, &mut chunk, total_sent, total_nodes) {
+                    return false; // receiver droppato: operazione annullata
+                }
+                chunk_nodes = 0;
+                last_flush = Instant::now();
+            }
+            true
+        });
+
+        if !completed {
+            return;
         }
 
         if !chunk.is_empty() {
-            let _ = tx.blocking_send(ExpandChunk { expansions: chunk, progress: 99 });
+            let progress = ((total_sent * 100) / total_nodes.max(1)).min(99) as u8;
+            let _ = tx.blocking_send(ExpandChunk { expansions: chunk, progress });
         }
         // tx droppato qui → rx.recv() restituisce None → loop termina
     });
 
     // Emette i chunk verso il frontend man mano che arrivano.
     // Il thread Tokio è libero (await) → la UI riceve gli eventi in tempo reale.
+    let mut emitted_chunks = 0usize;
     while let Some(chunk) = rx.recv().await {
         app.emit("expand-chunk", chunk).ok();
+        let pause_ms = if emitted_chunks == 0 {
+            EXPAND_FIRST_EMIT_PAUSE_MS
+        } else {
+            EXPAND_EMIT_PAUSE_MS
+        };
+        emitted_chunks += 1;
+        sleep(Duration::from_millis(pause_ms)).await;
     }
     app.emit("expand-done", ()).ok();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_expand_chunk_has_smaller_target() {
+        assert_eq!(expand_chunk_target(false), EXPAND_FIRST_CHUNK_NODE_TARGET);
+        assert_eq!(expand_chunk_target(true), EXPAND_CHUNK_NODE_TARGET);
+        assert!(expand_chunk_target(false) < expand_chunk_target(true));
+    }
+
+    #[test]
+    fn immediate_first_parent_flush_is_supported() {
+        let (tx, mut rx) = mpsc::channel::<ExpandChunk>(1);
+        let mut chunk = vec![(1, Vec::new())];
+
+        assert!(flush_expand_chunk(&tx, &mut chunk, 10, 100));
+        assert!(chunk.is_empty());
+
+        let emitted = rx.blocking_recv().expect("missing chunk");
+        assert_eq!(emitted.expansions.len(), 1);
+        assert_eq!(emitted.progress, 10);
+    }
+
+    #[test]
+    fn flushes_when_node_budget_is_reached() {
+        assert!(!should_flush_expand_chunk(
+            EXPAND_FIRST_CHUNK_NODE_TARGET - 1,
+            false,
+            Duration::from_millis(0),
+        ));
+        assert!(should_flush_expand_chunk(
+            EXPAND_FIRST_CHUNK_NODE_TARGET,
+            false,
+            Duration::from_millis(0),
+        ));
+        assert!(should_flush_expand_chunk(
+            EXPAND_CHUNK_NODE_TARGET,
+            true,
+            Duration::from_millis(0),
+        ));
+    }
+
+    #[test]
+    fn flushes_on_latency_even_with_small_chunks() {
+        assert!(!should_flush_expand_chunk(
+            1,
+            false,
+            Duration::from_millis(EXPAND_CHUNK_MAX_LATENCY_MS - 1),
+        ));
+        assert!(should_flush_expand_chunk(
+            1,
+            false,
+            Duration::from_millis(EXPAND_CHUNK_MAX_LATENCY_MS),
+        ));
+        assert!(!should_flush_expand_chunk(
+            0,
+            false,
+            Duration::from_millis(EXPAND_CHUNK_MAX_LATENCY_MS),
+        ));
+    }
+
+    #[test]
+    fn walks_expandable_nodes_horizontally() {
+        let index = JsonIndex::from_str(
+            r#"{
+                "a": {
+                    "a1": { "leaf": 1 },
+                    "a2": 2
+                },
+                "b": {
+                    "b1": 3
+                },
+                "c": 4
+            }"#,
+        )
+        .unwrap();
+
+        let mut order = Vec::new();
+        let completed = walk_expandable_nodes_breadth_first(&index, |node_id, _children| {
+            order.push(index.get_path(node_id));
+            true
+        });
+
+        assert!(completed);
+        assert_eq!(order, vec!["$.a", "$.b", "$.a.a1"]);
+    }
 }
 
 #[tauri::command]

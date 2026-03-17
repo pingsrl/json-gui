@@ -1,6 +1,5 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 
 export interface NodeDto {
   id: number;
@@ -34,10 +33,19 @@ interface ExpandToResult {
   path: string;
 }
 
+interface ExpandedSliceResult {
+  offset: number;
+  total_count: number;
+  rows: VNode[];
+}
+
 const MAX_RECENT = 5;
 // Contatore generazione per ignorare chunk di expand_all superati da un reload
 let expandGeneration = 0;
 const MAX_CHILDREN_CACHE = 2000;
+const EXPAND_ALL_SLICE_SIZE = 200;
+
+const expandAllRequestedPages = new Set<number>();
 
 // Cache LRU semplice (FIFO con limite) per i figli già caricati
 const childrenCache = new Map<number, NodeDto[]>();
@@ -79,6 +87,10 @@ function loadRecentFiles(): string[] {
   }
 }
 
+function clearExpandAllRequests() {
+  expandAllRequestedPages.clear();
+}
+
 export function buildVisibleNodes(
   rootChildren: NodeDto[],
   expandedNodes: Map<number, NodeDto[]>
@@ -104,6 +116,27 @@ export function buildVisibleNodes(
   return result;
 }
 
+export function insertVisibleChildren(
+  visibleNodes: VNode[],
+  expansions: [number, NodeDto[]][]
+): VNode[] {
+  if (expansions.length === 0) return visibleNodes;
+
+  const nextVisible = visibleNodes.slice();
+  for (const [parentId, children] of expansions) {
+    if (children.length === 0) continue;
+    const parentIndex = nextVisible.findIndex(({ node }) => node.id === parentId);
+    if (parentIndex < 0) continue;
+    const depth = nextVisible[parentIndex].depth + 1;
+    nextVisible.splice(
+      parentIndex + 1,
+      0,
+      ...children.map((node) => ({ node, depth }))
+    );
+  }
+  return nextVisible;
+}
+
 export interface ContextMenuState {
   x: number;
   y: number;
@@ -118,6 +151,9 @@ interface JsonStore {
   sizeBytes: number;
   rootChildren: NodeDto[];
   expandedNodes: Map<number, NodeDto[]>;
+  expandAllActive: boolean;
+  expandAllTotalCount: number;
+  expandAllRows: Map<number, VNode>;
   expandProgress: number | null;
   selectedNodeId: number | null;
   selectedNode: NodeDto | null;
@@ -144,6 +180,7 @@ interface JsonStore {
     exactMatch: boolean
   ) => Promise<void>;
   expandAll: () => Promise<void>;
+  fetchExpandedSlice: (offset: number, limit: number) => Promise<void>;
   collapseAll: () => void;
   clearSearch: () => void;
   showContextMenu: (cm: ContextMenuState) => void;
@@ -156,6 +193,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   sizeBytes: 0,
   rootChildren: [],
   expandedNodes: new Map(),
+  expandAllActive: false,
+  expandAllTotalCount: 0,
+  expandAllRows: new Map(),
   expandProgress: null,
   selectedNodeId: null,
   selectedNode: null,
@@ -181,6 +221,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     pathCache.clear();
     nodeMapCache.clear();
     parentMap.clear();
+    clearExpandAllRequests();
 
     // Popola nodeMapCache con root_children
     for (const n of info.root_children) {
@@ -197,6 +238,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       sizeBytes: info.size_bytes,
       rootChildren: info.root_children,
       expandedNodes,
+      expandAllActive: false,
+      expandAllTotalCount: 0,
+      expandAllRows: new Map(),
       selectedNodeId: null,
       selectedNode: null,
       selectedNodePath: null,
@@ -210,9 +254,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
 
   openFromString: async (content: string) => {
     set({ loading: true });
-    const info = await invoke<FileInfo>("open_from_string", { content }).finally(() =>
-      set({ loading: false })
-    );
+    const info = await invoke<FileInfo>("open_from_string", {
+      content
+    }).finally(() => set({ loading: false }));
     const expandedNodes = new Map<number, NodeDto[]>();
     const visibleNodes = buildVisibleNodes(info.root_children, expandedNodes);
 
@@ -220,6 +264,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     pathCache.clear();
     nodeMapCache.clear();
     parentMap.clear();
+    clearExpandAllRequests();
 
     for (const n of info.root_children) {
       nodeMapCache.set(n.id, n);
@@ -231,6 +276,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       sizeBytes: info.size_bytes,
       rootChildren: info.root_children,
       expandedNodes,
+      expandAllActive: false,
+      expandAllTotalCount: 0,
+      expandAllRows: new Map(),
       selectedNodeId: null,
       selectedNode: null,
       selectedNodePath: null,
@@ -242,7 +290,8 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   },
 
   toggleNode: async (nodeId: number) => {
-    const { expandedNodes, rootChildren, selectedNodeId } = get();
+    const { expandAllActive, expandedNodes, rootChildren, selectedNodeId } = get();
+    if (expandAllActive) return;
     let next: Map<number, NodeDto[]>;
     if (expandedNodes.has(nodeId)) {
       next = new Map(expandedNodes);
@@ -261,9 +310,10 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       next.set(nodeId, children);
     }
     const visibleNodes = buildVisibleNodes(rootChildren, next);
-    const selectedNodeSiblings = selectedNodeId !== null
-      ? findSiblings(selectedNodeId, rootChildren, next)
-      : null;
+    const selectedNodeSiblings =
+      selectedNodeId !== null
+        ? findSiblings(selectedNodeId, rootChildren, next)
+        : null;
     set({ expandedNodes: next, visibleNodes, selectedNodeSiblings });
   },
 
@@ -273,8 +323,10 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       path = await invoke<string>("get_path", { nodeId: node.id });
       pathCache.set(node.id, path);
     }
-    const { rootChildren, expandedNodes } = get();
-    const selectedNodeSiblings = findSiblings(node.id, rootChildren, expandedNodes);
+    const { expandAllActive, rootChildren, expandedNodes } = get();
+    const selectedNodeSiblings = expandAllActive
+      ? null
+      : findSiblings(node.id, rootChildren, expandedNodes);
     set({
       selectedNodeId: node.id,
       selectedNode: node,
@@ -328,6 +380,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   },
 
   navigateToNode: async (nodeId: number) => {
+    clearExpandAllRequests();
     const result = await invoke<ExpandToResult>("expand_to", { nodeId });
     const { expandedNodes, rootChildren } = get();
     const next = new Map(expandedNodes);
@@ -346,6 +399,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     const selectedNodeSiblings = findSiblings(nodeId, rootChildren, next);
     set({
       expandedNodes: next,
+      expandAllActive: false,
+      expandAllTotalCount: 0,
+      expandAllRows: new Map(),
       selectedNodeId: nodeId,
       selectedNode: targetNode,
       selectedNodePath: result.path,
@@ -355,97 +411,92 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     });
   },
 
+  fetchExpandedSlice: async (offset: number, limit: number) => {
+    const { expandAllActive } = get();
+    if (!expandAllActive) return;
+
+    const gen = expandGeneration;
+    const start =
+      Math.floor(Math.max(0, offset) / EXPAND_ALL_SLICE_SIZE) * EXPAND_ALL_SLICE_SIZE;
+    const end = Math.max(
+      start + EXPAND_ALL_SLICE_SIZE,
+      Math.ceil((Math.max(0, offset) + Math.max(1, limit)) / EXPAND_ALL_SLICE_SIZE) *
+        EXPAND_ALL_SLICE_SIZE
+    );
+
+    const tasks: Promise<void>[] = [];
+    for (let page = start; page < end; page += EXPAND_ALL_SLICE_SIZE) {
+      if (expandAllRequestedPages.has(page)) continue;
+      expandAllRequestedPages.add(page);
+      tasks.push(
+        invoke<ExpandedSliceResult>("get_expanded_slice", {
+          offset: page,
+          limit: EXPAND_ALL_SLICE_SIZE
+        })
+          .then((result) => {
+            if (expandGeneration !== gen || !get().expandAllActive) return;
+            const nextRows = new Map(get().expandAllRows);
+            result.rows.forEach((row, idx) => {
+              nextRows.set(result.offset + idx, row);
+            });
+            set({
+              expandAllRows: nextRows,
+              expandAllTotalCount: result.total_count
+            });
+          })
+          .catch((err) => {
+            console.error("get_expanded_slice failed:", err);
+            expandAllRequestedPages.delete(page);
+          })
+      );
+    }
+
+    await Promise.all(tasks);
+  },
+
   expandAll: async () => {
-    const { rootChildren } = get();
+    const { rootChildren, nodeCount } = get();
     if (rootChildren.length === 0) return;
 
     expandGeneration++;
     const myGen = expandGeneration;
-    set({ loading: true });
-
-    // Accumulatore locale: cresce chunk per chunk
-    const next = new Map<number, NodeDto[]>();
-    // Chunk ricevuti ma non ancora applicati all'UI
-    let pending: [number, NodeDto[]][] = [];
-    // Primo chunk già applicato (per feedback immediato)
-    let firstApplied = false;
-
-    let doneResolve!: () => void;
-    const donePromise = new Promise<void>((r) => { doneResolve = r; });
-
-    // Svuota pending in next (solo accumulo, senza rebuild visibleNodes).
-    const drainPending = () => {
-      for (const [id, children] of pending) {
-        next.set(id, children);
-        cacheSet(id, children);
-        registerChildren(id, children);
-        for (const child of children) nodeMapCache.set(child.id, child);
-      }
-      pending = [];
-    };
-
-    // Rebuild completo: chiamato solo al primo chunk e a expand-done.
-    // buildVisibleNodes è O(visible) — con milioni di nodi blocca il thread JS
-    // se chiamato ad ogni chunk. Lo chiamiamo il meno possibile.
-    const applyFull = () => {
-      drainPending();
-      const { rootChildren: rc, selectedNodeId } = get();
-      const visibleNodes = buildVisibleNodes(rc, next);
-      const selectedNodeSiblings =
-        selectedNodeId !== null ? findSiblings(selectedNodeId, rc, next) : null;
-      // new Map(next) crea una nuova reference per triggerare Zustand
-      set({ expandedNodes: new Map(next), visibleNodes, selectedNodeSiblings });
-    };
-
-    const unlistenChunk = await listen<{ expansions: [number, NodeDto[]][], progress: number }>(
-      "expand-chunk",
-      (e) => {
-        if (expandGeneration !== myGen) return;
-        pending.push(...e.payload.expansions);
-        set({ expandProgress: e.payload.progress });
-
-        if (!firstApplied) {
-          // Primo chunk: rebuild immediato → l'utente vede l'albero espandersi
-          // entro pochi ms senza aspettare tutti i nodi
-          firstApplied = true;
-          applyFull();
-        }
-        // Chunk successivi: solo accumulati in pending.
-        // Il rebuild finale avviene a expand-done.
-      }
-    );
-
-    const unlistenDone = await listen("expand-done", () => {
-      if (expandGeneration !== myGen) { doneResolve(); return; }
-      // Rebuild finale con tutti i chunk rimasti
-      applyFull();
-      unlistenChunk();
-      unlistenDone();
-      set({ loading: false, expandProgress: null });
-      doneResolve();
+    clearExpandAllRequests();
+    set({
+      loading: true,
+      expandProgress: null,
+      expandedNodes: new Map(),
+      expandAllActive: true,
+      expandAllTotalCount: Math.max(0, nodeCount - 1),
+      expandAllRows: new Map(),
+      selectedNodeSiblings: null
     });
-
     try {
-      await invoke("expand_all");
+      await get().fetchExpandedSlice(0, EXPAND_ALL_SLICE_SIZE * 2);
     } catch (err) {
-      console.error("expand_all failed:", err);
-      unlistenChunk();
-      unlistenDone();
-      set({ loading: false, expandProgress: null });
-      doneResolve();
+      console.error("expandAll failed:", err);
     }
-
-    await donePromise;
+    if (expandGeneration === myGen) {
+      set({ loading: false, expandProgress: null });
+    }
   },
 
   collapseAll: () => {
+    clearExpandAllRequests();
     const { rootChildren, selectedNodeId } = get();
     const next = new Map<number, NodeDto[]>();
     const visibleNodes = buildVisibleNodes(rootChildren, next);
-    const selectedNodeSiblings = selectedNodeId !== null
-      ? findSiblings(selectedNodeId, rootChildren, next)
-      : null;
-    set({ expandedNodes: next, visibleNodes, selectedNodeSiblings });
+    const selectedNodeSiblings =
+      selectedNodeId !== null
+        ? findSiblings(selectedNodeId, rootChildren, next)
+        : null;
+    set({
+      expandedNodes: next,
+      expandAllActive: false,
+      expandAllTotalCount: 0,
+      expandAllRows: new Map(),
+      visibleNodes,
+      selectedNodeSiblings
+    });
   },
 
   clearSearch: () => set({ searchResults: [], searching: false }),

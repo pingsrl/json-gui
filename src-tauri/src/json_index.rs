@@ -57,6 +57,7 @@ pub struct Node {
     pub value: NodeValue,
     pub children_start: u32,
     pub children_len: u32,
+    pub subtree_len: u32,
 }
 
 // ---- TempNode used during BFS build ----
@@ -76,6 +77,11 @@ pub struct JsonIndex {
     pub children: Vec<u32>,
     pub keys: StringPool,
     pub root: u32,
+}
+
+pub struct VisibleSliceRow {
+    pub id: u32,
+    pub depth: usize,
 }
 
 impl JsonIndex {
@@ -185,7 +191,23 @@ impl JsonIndex {
                 value: tn.value,
                 children_start,
                 children_len,
+                subtree_len: 1,
             });
+        }
+
+        for idx in (0..nodes.len()).rev() {
+            let child_ids: Vec<u32> = {
+                let node = &nodes[idx];
+                let start = node.children_start as usize;
+                let end = start + node.children_len as usize;
+                children[start..end].to_vec()
+            };
+            let subtree_len = 1
+                + child_ids
+                    .iter()
+                    .map(|&child_id| nodes[child_id as usize].subtree_len)
+                    .sum::<u32>();
+            nodes[idx].subtree_len = subtree_len;
         }
 
         Ok(JsonIndex {
@@ -194,6 +216,75 @@ impl JsonIndex {
             keys,
             root: 0,
         })
+    }
+
+    pub fn expanded_visible_count(&self) -> usize {
+        self.nodes[self.root as usize]
+            .subtree_len
+            .saturating_sub(1) as usize
+    }
+
+    pub fn get_expanded_slice(&self, offset: usize, limit: usize) -> Vec<VisibleSliceRow> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        struct Frame {
+            parent_id: u32,
+            next_child_index: usize,
+            depth: usize,
+        }
+
+        let mut rows = Vec::with_capacity(limit);
+        let mut skip = offset as u32;
+        let mut stack = vec![Frame {
+            parent_id: self.root,
+            next_child_index: 0,
+            depth: 0,
+        }];
+
+        while !stack.is_empty() {
+            let (child_id, depth) = {
+                let frame = stack.last_mut().unwrap();
+                let children = self.get_children_slice(frame.parent_id);
+                if frame.next_child_index >= children.len() {
+                    stack.pop();
+                    continue;
+                }
+
+                let child_id = children[frame.next_child_index];
+                frame.next_child_index += 1;
+                (child_id, frame.depth)
+            };
+            let child = &self.nodes[child_id as usize];
+
+            if skip >= child.subtree_len {
+                skip -= child.subtree_len;
+                continue;
+            }
+
+            if skip == 0 {
+                rows.push(VisibleSliceRow {
+                    id: child_id,
+                    depth,
+                });
+                if rows.len() >= limit {
+                    break;
+                }
+            } else {
+                skip -= 1;
+            }
+
+            if child.children_len > 0 {
+                stack.push(Frame {
+                    parent_id: child_id,
+                    next_child_index: 0,
+                    depth: depth + 1,
+                });
+            }
+        }
+
+        rows
     }
 
     /// Costruisce la rappresentazione JSON raw di un nodo, iterativamente (no ricorsione).
@@ -674,5 +765,29 @@ mod tests {
         let index = idx(r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#);
         // "name" deve essere internato una volta sola
         assert_eq!(index.keys.strings.iter().filter(|s| s.as_str() == "name").count(), 1);
+    }
+
+    #[test]
+    fn expanded_visible_count_excludes_synthetic_root() {
+        let index = idx(r#"{"a":{"b":1},"c":[2,3]}"#);
+        assert_eq!(index.expanded_visible_count(), index.nodes.len() - 1);
+    }
+
+    #[test]
+    fn expanded_slice_returns_preorder_rows() {
+        let index = idx(r#"{"a":{"b":1},"c":[2,3]}"#);
+        let rows = index.get_expanded_slice(0, 10);
+        let paths: Vec<String> = rows.iter().map(|row| index.get_path(row.id)).collect();
+        let depths: Vec<usize> = rows.iter().map(|row| row.depth).collect();
+        assert_eq!(paths, vec!["$.a", "$.a.b", "$.c", "$.c.0", "$.c.1"]);
+        assert_eq!(depths, vec![0, 1, 0, 1, 1]);
+    }
+
+    #[test]
+    fn expanded_slice_supports_offsets_inside_subtrees() {
+        let index = idx(r#"{"a":{"b":1},"c":[2,3]}"#);
+        let rows = index.get_expanded_slice(2, 2);
+        let paths: Vec<String> = rows.iter().map(|row| index.get_path(row.id)).collect();
+        assert_eq!(paths, vec!["$.c", "$.c.0"]);
     }
 }

@@ -22,7 +22,7 @@ rayon = "1"
 regex = "1"
 memmap2 = "0.9"
 tauri = { version = "2", features = [] }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "time"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-updater = "2"
