@@ -10,7 +10,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, Minus, Plus, Search, X } from "lucide-react";
+import { Check, ChevronDown, Minus, Plus, Search, X } from "lucide-react";
 import {
   type ObjectSearchFilter,
   type SearchMode,
@@ -1211,22 +1211,29 @@ export const SearchBar: FC = () => {
                           />
                         </div>
 
-                        <select
-                          value={row.operator}
-                          onChange={(event) =>
-                            updateObjectRow(row.id, (current) => ({
-                              ...current,
-                              operator: event.target.value as ObjectSearchFilter["operator"]
-                            }))
-                          }
-                          className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-700 shadow-sm outline-none transition-colors focus:border-blue-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200"
-                        >
-                          {OBJECT_OPERATORS.map((operator) => (
-                            <option key={operator.value} value={operator.value}>
-                              {t[operator.labelKey]}
-                            </option>
-                          ))}
-                        </select>
+                        <div className="relative">
+                          <select
+                            value={row.operator}
+                            onChange={(event) =>
+                              updateObjectRow(row.id, (current) => ({
+                                ...current,
+                                operator: event.target
+                                  .value as ObjectSearchFilter["operator"]
+                              }))
+                            }
+                            className="h-[38px] w-full appearance-none rounded-lg border border-gray-200 bg-gray-50 px-3 pr-8 text-xs font-medium leading-none text-gray-700 shadow-sm outline-none transition-colors focus:border-blue-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200"
+                          >
+                            {OBJECT_OPERATORS.map((operator) => (
+                              <option key={operator.value} value={operator.value}>
+                                {t[operator.labelKey]}
+                              </option>
+                            ))}
+                          </select>
+                          <ChevronDown
+                            size={14}
+                            className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-500"
+                          />
+                        </div>
 
                         <div className="flex items-center gap-2">
                           {row.operator !== "exists" && (
