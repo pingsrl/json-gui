@@ -299,7 +299,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       get().clearSearch();
       return;
     }
-    set({ searching: true });
+    set({ searching: true, selectedNode: null, selectedNodeId: null });
     try {
       const results = await invoke<SearchResult[]>("search", {
         query: {
