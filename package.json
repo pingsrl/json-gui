@@ -10,7 +10,10 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "test": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "bench": "cd src-tauri && cargo bench",
+    "bench:real": "cd src-tauri && cargo bench -- real_file",
+    "bench:frontend": "node --experimental-strip-types src/bench/perf.mts"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.13.23",
