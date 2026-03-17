@@ -369,22 +369,28 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   },
 
   selectNode: async (node: NodeDto) => {
-    let path = pathCache.get(node.id);
-    if (!path) {
-      path = await invoke<string>("get_path", { nodeId: node.id });
-      pathCache.set(node.id, path);
-    }
     const { expandAllActive, rootChildren, expandedNodes } = get();
     const selectedNodeSiblings = expandAllActive
       ? null
       : findSiblings(node.id, rootChildren, expandedNodes);
+    const cachedPath = pathCache.get(node.id) ?? null;
     set({
       selectedNodeId: node.id,
       selectedNode: node,
-      selectedNodePath: path,
+      selectedNodePath: cachedPath,
       selectedNodeSiblings,
       focusedNodeId: node.id
     });
+    if (cachedPath) return;
+    try {
+      const path = await invoke<string>("get_path", { nodeId: node.id });
+      pathCache.set(node.id, path);
+      if (get().selectedNodeId === node.id) {
+        set({ selectedNodePath: path });
+      }
+    } catch (err) {
+      console.error("selectNode path error:", err);
+    }
   },
 
   setFocusedNode: (nodeId: number | null) => {
