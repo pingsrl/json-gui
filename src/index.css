@@ -5,12 +5,14 @@
   --scrollbar-track: rgba(226, 232, 240, 0.9);
   --scrollbar-thumb: rgba(148, 163, 184, 0.9);
   --scrollbar-thumb-hover: rgba(100, 116, 139, 0.95);
+  color-scheme: light;
 }
 
 .dark {
   --scrollbar-track: rgba(31, 41, 55, 0.95);
   --scrollbar-thumb: rgba(75, 85, 99, 0.9);
   --scrollbar-thumb-hover: rgba(107, 114, 128, 0.95);
+  color-scheme: dark;
 }
 
 * {
