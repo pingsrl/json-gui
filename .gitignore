@@ -21,3 +21,4 @@ npm-debug.log*
 # Env
 .env
 .env.local
+.bench.env

@@ -293,7 +293,9 @@ pub async fn expand_to(
     Ok(ExpandToResult { expansions, path })
 }
 
-const EXPAND_CHUNK_SIZE: usize = 1_000;
+// 10k nodi/chunk → ~100 chiamate IPC per 1M nodi (vs 1000 con chunk=1k)
+// Riduce l'overhead IPC 10x mantenendo feedback visivo ogni ~500ms
+const EXPAND_CHUNK_SIZE: usize = 10_000;
 
 #[derive(Serialize, Clone)]
 pub struct ExpandChunk {

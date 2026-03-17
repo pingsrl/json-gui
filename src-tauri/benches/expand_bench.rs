@@ -257,11 +257,33 @@ fn bench_build_raw(c: &mut Criterion) {
 
 // ── Benchmark su file reale ───────────────────────────────────────────────────
 
+/// Legge KEY=value da un file .env (solo la variabile richiesta, no dipendenze extra).
+fn read_dotenv(key: &str) -> Option<String> {
+    // Cerca in .bench.env nella directory del workspace (due livelli su rispetto a benches/)
+    let candidates = ["../.bench.env", ".bench.env"];
+    for candidate in candidates {
+        let Ok(content) = std::fs::read_to_string(candidate) else { continue };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() { continue }
+            if let Some(rest) = line.strip_prefix(key) {
+                if let Some(val) = rest.strip_prefix('=') {
+                    return Some(val.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Misura il BFS su un file JSON reale.
-/// Usa BENCH_JSON_PATH o il path di default se presente.
+/// Cerca BENCH_JSON_PATH in: variabile d'ambiente, poi .bench.env nella root del progetto.
 fn bench_real_file(c: &mut Criterion) {
-    let Ok(path) = std::env::var("BENCH_JSON_PATH") else {
-        eprintln!("[bench_real_file] Imposta BENCH_JSON_PATH=/path/to/large.json per eseguire questo benchmark");
+    let path = std::env::var("BENCH_JSON_PATH")
+        .ok()
+        .or_else(|| read_dotenv("BENCH_JSON_PATH"));
+    let Some(path) = path else {
+        eprintln!("[bench_real_file] Imposta BENCH_JSON_PATH in .bench.env o come variabile d'ambiente");
         return;
     };
 
