@@ -22,7 +22,9 @@ export const SearchPanel: FC = () => {
     toggleNode,
     expandedNodes,
     hasActiveSearch,
-    searchMode
+    searchMode,
+    searchSort,
+    setSearchSort
   } = useJsonStore();
   const { t } = useI18n();
 
@@ -52,12 +54,34 @@ export const SearchPanel: FC = () => {
 
   return (
     <div className="flex h-full flex-col border-r border-gray-200 bg-gray-50 dark:border-gray-700 dark:bg-gray-900">
-      {!searching && searchResults.length > 0 && (
-        <div className="border-b border-gray-200 bg-gray-50 px-3 py-1.5 text-xs text-gray-400 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-500">
-          {t.results(searchResults.length)}
-          {searchResults.length === 500 && (
-            <span className="ml-1 text-yellow-600">{t.limitReached}</span>
-          )}
+      {!searching && hasActiveSearch && (
+        <div className="flex items-center justify-between border-b border-gray-200 bg-gray-50 px-3 py-1.5 dark:border-gray-700 dark:bg-gray-900">
+          <span className="text-xs text-gray-400 dark:text-gray-500">
+            {searchResults.length > 0 && (
+              <>
+                {t.results(searchResults.length)}
+                {searchResults.length === 500 && (
+                  <span className="ml-1 text-yellow-600">{t.limitReached}</span>
+                )}
+              </>
+            )}
+          </span>
+          <div className="inline-flex rounded-lg border border-gray-200 bg-gray-100 p-0.5 dark:border-gray-700 dark:bg-gray-800">
+            {(["relevance", "file"] as const).map((value) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setSearchSort(value)}
+                className={`rounded-md px-2 py-1 text-[11px] font-medium transition-all ${
+                  searchSort === value
+                    ? "bg-white text-gray-800 shadow-sm dark:bg-gray-700 dark:text-gray-100"
+                    : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                }`}
+              >
+                {value === "relevance" ? t.searchSortRelevance : t.searchSortFileOrder}
+              </button>
+            ))}
+          </div>
         </div>
       )}
 

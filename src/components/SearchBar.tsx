@@ -25,10 +25,6 @@ const TEXT_TARGETS = [
   { value: "values", labelKey: "searchValues" }
 ] as const;
 
-const SEARCH_SORT_OPTIONS = [
-  { value: "relevance", labelKey: "searchSortRelevance" },
-  { value: "file", labelKey: "searchSortFileOrder" }
-] as const;
 
 const TEXT_FILTERS = [
   {
@@ -1030,17 +1026,6 @@ export const SearchBar: FC = () => {
                 </div>
               </div>
 
-              <div className="flex flex-col gap-1.5">
-                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-400 dark:text-gray-500">
-                  {t.searchSort}
-                </div>
-                {renderSegmentedControl(
-                  SEARCH_SORT_OPTIONS,
-                  searchSort,
-                  (value) => setSearchSort(value as "relevance" | "file"),
-                  "search-sort"
-                )}
-              </div>
             </div>
           </div>
         ) : (
