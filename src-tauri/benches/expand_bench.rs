@@ -81,37 +81,27 @@ fn bfs_collect_all_dtos(index: &JsonIndex) -> Vec<(u32, Vec<NodeDtoSimple>)> {
     result
 }
 
-/// DTO minimalista che replica esattamente la struttura di produzione.
+/// DTO minimalista che replica la struttura di produzione.
 #[derive(Debug)]
 struct NodeDtoSimple {
     id: u32,
     key: Option<String>,
     value_type: &'static str,
     value_preview: Cow<'static, str>,
-    has_children: bool,
     children_count: usize,
 }
 
 fn node_to_dto_simple(index: &JsonIndex, id: u32) -> NodeDtoSimple {
     let node = &index.nodes[id as usize];
     let children_len = node.children_len as usize;
-    let has_children = children_len > 0;
     let (value_type, value_preview): (&'static str, Cow<'static, str>) = match &node.value {
         NodeValue::Object => (
             "object",
-            if !has_children {
-                Cow::Borrowed("{}")
-            } else {
-                Cow::Owned(format!("{{{} keys}}", children_len))
-            },
+            if children_len == 0 { Cow::Borrowed("{}") } else { Cow::Owned(format!("{{{} keys}}", children_len)) },
         ),
         NodeValue::Array => (
             "array",
-            if !has_children {
-                Cow::Borrowed("[]")
-            } else {
-                Cow::Owned(format!("[{} items]", children_len))
-            },
+            if children_len == 0 { Cow::Borrowed("[]") } else { Cow::Owned(format!("[{} items]", children_len)) },
         ),
         NodeValue::Str(s) => (
             "string",
@@ -132,42 +122,61 @@ fn node_to_dto_simple(index: &JsonIndex, id: u32) -> NodeDtoSimple {
         key: node.key.map(|kid| index.keys.get(kid).to_string()),
         value_type,
         value_preview,
-        has_children,
         children_count: children_len,
     }
 }
 
 // ── Serde JSON serialization cost ────────────────────────────────────────────
 
-/// Simula il costo di serializzare JSON per l'IPC (serde_json::to_string).
-fn serialize_chunk(chunk: &[(u32, Vec<NodeDtoSimple>)]) -> String {
-    // Serializzazione manuale per simulare serde
-    let mut out = String::with_capacity(chunk.len() * 150);
-    out.push('[');
-    for (i, (parent_id, children)) in chunk.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!("[{},", parent_id));
-        out.push('[');
-        for (j, dto) in children.iter().enumerate() {
-            if j > 0 {
-                out.push(',');
+/// Simula il costo di serializzare get_expanded_slice nel formato compatto a tuple.
+/// Ogni row: [id, parent_id, key_idx, type_byte, preview, children_count, depth]
+fn serialize_compact_slice(nodes: &[(u32, &NodeDtoSimple)]) -> String {
+    // Pool locale di chiavi (simula quello di produzione)
+    let mut key_pool: Vec<&str> = Vec::new();
+    let mut key_pool_keys: Vec<Option<&str>> = Vec::new();
+
+    let mut rows = String::with_capacity(nodes.len() * 40);
+    rows.push('[');
+    for (i, (parent_id, dto)) in nodes.iter().enumerate() {
+        if i > 0 { rows.push(','); }
+        let key_idx: i32 = match dto.key.as_deref() {
+            None => -1,
+            Some(k) => {
+                match key_pool_keys.iter().position(|&kk| kk == Some(k)) {
+                    Some(pos) => pos as i32,
+                    None => {
+                        let pos = key_pool.len() as i32;
+                        key_pool.push(k);
+                        key_pool_keys.push(Some(k));
+                        pos
+                    }
+                }
             }
-            out.push_str(&format!(
-                r#"{{"id":{},"key":{},"value_type":"{}","value_preview":"{}","has_children":{},"children_count":{}}}"#,
-                dto.id,
-                dto.key.as_deref().map(|k| format!("\"{}\"", k)).unwrap_or_else(|| "null".to_string()),
-                dto.value_type,
-                dto.value_preview.replace('"', "\\\""),
-                dto.has_children,
-                dto.children_count
-            ));
-        }
-        out.push_str("]]");
+        };
+        let type_byte: u8 = match dto.value_type {
+            "object" => 0, "array" => 1, "string" => 2,
+            "number" => 3, "boolean" => 4, _ => 5,
+        };
+        let preview = dto.value_preview.replace('"', "\\\"");
+        rows.push_str(&format!(
+            "[{},{},{},{}",
+            dto.id, parent_id, key_idx, type_byte
+        ));
+        rows.push_str(&format!(",\"{}\",{},0]", preview, dto.children_count));
     }
-    out.push(']');
-    out
+    rows.push(']');
+
+    // Serializza il pool di chiavi
+    let mut pool_json = String::from("[");
+    for (i, k) in key_pool.iter().enumerate() {
+        if i > 0 { pool_json.push(','); }
+        pool_json.push('"');
+        pool_json.push_str(k);
+        pool_json.push('"');
+    }
+    pool_json.push(']');
+
+    format!(r#"{{"offset":0,"total_count":50000,"key_pool":{},"rows":{}}}"#, pool_json, rows)
 }
 
 // ── Criterion groups ──────────────────────────────────────────────────────────
@@ -224,18 +233,22 @@ fn bench_bfs_dto(c: &mut Criterion) {
 
 fn bench_serialization(c: &mut Criterion) {
     let mut group = c.benchmark_group("ipc_serialization");
-    // Simula un singolo chunk di 1000 nodi
+    // Simula get_expanded_slice con il formato compatto a tuple.
+    // Appiattisce tutte le coppie (parent_id, Vec<NodeDtoSimple>) in una
+    // slice flat che corrisponde a quello che fa get_expanded_slice.
     let index = JsonIndex::from_str(&flat_array_json(10_000)).unwrap();
     let all = bfs_collect_all_dtos(&index);
-    for &chunk_size in &[100usize, 500, 1000, 5000] {
-        let chunk = &all[..chunk_size.min(all.len())];
-        group.throughput(Throughput::Elements(
-            chunk.iter().map(|(_, c)| c.len()).sum::<usize>() as u64,
-        ));
+    let flat: Vec<(u32, NodeDtoSimple)> = all.into_iter()
+        .flat_map(|(parent_id, children)| children.into_iter().map(move |dto| (parent_id, dto)))
+        .collect();
+    for &slice_size in &[100usize, 200, 500, 1000] {
+        let slice: Vec<(u32, &NodeDtoSimple)> = flat[..slice_size.min(flat.len())]
+            .iter().map(|(p, d)| (*p, d)).collect();
+        group.throughput(Throughput::Elements(slice.len() as u64));
         group.bench_with_input(
-            BenchmarkId::new("serialize_chunk", chunk_size),
-            chunk,
-            |b, ch| b.iter(|| serialize_chunk(black_box(ch))),
+            BenchmarkId::new("compact_slice", slice_size),
+            &slice,
+            |b, sl| b.iter(|| serialize_compact_slice(black_box(sl))),
         );
     }
     group.finish();

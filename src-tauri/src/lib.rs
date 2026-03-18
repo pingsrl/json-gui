@@ -243,10 +243,9 @@ pub fn run() {
             commands::get_raw,
             commands::expand_to,
             commands::get_expanded_slice,
-            commands::expand_all,
             commands::get_initial_path,
             commands::open_from_string,
-            commands::export_types,
+            commands::export_types
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
