@@ -66,20 +66,23 @@ export const TreePanel: FC = () => {
     fetchExpandedSlice
   ]);
 
-  // Scroll al nodo selezionato — lookup O(1) via index map
+  // Ref sempre aggiornati: permettono all'effect di leggere le mappe correnti
+  // senza dover dipendere da esse (evita lo scroll-to-selected su ogni expand/collapse)
+  const visibleIndexMapRef = useRef(visibleIndexMap);
+  const expandAllIndexMapRef = useRef(expandAllIndexMap);
+  visibleIndexMapRef.current = visibleIndexMap;
+  expandAllIndexMapRef.current = expandAllIndexMap;
+
+  // Scroll al nodo selezionato — scatta SOLO quando selectedNodeId cambia,
+  // non ad ogni expand/collapse (che cambierebbe visibleIndexMap e riporterebbe
+  // la vista all'inizio della lista)
   useEffect(() => {
     if (selectedNodeId === null) return;
     const idx = expandAllActive
-      ? (expandAllIndexMap.get(selectedNodeId) ?? -1)
-      : (visibleIndexMap.get(selectedNodeId) ?? -1);
+      ? (expandAllIndexMapRef.current.get(selectedNodeId) ?? -1)
+      : (visibleIndexMapRef.current.get(selectedNodeId) ?? -1);
     if (idx >= 0) rowVirtualizer.scrollToIndex(idx, { align: "center" });
-  }, [
-    expandAllActive,
-    expandAllIndexMap,
-    selectedNodeId,
-    visibleIndexMap,
-    rowVirtualizer
-  ]);
+  }, [selectedNodeId, expandAllActive, rowVirtualizer]);
 
   // Ref sempre aggiornato con i valori correnti — evita di ri-registrare il listener
   // ad ogni expand/collapse (da 12 dipendenze a 1)

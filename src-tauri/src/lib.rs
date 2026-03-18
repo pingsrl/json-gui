@@ -293,7 +293,8 @@ pub fn run() {
             commands::get_expanded_slice,
             commands::get_initial_path,
             commands::open_from_string,
-            commands::export_types
+            commands::export_types,
+            commands::take_screenshot
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

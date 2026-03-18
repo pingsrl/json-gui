@@ -761,3 +761,24 @@ pub async fn open_from_string(
         root_children,
     })
 }
+
+#[tauri::command]
+pub async fn take_screenshot(
+    path: String,
+    webview_window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    use std::process::Command;
+    let pos = webview_window.outer_position().map_err(|e| e.to_string())?;
+    let size = webview_window.outer_size().map_err(|e| e.to_string())?;
+    let scale = webview_window.scale_factor().map_err(|e| e.to_string())?;
+    let x = (pos.x as f64 / scale) as i32;
+    let y = (pos.y as f64 / scale) as i32;
+    let w = (size.width as f64 / scale) as u32;
+    let h = (size.height as f64 / scale) as u32;
+    let rect = format!("{},{},{},{}", x, y, w, h);
+    let status = Command::new("screencapture")
+        .args(["-x", "-t", "jpg", "-R", &rect, &path])
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() { Ok(()) } else { Err("screencapture failed".into()) }
+}
