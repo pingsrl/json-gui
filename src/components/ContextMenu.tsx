@@ -138,6 +138,17 @@ export const ContextMenu: FC = () => {
       <button
         type="button"
         className={itemClassName}
+        onClick={() => {
+          void invoke("open_in_new_window", { nodeId });
+          hideContextMenu();
+        }}
+      >
+        {t.openInNewWindow}
+      </button>
+      <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
+      <button
+        type="button"
+        className={itemClassName}
         onClick={copyKey}
         disabled={!hasNodeKey}
       >

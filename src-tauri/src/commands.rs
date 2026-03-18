@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::io::{BufReader, Read};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State, WindowEvent};
 
 /// Wrapper attorno a un `Read` che emette una callback ogni volta che la percentuale avanza.
 struct ProgressReader<R: Read, F: Fn(u8)> {
@@ -54,6 +54,9 @@ pub struct AppState {
     /// permettendo letture concorrenti (search, get_children, …) sulla stessa finestra.
     pub windows: RwLock<HashMap<String, Arc<RwLock<Option<JsonIndex>>>>>,
     pub initial_path: std::sync::Mutex<Option<String>>,
+    /// JSON grezzo pre-caricato per una finestra aperta via "Apri in nuova finestra".
+    /// Chiave = label finestra; consumato una sola volta da get_pending_content.
+    pub pending_content: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl AppState {
@@ -76,6 +79,7 @@ impl AppState {
     /// Rimuove l'indice associato a una finestra (chiamato alla sua distruzione).
     pub fn remove_window(&self, label: &str) {
         self.windows.write().unwrap().remove(label);
+        self.pending_content.lock().unwrap().remove(label);
     }
 }
 
@@ -616,6 +620,74 @@ pub async fn get_raw(
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     Ok(index.build_raw(node_id))
+}
+
+/// Apre il sotto-albero di `node_id` in una nuova finestra come JSON indipendente.
+/// Il JSON grezzo viene salvato in `pending_content` per il label della nuova finestra;
+/// la nuova finestra lo legge tramite `get_pending_content` all'avvio.
+#[tauri::command]
+pub async fn open_in_new_window(
+    node_id: u32,
+    state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let raw = {
+        let idx = state.window_index(webview_window.label());
+        let guard = idx.read().unwrap();
+        let index = guard.as_ref().ok_or("Nessun file aperto")?;
+        index.build_raw(node_id)
+    };
+
+    let label = format!(
+        "w{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+
+    state
+        .pending_content
+        .lock()
+        .unwrap()
+        .insert(label.clone(), raw);
+
+    let new_window = tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+    .title("JsonGUI")
+    .inner_size(1200.0, 800.0)
+    .min_inner_size(600.0, 400.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    // Cleanup all'uscita
+    let app_clone = app.clone();
+    let lbl = label.clone();
+    new_window.on_window_event(move |event| {
+        if let WindowEvent::Destroyed = event {
+            app_clone.state::<AppState>().remove_window(&lbl);
+        }
+    });
+
+    Ok(())
+}
+
+/// Restituisce (e consuma) il JSON pre-caricato per questa finestra, se presente.
+/// Usato da finestre aperte tramite "Apri in nuova finestra" per caricare il subtree.
+#[tauri::command]
+pub fn get_pending_content(
+    webview_window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Option<String> {
+    state
+        .pending_content
+        .lock()
+        .unwrap()
+        .remove(webview_window.label())
 }
 
 #[tauri::command]

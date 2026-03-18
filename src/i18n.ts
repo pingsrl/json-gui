@@ -73,6 +73,7 @@ export interface Translations {
   copyValue: string;
   copyRaw: string;
   expandFromHere: string;
+  openInNewWindow: string;
   searchInNode: string;
   searchInParentNode: string;
   exportTitle: string;
@@ -153,6 +154,7 @@ const translations: Record<Lang, Translations> = {
     copyValue: "Copy value",
     copyRaw: "Copy raw JSON",
     expandFromHere: "Expand from here",
+    openInNewWindow: "Open in new window",
     searchInNode: "Search in this node",
     searchInParentNode: "Search in parent node",
     exportTitle: "Export type definition",
@@ -232,6 +234,7 @@ const translations: Record<Lang, Translations> = {
     copyValue: "Copia valore",
     copyRaw: "Copia raw JSON",
     expandFromHere: "Espandi da qui",
+    openInNewWindow: "Apri in nuova finestra",
     searchInNode: "Cerca in questo nodo",
     searchInParentNode: "Cerca nel nodo padre",
     exportTitle: "Esporta definizione tipo",
@@ -310,6 +313,7 @@ const translations: Record<Lang, Translations> = {
     copyValue: "复制值",
     copyRaw: "复制原始 JSON",
     expandFromHere: "从此处展开",
+    openInNewWindow: "在新窗口中打开",
     searchInNode: "在此节点中搜索",
     searchInParentNode: "在父节点中搜索",
     exportTitle: "导出类型定义",

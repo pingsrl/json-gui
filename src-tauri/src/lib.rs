@@ -126,6 +126,7 @@ pub fn run() {
         .manage(AppState {
             windows: RwLock::new(HashMap::new()),
             initial_path: std::sync::Mutex::new(None),
+            pending_content: std::sync::Mutex::new(HashMap::new()),
         })
         .setup(|app| {
             // Windows/Linux: il file viene passato come argomento CLI
@@ -284,6 +285,8 @@ pub fn run() {
             commands::search_objects,
             commands::suggest_property_paths,
             commands::get_raw,
+            commands::open_in_new_window,
+            commands::get_pending_content,
             commands::expand_to,
             commands::get_expanded_slice,
             commands::get_initial_path,

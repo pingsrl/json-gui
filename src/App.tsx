@@ -94,6 +94,13 @@ export default function App() {
     });
   }, [openFile]);
 
+  // Carica subtree pre-caricato (finestra aperta via "Apri in nuova finestra")
+  useEffect(() => {
+    invoke<string | null>("get_pending_content").then((content) => {
+      if (content) openFromString(content);
+    });
+  }, [openFromString]);
+
   // Apri file via "Apri con" / double-click (macOS RunEvent::Opened)
   useEffect(() => {
     let unlisten: (() => void) | undefined;
