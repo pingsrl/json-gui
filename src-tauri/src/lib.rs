@@ -6,7 +6,7 @@ use commands::AppState;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -119,8 +119,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState {
-            index: Arc::new(Mutex::new(None)),
-            initial_path: Mutex::new(None),
+            index: Arc::new(RwLock::new(None)),
+            initial_path: std::sync::Mutex::new(None),
         })
         .setup(|app| {
             // Windows/Linux: il file viene passato come argomento CLI

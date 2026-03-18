@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{BufReader, Read};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
 use tokio::sync::mpsc;
@@ -52,8 +52,10 @@ impl<R: Read, F: Fn(u8)> Read for ProgressReader<R, F> {
 }
 
 pub struct AppState {
-    pub index: Arc<Mutex<Option<JsonIndex>>>,
-    pub initial_path: Mutex<Option<String>>,
+    // RwLock: letture concorrenti (search, get_children, get_path, get_expanded_slice)
+    // senza bloccarsi a vicenda; write lock solo su open_file/open_from_string.
+    pub index: Arc<RwLock<Option<JsonIndex>>>,
+    pub initial_path: std::sync::Mutex<Option<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -136,9 +138,6 @@ pub struct ExpandedSliceResult {
 
 /// Tronca una stringa UTF-8 in modo sicuro al massimo `max_chars` caratteri.
 fn truncate_str(s: &str, max_chars: usize) -> &str {
-    if s.chars().count() <= max_chars {
-        return s;
-    }
     match s.char_indices().nth(max_chars) {
         Some((idx, _)) => &s[..idx],
         None => s,
@@ -226,7 +225,7 @@ pub async fn open_file(
         .iter()
         .map(|&id| node_to_dto(&index, id))
         .collect();
-    *state.index.lock().unwrap() = Some(index);
+    *state.index.write().unwrap() = Some(index);
     Ok(FileInfo {
         node_count,
         size_bytes,
@@ -239,7 +238,7 @@ pub async fn get_children(
     node_id: u32,
     state: State<'_, AppState>,
 ) -> Result<Vec<NodeDto>, String> {
-    let guard = state.index.lock().unwrap();
+    let guard = state.index.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let children: Vec<NodeDto> = index
         .get_children_slice(node_id)
@@ -251,7 +250,7 @@ pub async fn get_children(
 
 #[tauri::command]
 pub async fn get_path(node_id: u32, state: State<'_, AppState>) -> Result<String, String> {
-    let guard = state.index.lock().unwrap();
+    let guard = state.index.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     Ok(index.get_path(node_id))
 }
@@ -261,7 +260,7 @@ pub async fn search(
     query: SearchQuery,
     state: State<'_, AppState>,
 ) -> Result<Vec<SearchResult>, String> {
-    let guard = state.index.lock().unwrap();
+    let guard = state.index.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let results = index.search(
         &query.text,
@@ -338,7 +337,7 @@ pub async fn search_objects(
     query: ObjectSearchQuery,
     state: State<'_, AppState>,
 ) -> Result<Vec<SearchResult>, String> {
-    let guard = state.index.lock().unwrap();
+    let guard = state.index.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
     let filters: Vec<IndexObjectSearchFilter> = query
@@ -367,12 +366,19 @@ pub async fn search_objects(
         .into_iter()
         .map(|id| {
             let node = &index.nodes[id as usize];
+            let children_len = node.children_len as usize;
+            // Inline value_preview per oggetti: evita di costruire NodeDto completo
+            let value_preview = if children_len == 0 {
+                "{}".to_string()
+            } else {
+                format!("{{{} keys}}", children_len)
+            };
             SearchResult {
                 node_id: id,
                 file_order: node.preorder_index,
                 path: index.get_path(id),
                 key: node.key.map(|kid| index.keys.get(kid).to_string()),
-                value_preview: node_to_dto(index, id).value_preview.into_owned(),
+                value_preview,
                 kind: "object",
                 match_preview: Some(match_preview.clone()),
             }
@@ -387,7 +393,7 @@ pub async fn suggest_property_paths(
     limit: usize,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    let guard = state.index.lock().unwrap();
+    let guard = state.index.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     Ok(index.suggest_property_paths(&prefix, limit))
 }
@@ -397,7 +403,7 @@ pub async fn suggest_property_paths(
 /// e ottenere il path in un singolo IPC call.
 #[tauri::command]
 pub async fn expand_to(node_id: u32, state: State<'_, AppState>) -> Result<ExpandToResult, String> {
-    let guard = state.index.lock().unwrap();
+    let guard = state.index.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
     let mut chain: Vec<u32> = Vec::new();
@@ -437,7 +443,7 @@ pub async fn get_expanded_slice(
     limit: usize,
     state: State<'_, AppState>,
 ) -> Result<ExpandedSliceResult, String> {
-    let guard = state.index.lock().unwrap();
+    let guard = state.index.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let rows = index
         .get_expanded_slice(offset, limit)
@@ -530,7 +536,7 @@ pub async fn expand_all(state: State<'_, AppState>, app: tauri::AppHandle) -> Re
     // BFS orizzontale + DTO build su un thread dedicato.
     // Il Mutex è tenuto solo dentro spawn_blocking, non attraverso await.
     tauri::async_runtime::spawn_blocking(move || {
-        let guard = index_arc.lock().unwrap();
+        let guard = index_arc.read().unwrap();
         let index = match guard.as_ref() {
             Some(i) => i,
             None => return,
@@ -693,14 +699,14 @@ mod tests {
 
 #[tauri::command]
 pub async fn get_raw(node_id: u32, state: State<'_, AppState>) -> Result<String, String> {
-    let guard = state.index.lock().unwrap();
+    let guard = state.index.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     Ok(index.build_raw(node_id))
 }
 
 #[tauri::command]
 pub async fn export_types(lang: String, state: State<'_, AppState>) -> Result<String, String> {
-    let guard = state.index.lock().unwrap();
+    let guard = state.index.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let result = match lang.as_str() {
         "typescript" => schema::generate_typescript(index),
@@ -735,7 +741,7 @@ pub async fn open_from_string(
         .iter()
         .map(|&id| node_to_dto(&index, id))
         .collect();
-    *state.index.lock().unwrap() = Some(index);
+    *state.index.write().unwrap() = Some(index);
     Ok(FileInfo {
         node_count,
         size_bytes,
