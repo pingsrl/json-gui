@@ -36,7 +36,9 @@ export const SearchPanel: FC = () => {
         await toggleNode(result.node_id);
       }
       // Seleziona la prima proprietà dell'oggetto invece del nodo oggetto stesso
-      const children = useJsonStore.getState().expandedNodes.get(result.node_id);
+      const children = useJsonStore
+        .getState()
+        .expandedNodes.get(result.node_id);
       if (children && children.length > 0) {
         await navigateToNode(children[0].id);
       }
@@ -66,21 +68,28 @@ export const SearchPanel: FC = () => {
               </>
             )}
           </span>
-          <div className="inline-flex rounded-lg border border-gray-200 bg-gray-100 p-0.5 dark:border-gray-700 dark:bg-gray-800">
-            {(["relevance", "file"] as const).map((value) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => setSearchSort(value)}
-                className={`rounded-md px-2 py-1 text-[11px] font-medium transition-all ${
-                  searchSort === value
-                    ? "bg-white text-gray-800 shadow-sm dark:bg-gray-700 dark:text-gray-100"
-                    : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-                }`}
-              >
-                {value === "relevance" ? t.searchSortRelevance : t.searchSortFileOrder}
-              </button>
-            ))}
+          <div className="flex items-center gap-1.5">
+            <span className="text-[11px] text-gray-400 dark:text-gray-500">
+              {t.searchSortLabel}
+            </span>
+            <div className="inline-flex rounded-lg border border-gray-200 bg-gray-100 p-0.5 dark:border-gray-700 dark:bg-gray-800">
+              {(["relevance", "file"] as const).map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setSearchSort(value)}
+                  className={`rounded-md px-2 py-1 text-[11px] font-medium transition-all ${
+                    searchSort === value
+                      ? "bg-white text-gray-800 shadow-sm dark:bg-gray-700 dark:text-gray-100"
+                      : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                  }`}
+                >
+                  {value === "relevance"
+                    ? t.searchSortRelevance
+                    : t.searchSortFileOrder}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       )}

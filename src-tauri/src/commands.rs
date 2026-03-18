@@ -123,14 +123,25 @@ pub struct SearchQuery {
     pub max_results: usize,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(default)]
+    pub multiline: bool,
+    #[serde(default)]
+    pub dot_all: bool,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ObjectSearchFilterInput {
     pub path: String,
     pub operator: String,
     #[serde(default)]
     pub value: Option<String>,
+    #[serde(default)]
+    pub regex_case_insensitive: bool,
+    #[serde(default)]
+    pub regex_multiline: bool,
+    #[serde(default)]
+    pub regex_dot_all: bool,
 }
 
 #[derive(Deserialize)]
@@ -362,6 +373,8 @@ pub async fn search(
         query.exact_match,
         query.max_results,
         query.path.as_deref(),
+        query.multiline,
+        query.dot_all,
     );
     let dtos: Vec<SearchResult> = results
         .into_iter()
@@ -444,6 +457,9 @@ pub async fn search_objects(
                 path: filter.path.clone(),
                 operator,
                 value: filter.value.clone(),
+                regex_case_insensitive: filter.regex_case_insensitive,
+                regex_multiline: filter.regex_multiline,
+                regex_dot_all: filter.regex_dot_all,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

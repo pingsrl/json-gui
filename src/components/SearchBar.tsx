@@ -18,6 +18,7 @@ import {
   useJsonStore
 } from "../store";
 import { useI18n } from "../i18n";
+import { RegexInput, type RegexFlags } from "./RegexInput";
 
 const TEXT_TARGETS = [
   { value: "both", labelKey: "searchBoth" },
@@ -25,60 +26,52 @@ const TEXT_TARGETS = [
   { value: "values", labelKey: "searchValues" }
 ] as const;
 
+type FilterState = {
+  caseSensitive: boolean;
+  useRegex: boolean;
+  exactMatch: boolean;
+};
+type FilterSetters = {
+  setCaseSensitive: (v: boolean) => void;
+  setUseRegex: (v: boolean) => void;
+  setExactMatch: (v: boolean) => void;
+};
 
-const TEXT_FILTERS = [
+// Gruppo A: modificatori testo (escludono regex)
+const TEXT_MODIFIERS = [
   {
-    key: "caseSensitive",
-    getChecked: (state: {
-      caseSensitive: boolean;
-      useRegex: boolean;
-      exactMatch: boolean;
-    }) => state.caseSensitive,
-    onChange: (
-      checked: boolean,
-      setters: {
-        setCaseSensitive: (value: boolean) => void;
-        setUseRegex: (value: boolean) => void;
-        setExactMatch: (value: boolean) => void;
-      }
-    ) => setters.setCaseSensitive(checked),
-    labelKey: "caseSensitive"
+    key: "caseSensitive" as const,
+    getChecked: (s: FilterState) => s.caseSensitive,
+    onChange: (checked: boolean, setters: FilterSetters) => {
+      if (checked) setters.setUseRegex(false);
+      setters.setCaseSensitive(checked);
+    },
+    labelKey: "caseSensitive" as const
   },
   {
-    key: "regex",
-    getChecked: (state: {
-      caseSensitive: boolean;
-      useRegex: boolean;
-      exactMatch: boolean;
-    }) => state.useRegex,
-    onChange: (
-      checked: boolean,
-      setters: {
-        setCaseSensitive: (value: boolean) => void;
-        setUseRegex: (value: boolean) => void;
-        setExactMatch: (value: boolean) => void;
-      }
-    ) => setters.setUseRegex(checked),
-    labelKey: "regex"
-  },
-  {
-    key: "exactMatch",
-    getChecked: (state: {
-      caseSensitive: boolean;
-      useRegex: boolean;
-      exactMatch: boolean;
-    }) => state.exactMatch,
-    onChange: (
-      checked: boolean,
-      setters: {
-        setCaseSensitive: (value: boolean) => void;
-        setUseRegex: (value: boolean) => void;
-        setExactMatch: (value: boolean) => void;
-      }
-    ) => setters.setExactMatch(checked),
-    labelKey: "exactMatch"
+    key: "exactMatch" as const,
+    getChecked: (s: FilterState) => s.exactMatch,
+    onChange: (checked: boolean, setters: FilterSetters) => {
+      if (checked) setters.setUseRegex(false);
+      setters.setExactMatch(checked);
+    },
+    labelKey: "exactMatch" as const
   }
 ] as const;
+
+// Gruppo B: regex (esclude i modificatori testo)
+const TEXT_REGEX_FILTER = {
+  key: "regex" as const,
+  getChecked: (s: FilterState) => s.useRegex,
+  onChange: (checked: boolean, setters: FilterSetters) => {
+    if (checked) {
+      setters.setCaseSensitive(false);
+      setters.setExactMatch(false);
+    }
+    setters.setUseRegex(checked);
+  },
+  labelKey: "regex" as const
+};
 
 const OBJECT_OPERATORS = [
   { value: "contains", labelKey: "objectOperatorContains" },
@@ -102,6 +95,9 @@ interface ObjectFilterRow {
   path: string;
   operator: ObjectSearchFilter["operator"];
   value: string;
+  regexCaseInsensitive: boolean;
+  regexMultiline: boolean;
+  regexDotAll: boolean;
 }
 
 interface PersistedSearchFilters {
@@ -125,7 +121,10 @@ function buildObjectFilterRow(id: number): ObjectFilterRow {
     enabled: true,
     path: "",
     operator: "contains",
-    value: ""
+    value: "",
+    regexCaseInsensitive: false,
+    regexMultiline: false,
+    regexDotAll: false
   };
 }
 
@@ -134,20 +133,24 @@ function getObjectFilterFingerprint(row: ObjectFilterRow): string {
     enabled: row.enabled,
     path: row.path.trim(),
     operator: row.operator,
-    value: row.value.trim()
+    value: row.value.trim(),
+    regexCaseInsensitive: row.regexCaseInsensitive,
+    regexMultiline: row.regexMultiline,
+    regexDotAll: row.regexDotAll
   });
 }
 
-function toObjectSearchFilter(
-  row: ObjectFilterRow
-): ObjectSearchFilter | null {
+function toObjectSearchFilter(row: ObjectFilterRow): ObjectSearchFilter | null {
   const path = row.path.trim();
   if (!path) return null;
   if (row.operator !== "exists" && !row.value.trim()) return null;
   return {
     path,
     operator: row.operator,
-    value: row.operator === "exists" ? undefined : row.value.trim()
+    value: row.operator === "exists" ? undefined : row.value.trim(),
+    regexCaseInsensitive: row.regexCaseInsensitive,
+    regexMultiline: row.regexMultiline,
+    regexDotAll: row.regexDotAll
   };
 }
 
@@ -201,7 +204,19 @@ function sanitizePersistedRows(rows: unknown): ObjectFilterRow[] {
           typeof candidate.enabled === "boolean" ? candidate.enabled : true,
         path: typeof candidate.path === "string" ? candidate.path : "",
         operator,
-        value: typeof candidate.value === "string" ? candidate.value : ""
+        value: typeof candidate.value === "string" ? candidate.value : "",
+        regexCaseInsensitive:
+          typeof candidate.regexCaseInsensitive === "boolean"
+            ? candidate.regexCaseInsensitive
+            : false,
+        regexMultiline:
+          typeof candidate.regexMultiline === "boolean"
+            ? candidate.regexMultiline
+            : false,
+        regexDotAll:
+          typeof candidate.regexDotAll === "boolean"
+            ? candidate.regexDotAll
+            : false
       }
     ];
   });
@@ -216,10 +231,8 @@ function loadPersistedSearchFilters(
     const raw = localStorage.getItem(getSearchFiltersStorageKey(filePath));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<PersistedSearchFilters>;
-    const searchMode =
-      parsed.searchMode === "object" ? "object" : "text";
-    const searchSort =
-      parsed.searchSort === "file" ? "file" : "relevance";
+    const searchMode = parsed.searchMode === "object" ? "object" : "text";
+    const searchSort = parsed.searchSort === "file" ? "file" : "relevance";
     return {
       version: 1,
       searchMode,
@@ -235,7 +248,9 @@ function loadPersistedSearchFilters(
       useRegex: Boolean(parsed.useRegex),
       exactMatch: Boolean(parsed.exactMatch),
       searchScopePath:
-        typeof parsed.searchScopePath === "string" ? parsed.searchScopePath : "",
+        typeof parsed.searchScopePath === "string"
+          ? parsed.searchScopePath
+          : "",
       searchSort,
       objectKeyCaseSensitive: Boolean(parsed.objectKeyCaseSensitive),
       objectValueCaseSensitive: Boolean(parsed.objectValueCaseSensitive),
@@ -268,6 +283,11 @@ export const SearchBar: FC = () => {
   const [searchTarget, setSearchTarget] = useState("both");
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [useRegex, setUseRegex] = useState(false);
+  const [regexFlags, setRegexFlags] = useState<RegexFlags>({
+    caseInsensitive: false,
+    multiline: false,
+    dotAll: false
+  });
   const [exactMatch, setExactMatch] = useState(false);
   const [objectKeyCaseSensitive, setObjectKeyCaseSensitive] = useState(false);
   const [objectValueCaseSensitive, setObjectValueCaseSensitive] =
@@ -278,15 +298,14 @@ export const SearchBar: FC = () => {
   const [appliedFingerprints, setAppliedFingerprints] = useState<
     Map<number, string>
   >(new Map());
-  const [appliedObjectKeyCaseSensitive, setAppliedObjectKeyCaseSensitive] = useState<
-    boolean | null
-  >(null);
+  const [appliedObjectKeyCaseSensitive, setAppliedObjectKeyCaseSensitive] =
+    useState<boolean | null>(null);
   const [appliedObjectValueCaseSensitive, setAppliedObjectValueCaseSensitive] =
-    useState<
-    boolean | null
-  >(null);
+    useState<boolean | null>(null);
   const [appliedScopePath, setAppliedScopePath] = useState<string>("");
-  const [autocompleteRowId, setAutocompleteRowId] = useState<number | null>(null);
+  const [autocompleteRowId, setAutocompleteRowId] = useState<number | null>(
+    null
+  );
   const [autocompleteSuggestions, setAutocompleteSuggestions] = useState<
     string[]
   >([]);
@@ -305,12 +324,15 @@ export const SearchBar: FC = () => {
   const suggestionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined
   );
-  const blurTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const blurTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined
+  );
   const suggestionCache = useRef(new Map<string, string[]>());
   const pathInputRefs = useRef(new Map<number, HTMLInputElement>());
-  const latestAutocompleteRequest = useRef<{ rowId: number; prefix: string } | null>(
-    null
-  );
+  const latestAutocompleteRequest = useRef<{
+    rowId: number;
+    prefix: string;
+  } | null>(null);
   const restoredFilePath = useRef<string | null>(null);
   const nextRowId = useRef(2);
 
@@ -325,63 +347,73 @@ export const SearchBar: FC = () => {
         clearSearch();
         return;
       }
+      const effectiveCaseSensitive = useRegex
+        ? !regexFlags.caseInsensitive
+        : caseSensitive;
       searchTimer.current = setTimeout(() => {
-        search(query, searchTarget, caseSensitive, useRegex, exactMatch, path);
+        search(
+          query,
+          searchTarget,
+          effectiveCaseSensitive,
+          useRegex,
+          exactMatch,
+          path,
+          regexFlags.multiline,
+          regexFlags.dotAll
+        );
       }, 150);
     },
     [
       caseSensitive,
       clearSearch,
       exactMatch,
+      regexFlags,
       search,
       searchTarget,
       useRegex
     ]
   );
 
-  const requestAutocomplete = useCallback(
-    (rowId: number, value: string) => {
-      clearTimeout(suggestionTimer.current);
-      const trimmed = value.trim();
-      latestAutocompleteRequest.current = { rowId, prefix: trimmed };
+  const requestAutocomplete = useCallback((rowId: number, value: string) => {
+    clearTimeout(suggestionTimer.current);
+    const trimmed = value.trim();
+    latestAutocompleteRequest.current = { rowId, prefix: trimmed };
 
-      const cached = suggestionCache.current.get(trimmed);
-      if (cached) {
-        setAutocompleteRowId(rowId);
-        setAutocompleteSuggestions(cached);
-        setAutocompleteIndex(0);
-        return;
-      }
+    const cached = suggestionCache.current.get(trimmed);
+    if (cached) {
+      setAutocompleteRowId(rowId);
+      setAutocompleteSuggestions(cached);
+      setAutocompleteIndex(0);
+      return;
+    }
 
-      suggestionTimer.current = setTimeout(async () => {
-        try {
-          const suggestions = await invoke<string[]>("suggest_property_paths", {
-            prefix: trimmed,
-            limit: PATH_SUGGESTION_LIMIT
-          });
-          const latest = latestAutocompleteRequest.current;
-          if (!latest || latest.rowId !== rowId || latest.prefix !== trimmed) {
-            return;
-          }
-          // LRU semplice: rimuove la entry più vecchia se si supera il limite
-          if (suggestionCache.current.size >= MAX_SUGGESTION_CACHE) {
-            const firstKey = suggestionCache.current.keys().next().value;
-            if (firstKey !== undefined) suggestionCache.current.delete(firstKey);
-          }
-          suggestionCache.current.set(trimmed, suggestions);
-          setAutocompleteRowId(rowId);
-          setAutocompleteSuggestions(suggestions);
-          setAutocompleteIndex(0);
-        } catch (err) {
-          console.error("suggest_property_paths error:", err);
-          setAutocompleteRowId(null);
-          setAutocompleteSuggestions([]);
-          setAutocompleteIndex(0);
+    suggestionTimer.current = setTimeout(async () => {
+      try {
+        const suggestions = await invoke<string[]>("suggest_property_paths", {
+          prefix: trimmed,
+          limit: PATH_SUGGESTION_LIMIT
+        });
+        const latest = latestAutocompleteRequest.current;
+        if (!latest || latest.rowId !== rowId || latest.prefix !== trimmed) {
+          return;
         }
-      }, 80);
-    },
-    []
-  );
+        // LRU semplice: rimuove la entry più vecchia se si supera il limite
+        if (suggestionCache.current.size >= MAX_SUGGESTION_CACHE) {
+          const firstKey = suggestionCache.current.keys().next().value;
+          if (firstKey !== undefined) suggestionCache.current.delete(firstKey);
+        }
+        suggestionCache.current.set(trimmed, suggestions);
+        setAutocompleteRowId(rowId);
+        setAutocompleteSuggestions(suggestions);
+        setAutocompleteIndex(0);
+      } catch (err) {
+        console.error("suggest_property_paths error:", err);
+        setAutocompleteRowId(null);
+        setAutocompleteSuggestions([]);
+        setAutocompleteIndex(0);
+      }
+    }, 80);
+  }, []);
 
   const updateAutocompleteDropdownPosition = useCallback((rowId: number) => {
     const input = pathInputRefs.current.get(rowId);
@@ -431,13 +463,18 @@ export const SearchBar: FC = () => {
       return;
     }
     clearTimeout(searchTimer.current);
+    const effectiveCaseSensitive = useRegex
+      ? !regexFlags.caseInsensitive
+      : caseSensitive;
     void search(
       query,
       searchTarget,
-      caseSensitive,
+      effectiveCaseSensitive,
       useRegex,
       exactMatch,
-      searchScopePath
+      searchScopePath,
+      regexFlags.multiline,
+      regexFlags.dotAll
     );
   };
 
@@ -488,8 +525,7 @@ export const SearchBar: FC = () => {
 
   const getActiveSuggestionForRow = useCallback(
     (rowId: number, inputValue: string) =>
-      autocompleteRowId === rowId &&
-      suppressInlineAutocompleteRowId !== rowId
+      autocompleteRowId === rowId && suppressInlineAutocompleteRowId !== rowId
         ? getInlineAutocompleteSuggestion(
             inputValue,
             autocompleteSuggestions,
@@ -529,7 +565,12 @@ export const SearchBar: FC = () => {
       }
       return true;
     },
-    [autocompleteIndex, autocompleteRowId, autocompleteSuggestions, updateObjectRow]
+    [
+      autocompleteIndex,
+      autocompleteRowId,
+      autocompleteSuggestions,
+      updateObjectRow
+    ]
   );
 
   const handleObjectRowEnter = (rowId: number, rowCanApply: boolean) => {
@@ -612,10 +653,12 @@ export const SearchBar: FC = () => {
 
   const executableRows = useMemo(
     () =>
-      objectRows.filter((row) => row.enabled).flatMap((row) => {
-        const filter = toObjectSearchFilter(row);
-        return filter ? [{ row, filter }] : [];
-      }),
+      objectRows
+        .filter((row) => row.enabled)
+        .flatMap((row) => {
+          const filter = toObjectSearchFilter(row);
+          return filter ? [{ row, filter }] : [];
+        }),
     [objectRows]
   );
 
@@ -629,7 +672,10 @@ export const SearchBar: FC = () => {
     const filter = toObjectSearchFilter(effectiveRow);
     if (!filter) return;
     if (effectiveRow !== row) {
-      updateObjectRow(rowId, (current) => ({ ...current, path: effectiveRow.path }));
+      updateObjectRow(rowId, (current) => ({
+        ...current,
+        path: effectiveRow.path
+      }));
     }
     setAutocompleteRowId(null);
     setAutocompleteSuggestions([]);
@@ -669,7 +715,10 @@ export const SearchBar: FC = () => {
     );
     setAppliedFingerprints(
       new Map(
-        executableRows.map(({ row }) => [row.id, getObjectFilterFingerprint(row)])
+        executableRows.map(({ row }) => [
+          row.id,
+          getObjectFilterFingerprint(row)
+        ])
       )
     );
     setAppliedObjectKeyCaseSensitive(objectKeyCaseSensitive);
@@ -704,16 +753,21 @@ export const SearchBar: FC = () => {
 
   useEffect(() => {
     if (searchMode !== "text" || !searchQuery) return;
+    const effectiveCaseSensitive = useRegex
+      ? !regexFlags.caseInsensitive
+      : caseSensitive;
     search(
       searchQuery,
       searchTarget,
-      caseSensitive,
+      effectiveCaseSensitive,
       useRegex,
       exactMatch,
-      searchScopePath
+      searchScopePath,
+      regexFlags.multiline,
+      regexFlags.dotAll
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchTarget, caseSensitive, useRegex, exactMatch]);
+  }, [searchTarget, caseSensitive, useRegex, exactMatch, regexFlags]);
 
   useEffect(() => {
     if (searchMode === "text" && searchQuery) {
@@ -828,7 +882,9 @@ export const SearchBar: FC = () => {
 
   useEffect(() => {
     if (autocompleteRowId === null) return;
-    const row = objectRows.find((candidate) => candidate.id === autocompleteRowId);
+    const row = objectRows.find(
+      (candidate) => candidate.id === autocompleteRowId
+    );
     if (!row) return;
     const inlineSuggestion = getInlineAutocompleteSuggestion(
       row.path,
@@ -842,7 +898,12 @@ export const SearchBar: FC = () => {
       if (document.activeElement !== input) return;
       input.setSelectionRange(row.path.length, inlineSuggestion.length);
     });
-  }, [autocompleteIndex, autocompleteRowId, autocompleteSuggestions, objectRows]);
+  }, [
+    autocompleteIndex,
+    autocompleteRowId,
+    autocompleteSuggestions,
+    objectRows
+  ]);
 
   useEffect(() => {
     if (autocompleteRowId === null || autocompleteSuggestions.length === 0) {
@@ -940,36 +1001,53 @@ export const SearchBar: FC = () => {
 
         {searchMode === "text" ? (
           <div className="flex flex-col gap-3">
-            <div className="relative">
-              <Search
-                size={14}
-                className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-500"
-              />
-              <input
+            {useRegex ? (
+              <RegexInput
                 id="primary-search-input"
-                type="text"
-                placeholder={t.searchPlaceholder}
                 value={searchQuery}
-                onChange={(event) => handleSearchQueryChange(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    submitTextSearch();
-                  }
-                }}
+                flags={regexFlags}
+                placeholder={t.searchPlaceholder}
                 disabled={nodeCount === 0}
-                className="w-full pl-8 pr-8 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded text-sm placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-gray-900 dark:text-gray-100"
+                onChange={handleSearchQueryChange}
+                onFlagsChange={setRegexFlags}
+                onClear={handleClearTextSearch}
+                onEnter={submitTextSearch}
               />
-              {searchQuery && (
-                <button
-                  type="button"
-                  onClick={handleClearTextSearch}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
-                >
-                  <X size={12} />
-                </button>
-              )}
-            </div>
+            ) : (
+              // ── Normal text mode ──────────────────────────────────────────
+              <div className="relative">
+                <Search
+                  size={14}
+                  className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-500"
+                />
+                <input
+                  id="primary-search-input"
+                  type="text"
+                  placeholder={t.searchPlaceholder}
+                  value={searchQuery}
+                  onChange={(event) =>
+                    handleSearchQueryChange(event.target.value)
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      submitTextSearch();
+                    }
+                  }}
+                  disabled={nodeCount === 0}
+                  className="w-full pl-8 pr-8 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded text-sm placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-gray-900 dark:text-gray-100"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={handleClearTextSearch}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                  >
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
+            )}
 
             <div className="flex flex-wrap items-start gap-3">
               <div className="flex flex-col gap-1.5">
@@ -988,12 +1066,17 @@ export const SearchBar: FC = () => {
                 <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-400 dark:text-gray-500">
                   {t.searchFilters}
                 </div>
-                <div className="flex gap-2 flex-wrap">
-                  {TEXT_FILTERS.map((filter) => {
+                <div className="flex items-center gap-2 flex-wrap">
+                  {/* Gruppo A: modificatori testo — spenti quando regex è attivo */}
+                  {TEXT_MODIFIERS.map((filter) => {
                     const checked = filter.getChecked(filterState);
+                    const dimmed = useRegex && !checked;
                     const label = t[filter.labelKey];
                     return (
-                      <label key={filter.key} className="cursor-pointer">
+                      <label
+                        key={filter.key}
+                        className={`cursor-pointer transition-opacity ${dimmed ? "opacity-35" : ""}`}
+                      >
                         <input
                           type="checkbox"
                           checked={checked}
@@ -1023,9 +1106,52 @@ export const SearchBar: FC = () => {
                       </label>
                     );
                   })}
+
+                  {/* Separatore */}
+                  <div className="h-5 w-px bg-gray-200 dark:bg-gray-700" />
+
+                  {/* Gruppo B: regex — spento quando uno dei modificatori testo è attivo */}
+                  {(() => {
+                    const filter = TEXT_REGEX_FILTER;
+                    const checked = filter.getChecked(filterState);
+                    const dimmed = (caseSensitive || exactMatch) && !checked;
+                    const label = t[filter.labelKey];
+                    return (
+                      <label
+                        key={filter.key}
+                        className={`cursor-pointer transition-opacity ${dimmed ? "opacity-35" : ""}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(event) =>
+                            filter.onChange(event.target.checked, filterSetters)
+                          }
+                          className="peer sr-only"
+                        />
+                        <span
+                          className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium shadow-sm transition-all peer-focus-visible:ring-2 peer-focus-visible:ring-blue-500/50 ${
+                            checked
+                              ? "border-blue-500 bg-blue-50 text-blue-700 dark:border-blue-400/80 dark:bg-blue-500/15 dark:text-blue-200"
+                              : "border-gray-200 bg-white text-gray-600 hover:border-gray-300 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300 dark:hover:border-gray-600 dark:hover:bg-gray-700/80"
+                          }`}
+                        >
+                          <span
+                            className={`flex h-4 w-4 flex-shrink-0 items-center justify-center rounded border ${
+                              checked
+                                ? "border-blue-600 bg-blue-600 text-white dark:border-blue-300 dark:bg-blue-400 dark:text-gray-950"
+                                : "border-gray-300 bg-white text-transparent dark:border-gray-600 dark:bg-gray-800"
+                            }`}
+                          >
+                            <Check size={11} strokeWidth={3} />
+                          </span>
+                          {label}
+                        </span>
+                      </label>
+                    );
+                  })()}
                 </div>
               </div>
-
             </div>
           </div>
         ) : (
@@ -1102,7 +1228,9 @@ export const SearchBar: FC = () => {
                 <button
                   type="button"
                   onClick={handleApplyAll}
-                  disabled={nodeCount === 0 || searching || executableRows.length === 0}
+                  disabled={
+                    nodeCount === 0 || searching || executableRows.length === 0
+                  }
                   className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   {t.applyAll}
@@ -1119,14 +1247,21 @@ export const SearchBar: FC = () => {
                   {objectRows.map((row) => {
                     const isApplied =
                       activeSearchMode === "object" &&
-                      appliedObjectKeyCaseSensitive === objectKeyCaseSensitive &&
-                      appliedObjectValueCaseSensitive === objectValueCaseSensitive &&
+                      appliedObjectKeyCaseSensitive ===
+                        objectKeyCaseSensitive &&
+                      appliedObjectValueCaseSensitive ===
+                        objectValueCaseSensitive &&
                       appliedScopePath === searchScopePath.trim() &&
                       appliedFingerprints.get(row.id) ===
                         getObjectFilterFingerprint(row);
                     const activeSuggestions =
-                      autocompleteRowId === row.id ? autocompleteSuggestions : [];
-                    const inlineSuggestion = getActiveSuggestionForRow(row.id, row.path);
+                      autocompleteRowId === row.id
+                        ? autocompleteSuggestions
+                        : [];
+                    const inlineSuggestion = getActiveSuggestionForRow(
+                      row.id,
+                      row.path
+                    );
                     const rowCanApply = toObjectSearchFilter(row) !== null;
                     return (
                       <div
@@ -1182,7 +1317,9 @@ export const SearchBar: FC = () => {
                             }
                             autoComplete="off"
                             value={inlineSuggestion ?? row.path}
-                            onFocus={() => requestAutocomplete(row.id, row.path)}
+                            onFocus={() =>
+                              requestAutocomplete(row.id, row.path)
+                            }
                             onBlur={() => {
                               clearTimeout(blurTimer.current);
                               blurTimer.current = setTimeout(() => {
@@ -1194,9 +1331,15 @@ export const SearchBar: FC = () => {
                               }, 120);
                             }}
                             onKeyDown={(event) =>
-                              handleObjectPathKeyDown(event, row.id, rowCanApply)
+                              handleObjectPathKeyDown(
+                                event,
+                                row.id,
+                                rowCanApply
+                              )
                             }
-                            onChange={(event) => handleObjectPathChange(row.id, event)}
+                            onChange={(event) =>
+                              handleObjectPathChange(row.id, event)
+                            }
                             placeholder={t.objectPathPlaceholder}
                             className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs font-mono text-gray-700 shadow-sm outline-none transition-colors placeholder:text-gray-400 focus:border-blue-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:placeholder:text-gray-500"
                           />
@@ -1215,7 +1358,10 @@ export const SearchBar: FC = () => {
                             className="w-full appearance-none rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 pr-8 text-xs font-medium text-gray-700 shadow-sm outline-none transition-colors focus:border-blue-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200"
                           >
                             {OBJECT_OPERATORS.map((operator) => (
-                              <option key={operator.value} value={operator.value}>
+                              <option
+                                key={operator.value}
+                                value={operator.value}
+                              >
                                 {t[operator.labelKey]}
                               </option>
                             ))}
@@ -1227,7 +1373,44 @@ export const SearchBar: FC = () => {
                         </div>
 
                         <div className="flex items-center gap-2">
-                          {row.operator !== "exists" && (
+                          {row.operator === "regex" ? (
+                            <div className="flex-1">
+                              <RegexInput
+                                compact
+                                value={row.value}
+                                flags={{
+                                  caseInsensitive: row.regexCaseInsensitive,
+                                  multiline: row.regexMultiline,
+                                  dotAll: row.regexDotAll
+                                }}
+                                placeholder={t.objectValuePlaceholder}
+                                disabled={nodeCount === 0}
+                                onChange={(val) =>
+                                  updateObjectRow(row.id, (current) => ({
+                                    ...current,
+                                    value: val
+                                  }))
+                                }
+                                onFlagsChange={(f) =>
+                                  updateObjectRow(row.id, (current) => ({
+                                    ...current,
+                                    regexCaseInsensitive: f.caseInsensitive,
+                                    regexMultiline: f.multiline,
+                                    regexDotAll: f.dotAll
+                                  }))
+                                }
+                                onClear={() =>
+                                  updateObjectRow(row.id, (current) => ({
+                                    ...current,
+                                    value: ""
+                                  }))
+                                }
+                                onEnter={() =>
+                                  handleObjectRowEnter(row.id, rowCanApply)
+                                }
+                              />
+                            </div>
+                          ) : row.operator !== "exists" ? (
                             <input
                               type="text"
                               value={row.value}
@@ -1246,7 +1429,7 @@ export const SearchBar: FC = () => {
                               placeholder={t.objectValuePlaceholder}
                               className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700 shadow-sm outline-none transition-colors placeholder:text-gray-400 focus:border-blue-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:placeholder:text-gray-500"
                             />
-                          )}
+                          ) : null}
                           {isApplied && (
                             <span className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-emerald-700 dark:text-emerald-300">
                               {t.applied}
@@ -1257,7 +1440,9 @@ export const SearchBar: FC = () => {
                         <button
                           type="button"
                           onClick={() => handleApplyRow(row.id)}
-                          disabled={nodeCount === 0 || searching || !rowCanApply}
+                          disabled={
+                            nodeCount === 0 || searching || !rowCanApply
+                          }
                           className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {t.apply}

@@ -89,19 +89,23 @@ pub struct VisibleSliceRow {
     pub depth: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ObjectSearchOperator {
+    #[default]
     Contains,
     Equals,
     Regex,
     Exists,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ObjectSearchFilter {
     pub path: String,
     pub operator: ObjectSearchOperator,
     pub value: Option<String>,
+    pub regex_case_insensitive: bool,
+    pub regex_multiline: bool,
+    pub regex_dot_all: bool,
 }
 
 struct CompiledObjectSearchFilter {
@@ -459,6 +463,8 @@ impl JsonIndex {
         exact_match: bool,
         max_results: usize,
         path: Option<&str>,
+        multiline: bool,
+        dot_all: bool,
     ) -> Vec<(u32, String)> {
         let scope_node_id = match path.map(str::trim).filter(|path| !path.is_empty()) {
             Some(path) => match self.resolve_path(path) {
@@ -469,10 +475,14 @@ impl JsonIndex {
         };
 
         let results: Vec<(u32, String)> = if use_regex {
-            let pattern = if case_sensitive {
+            let mut flags = String::new();
+            if !case_sensitive { flags.push('i'); }
+            if multiline { flags.push('m'); }
+            if dot_all { flags.push('s'); }
+            let pattern = if flags.is_empty() {
                 query.to_string()
             } else {
-                format!("(?i){}", query)
+                format!("(?{}){}", flags, query)
             };
             let re = match Regex::new(&pattern) {
                 Ok(r) => r,
@@ -665,10 +675,16 @@ impl JsonIndex {
             let regex = match filter.operator {
                 ObjectSearchOperator::Regex => {
                     let pattern = value.as_ref()?;
-                    let pattern = if value_case_sensitive {
+                    let mut flags = String::new();
+                    if filter.regex_case_insensitive || !value_case_sensitive {
+                        flags.push('i');
+                    }
+                    if filter.regex_multiline { flags.push('m'); }
+                    if filter.regex_dot_all { flags.push('s'); }
+                    let pattern = if flags.is_empty() {
                         pattern.clone()
                     } else {
-                        format!("(?i){pattern}")
+                        format!("(?{flags}){pattern}")
                     };
                     Some(Regex::new(&pattern).ok()?)
                 }
@@ -1137,6 +1153,7 @@ mod tests {
                 path: "marketing_lingua".to_string(),
                 operator: ObjectSearchOperator::Contains,
                 value: Some("Acciaio".to_string()),
+                ..Default::default()
             }],
             false,
             false,
@@ -1158,11 +1175,13 @@ mod tests {
                     path: "marketing_lingua".to_string(),
                     operator: ObjectSearchOperator::Contains,
                     value: Some("Acciaio".to_string()),
+                    ..Default::default()
                 },
                 ObjectSearchFilter {
                     path: "finish".to_string(),
                     operator: ObjectSearchOperator::Equals,
                     value: Some("Lucido".to_string()),
+                    ..Default::default()
                 },
             ],
             false,
@@ -1183,6 +1202,7 @@ mod tests {
                 path: "code".to_string(),
                 operator: ObjectSearchOperator::Equals,
                 value: Some("A1".to_string()),
+                ..Default::default()
             }],
             true,
             true,
@@ -1208,6 +1228,7 @@ mod tests {
                 path: "marketing_lingua".to_string(),
                 operator: ObjectSearchOperator::Equals,
                 value: Some("Acciaio".to_string()),
+                ..Default::default()
             }],
             false,
             true,

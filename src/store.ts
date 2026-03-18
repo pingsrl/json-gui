@@ -31,6 +31,9 @@ export interface ObjectSearchFilter {
   path: string;
   operator: "contains" | "equals" | "regex" | "exists";
   value?: string;
+  regexCaseInsensitive?: boolean;
+  regexMultiline?: boolean;
+  regexDotAll?: boolean;
 }
 
 interface FileInfo {
@@ -54,7 +57,14 @@ interface CompactExpandedSliceResult {
   rows: CompactRow[];
 }
 
-const COMPACT_TYPE_NAMES = ["object", "array", "string", "number", "boolean", "null"] as const;
+const COMPACT_TYPE_NAMES = [
+  "object",
+  "array",
+  "string",
+  "number",
+  "boolean",
+  "null"
+] as const;
 
 function decodeCompactRow(row: CompactRow, keyPool: string[]): VNode {
   const [id, parentId, keyIdx, type, preview, childrenCount, depth] = row;
@@ -65,9 +75,9 @@ function decodeCompactRow(row: CompactRow, keyPool: string[]): VNode {
       key: keyIdx === -1 ? null : (keyPool[keyIdx] ?? null),
       value_type: COMPACT_TYPE_NAMES[type] ?? "null",
       value_preview: preview,
-      children_count: childrenCount,
+      children_count: childrenCount
     },
-    depth,
+    depth
   };
 }
 
@@ -162,7 +172,9 @@ export function insertVisibleChildren(
   const nextVisible = visibleNodes.slice();
   for (const [parentId, children] of expansions) {
     if (children.length === 0) continue;
-    const parentIndex = nextVisible.findIndex(({ node }) => node.id === parentId);
+    const parentIndex = nextVisible.findIndex(
+      ({ node }) => node.id === parentId
+    );
     if (parentIndex < 0) continue;
     const depth = nextVisible[parentIndex].depth + 1;
     nextVisible.splice(
@@ -266,7 +278,9 @@ interface JsonStore {
     caseSensitive: boolean,
     useRegex: boolean,
     exactMatch: boolean,
-    path: string
+    path: string,
+    multiline?: boolean,
+    dotAll?: boolean
   ) => Promise<void>;
   searchObjects: (
     filters: ObjectSearchFilter[],
@@ -403,7 +417,8 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   },
 
   toggleNode: async (nodeId: number) => {
-    const { expandAllActive, expandedNodes, rootChildren, selectedNodeId } = get();
+    const { expandAllActive, expandedNodes, rootChildren, selectedNodeId } =
+      get();
     if (expandAllActive) {
       // Esci da expand-all e mostra il nodo nel suo contesto (collassato).
       // navigateToNode espande solo gli antenati e resetta expandAllActive.
@@ -445,7 +460,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       ? isRootChild
         ? rootChildren
         : parentId !== null
-          ? childrenCache.get(parentId) ?? null
+          ? (childrenCache.get(parentId) ?? null)
           : null
       : findSiblings(node.id, rootChildren, expandedNodes);
     const cachedPath = pathCache.get(node.id) ?? null;
@@ -456,9 +471,16 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       selectedNodeSiblings,
       focusedNodeId: node.id
     });
-    if (expandAllActive && !isRootChild && parentId !== null && !selectedNodeSiblings) {
+    if (
+      expandAllActive &&
+      !isRootChild &&
+      parentId !== null &&
+      !selectedNodeSiblings
+    ) {
       try {
-        const siblings = await invoke<NodeDto[]>("get_children", { nodeId: parentId });
+        const siblings = await invoke<NodeDto[]>("get_children", {
+          nodeId: parentId
+        });
         cacheSet(parentId, siblings);
         registerChildren(parentId, siblings);
         for (const sibling of siblings) {
@@ -493,7 +515,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     caseSensitive: boolean,
     useRegex: boolean,
     exactMatch: boolean,
-    path: string
+    path: string,
+    multiline = false,
+    dotAll = false
   ) => {
     if (!query.trim()) {
       get().clearSearch();
@@ -515,7 +539,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
           regex: useRegex,
           exact_match: exactMatch,
           max_results: 500,
-          path: path.trim() || null
+          path: path.trim() || null,
+          multiline,
+          dot_all: dotAll
         }
       });
       const sortedResults = sortSearchResults(results, query, get().searchSort);
@@ -528,7 +554,11 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       });
     } catch (err) {
       console.error("Search error:", err);
-      set({ searching: false, activeSearchMode: "text", hasActiveSearch: true });
+      set({
+        searching: false,
+        activeSearchMode: "text",
+        hasActiveSearch: true
+      });
     }
   },
 
@@ -586,7 +616,11 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     const { searchResults, lastSearchQuery } = get();
     set({
       searchSort,
-      searchResults: sortSearchResults(searchResults, lastSearchQuery, searchSort)
+      searchResults: sortSearchResults(
+        searchResults,
+        lastSearchQuery,
+        searchSort
+      )
     });
   },
 
@@ -628,11 +662,13 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
 
     const gen = expandGeneration;
     const start =
-      Math.floor(Math.max(0, offset) / EXPAND_ALL_SLICE_SIZE) * EXPAND_ALL_SLICE_SIZE;
+      Math.floor(Math.max(0, offset) / EXPAND_ALL_SLICE_SIZE) *
+      EXPAND_ALL_SLICE_SIZE;
     const end = Math.max(
       start + EXPAND_ALL_SLICE_SIZE,
-      Math.ceil((Math.max(0, offset) + Math.max(1, limit)) / EXPAND_ALL_SLICE_SIZE) *
-        EXPAND_ALL_SLICE_SIZE
+      Math.ceil(
+        (Math.max(0, offset) + Math.max(1, limit)) / EXPAND_ALL_SLICE_SIZE
+      ) * EXPAND_ALL_SLICE_SIZE
     );
 
     const tasks: Promise<void>[] = [];
@@ -648,7 +684,10 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
             if (expandGeneration !== gen || !get().expandAllActive) return;
             const nextRows = new Map(get().expandAllRows);
             result.rows.forEach((row, idx) => {
-              nextRows.set(result.offset + idx, decodeCompactRow(row, result.key_pool));
+              nextRows.set(
+                result.offset + idx,
+                decodeCompactRow(row, result.key_pool)
+              );
             });
             set({
               expandAllRows: nextRows,
@@ -693,7 +732,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
 
   expandSubtree: async (nodeId: number) => {
     const { expandedNodes, rootChildren } = get();
-    const expansions = await invoke<[number, NodeDto[]][]>("expand_subtree", { nodeId });
+    const expansions = await invoke<[number, NodeDto[]][]>("expand_subtree", {
+      nodeId
+    });
     const next = new Map(expandedNodes);
     for (const [parentId, children] of expansions) {
       next.set(parentId, children);

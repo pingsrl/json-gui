@@ -21,6 +21,7 @@ export interface Translations {
   searchPathPlaceholder: string;
   clearSearchScope: string;
   searchSort: string;
+  searchSortLabel: string;
   searchSortRelevance: string;
   searchSortFileOrder: string;
   searchBoth: string;
@@ -80,6 +81,7 @@ export interface Translations {
   exportSubtitle: string;
   exportNoFile: string;
   exportSaveError: string;
+  regexError: (msg: string) => string;
 }
 
 const translations: Record<Lang, Translations> = {
@@ -102,8 +104,9 @@ const translations: Record<Lang, Translations> = {
     searchPathPlaceholder: "$.users.0",
     clearSearchScope: "Clear path filter",
     searchSort: "Sort",
+    searchSortLabel: "sort by",
     searchSortRelevance: "relevance",
-    searchSortFileOrder: "file order",
+    searchSortFileOrder: "position",
     searchBoth: "both",
     searchKeys: "keys",
     searchValues: "values",
@@ -160,7 +163,22 @@ const translations: Record<Lang, Translations> = {
     exportTitle: "Export type definition",
     exportSubtitle: "Select target language",
     exportNoFile: "No file is open",
-    exportSaveError: "Could not save file"
+    exportSaveError: "Could not save file",
+    regexError: (msg: string) => {
+      const m = msg.toLowerCase();
+      if (m.includes("nothing to repeat")) return "Nothing to repeat";
+      if (m.includes("unterminated group") || m.includes("missing )"))
+        return "Unterminated group";
+      if (m.includes("unmatched )") || m.includes("unmatched ')'"))
+        return "Unmatched ')'";
+      if (m.includes("invalid group")) return "Invalid group";
+      if (m.includes("range out of order"))
+        return "Range out of order in character class";
+      if (m.includes("invalid escape")) return "Invalid escape sequence";
+      if (m.includes("too many") || m.includes("too large"))
+        return "Quantifier too large";
+      return "Invalid regex";
+    }
   },
   it: {
     openFile: "Apri file",
@@ -181,8 +199,9 @@ const translations: Record<Lang, Translations> = {
     searchPathPlaceholder: "$.users.0",
     clearSearchScope: "Rimuovi filtro path",
     searchSort: "Ordina",
+    searchSortLabel: "ordina per",
     searchSortRelevance: "pertinenza",
-    searchSortFileOrder: "ordine file",
+    searchSortFileOrder: "posizione",
     searchBoth: "entrambi",
     searchKeys: "chiavi",
     searchValues: "valori",
@@ -240,7 +259,22 @@ const translations: Record<Lang, Translations> = {
     exportTitle: "Esporta definizione tipo",
     exportSubtitle: "Seleziona il linguaggio",
     exportNoFile: "Nessun file aperto",
-    exportSaveError: "Impossibile salvare il file"
+    exportSaveError: "Impossibile salvare il file",
+    regexError: (msg: string) => {
+      const m = msg.toLowerCase();
+      if (m.includes("nothing to repeat")) return "Niente da ripetere";
+      if (m.includes("unterminated group") || m.includes("missing )"))
+        return "Gruppo non chiuso";
+      if (m.includes("unmatched )") || m.includes("unmatched ')'"))
+        return "')' senza corrispondenza";
+      if (m.includes("invalid group")) return "Gruppo non valido";
+      if (m.includes("range out of order"))
+        return "Intervallo non valido nella classe di caratteri";
+      if (m.includes("invalid escape")) return "Sequenza di escape non valida";
+      if (m.includes("too many") || m.includes("too large"))
+        return "Quantificatore troppo grande";
+      return "Espressione regolare non valida";
+    }
   },
   zh: {
     openFile: "打开文件",
@@ -261,8 +295,9 @@ const translations: Record<Lang, Translations> = {
     searchPathPlaceholder: "$.users.0",
     clearSearchScope: "清除路径过滤",
     searchSort: "排序",
+    searchSortLabel: "排序方式",
     searchSortRelevance: "相关性",
-    searchSortFileOrder: "文件顺序",
+    searchSortFileOrder: "位置",
     searchBoth: "全部",
     searchKeys: "键",
     searchValues: "值",
@@ -319,7 +354,20 @@ const translations: Record<Lang, Translations> = {
     exportTitle: "导出类型定义",
     exportSubtitle: "选择目标语言",
     exportNoFile: "未打开文件",
-    exportSaveError: "无法保存文件"
+    exportSaveError: "无法保存文件",
+    regexError: (msg: string) => {
+      const m = msg.toLowerCase();
+      if (m.includes("nothing to repeat")) return "没有可重复的内容";
+      if (m.includes("unterminated group") || m.includes("missing )"))
+        return "未闭合的分组";
+      if (m.includes("unmatched )") || m.includes("unmatched ')'"))
+        return "多余的 ')'";
+      if (m.includes("invalid group")) return "无效的分组";
+      if (m.includes("range out of order")) return "字符类中范围顺序错误";
+      if (m.includes("invalid escape")) return "无效的转义序列";
+      if (m.includes("too many") || m.includes("too large")) return "量词过大";
+      return "无效的正则表达式";
+    }
   }
 };
 
