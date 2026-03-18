@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 
 export interface NodeDto {
   id: number;
-  parent_id?: number | null;
   key: string | null;
   value_type: string;
   value_preview: string;
@@ -45,10 +44,31 @@ interface ExpandToResult {
   path: string;
 }
 
-interface ExpandedSliceResult {
+// Formato compatto restituito da get_expanded_slice.
+// Ogni row: [id, parent_id (-1=root), key_idx (-1=none), type_byte, preview, children_count, depth]
+type CompactRow = [number, number, number, number, string, number, number];
+interface CompactExpandedSliceResult {
   offset: number;
   total_count: number;
-  rows: VNode[];
+  key_pool: string[];
+  rows: CompactRow[];
+}
+
+const COMPACT_TYPE_NAMES = ["object", "array", "string", "number", "boolean", "null"] as const;
+
+function decodeCompactRow(row: CompactRow, keyPool: string[]): VNode {
+  const [id, parentId, keyIdx, type, preview, childrenCount, depth] = row;
+  if (parentId !== -1) parentMap.set(id, parentId);
+  return {
+    node: {
+      id,
+      key: keyIdx === -1 ? null : (keyPool[keyIdx] ?? null),
+      value_type: COMPACT_TYPE_NAMES[type] ?? "null",
+      value_preview: preview,
+      children_count: childrenCount,
+    },
+    depth,
+  };
 }
 
 const MAX_RECENT = 5;
@@ -412,7 +432,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   selectNode: async (node: NodeDto) => {
     const { expandAllActive, rootChildren, expandedNodes } = get();
     const isRootChild = rootChildren.some((child) => child.id === node.id);
-    const parentId = node.parent_id ?? null;
+    // parent_id è stato rimosso da NodeDto; usiamo parentMap (popolata da
+    // registerChildren in modalità tree e da decodeCompactRow in expand_all).
+    const parentId = parentMap.get(node.id) ?? null;
     const selectedNodeSiblings = expandAllActive
       ? isRootChild
         ? rootChildren
@@ -612,7 +634,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       if (expandAllRequestedPages.has(page)) continue;
       expandAllRequestedPages.add(page);
       tasks.push(
-        invoke<ExpandedSliceResult>("get_expanded_slice", {
+        invoke<CompactExpandedSliceResult>("get_expanded_slice", {
           offset: page,
           limit: EXPAND_ALL_SLICE_SIZE
         })
@@ -620,7 +642,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
             if (expandGeneration !== gen || !get().expandAllActive) return;
             const nextRows = new Map(get().expandAllRows);
             result.rows.forEach((row, idx) => {
-              nextRows.set(result.offset + idx, row);
+              nextRows.set(result.offset + idx, decodeCompactRow(row, result.key_pool));
             });
             set({
               expandAllRows: nextRows,

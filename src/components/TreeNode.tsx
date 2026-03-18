@@ -1,5 +1,5 @@
 import { type FC } from "react";
-import { NodeDto, useJsonStore } from "../store";
+import { NodeDto, useJsonStore, getParentId } from "../store";
 import { ChevronRight, ChevronDown } from "lucide-react";
 
 const TYPE_COLORS: Record<string, string> = {
@@ -46,7 +46,7 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
       x: e.clientX,
       y: e.clientY,
       nodeId: node.id,
-      parentId: node.parent_id ?? null,
+      parentId: getParentId(node.id) ?? null,
       nodeKey: node.key,
       valueType: node.value_type
     });

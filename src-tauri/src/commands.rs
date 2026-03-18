@@ -122,18 +122,6 @@ pub struct ExpandToResult {
     pub path: String,
 }
 
-#[derive(Serialize)]
-pub struct VisibleNode {
-    pub node: NodeDto,
-    pub depth: usize,
-}
-
-#[derive(Serialize)]
-pub struct ExpandedSliceResult {
-    pub offset: usize,
-    pub total_count: usize,
-    pub rows: Vec<VisibleNode>,
-}
 
 /// Tronca una stringa UTF-8 in modo sicuro al massimo `max_chars` caratteri.
 fn truncate_str(s: &str, max_chars: usize) -> &str {
@@ -143,46 +131,68 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
     }
 }
 
-fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
-    let node = &index.nodes[id as usize];
-    let children_len = node.children_len as usize;
-    let has_children = children_len > 0;
-    let (value_type, value_preview): (&'static str, Cow<'static, str>) = match &node.value {
-        NodeValue::Object => (
-            "object",
-            if !has_children {
+/// Tipo del nodo come byte per il formato compatto IPC (get_expanded_slice).
+/// 0=object, 1=array, 2=string, 3=number, 4=boolean, 5=null
+fn node_type_byte(value: &NodeValue) -> u8 {
+    match value {
+        NodeValue::Object => 0,
+        NodeValue::Array => 1,
+        NodeValue::Str(_) => 2,
+        NodeValue::Num(_) => 3,
+        NodeValue::Bool(_) => 4,
+        NodeValue::Null => 5,
+    }
+}
+
+/// Preview testuale del valore di un nodo, riutilizzata da node_to_dto e dal
+/// formato compatto di get_expanded_slice.
+fn node_value_preview(value: &NodeValue, children_len: usize) -> Cow<'static, str> {
+    match value {
+        NodeValue::Object => {
+            if children_len == 0 {
                 Cow::Borrowed("{}")
             } else {
                 Cow::Owned(format!("{{{} keys}}", children_len))
-            },
-        ),
-        NodeValue::Array => (
-            "array",
-            if !has_children {
+            }
+        }
+        NodeValue::Array => {
+            if children_len == 0 {
                 Cow::Borrowed("[]")
             } else {
                 Cow::Owned(format!("[{} items]", children_len))
-            },
-        ),
-        NodeValue::Str(s) => (
-            "string",
+            }
+        }
+        NodeValue::Str(s) => {
             if s.chars().count() > 80 {
                 Cow::Owned(format!("\"{}…\"", truncate_str(s, 80)))
             } else {
                 Cow::Owned(format!("\"{}\"", s))
-            },
-        ),
-        NodeValue::Num(n) => ("number", Cow::Owned(n.to_string())),
-        NodeValue::Bool(true) => ("boolean", Cow::Borrowed("true")),
-        NodeValue::Bool(false) => ("boolean", Cow::Borrowed("false")),
-        NodeValue::Null => ("null", Cow::Borrowed("null")),
+            }
+        }
+        NodeValue::Num(n) => Cow::Owned(n.to_string()),
+        NodeValue::Bool(true) => Cow::Borrowed("true"),
+        NodeValue::Bool(false) => Cow::Borrowed("false"),
+        NodeValue::Null => Cow::Borrowed("null"),
+    }
+}
+
+fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
+    let node = &index.nodes[id as usize];
+    let children_len = node.children_len as usize;
+    let value_type: &'static str = match &node.value {
+        NodeValue::Object => "object",
+        NodeValue::Array => "array",
+        NodeValue::Str(_) => "string",
+        NodeValue::Num(_) => "number",
+        NodeValue::Bool(_) => "boolean",
+        NodeValue::Null => "null",
     };
     NodeDto {
         id,
         parent_id: node.parent,
         key: node.key.map(|kid| index.keys.get(kid).to_string()),
         value_type,
-        value_preview,
+        value_preview: node_value_preview(&node.value, children_len),
         children_count: children_len,
     }
 }
@@ -435,25 +445,71 @@ pub async fn expand_to(node_id: u32, state: State<'_, AppState>) -> Result<Expan
     Ok(ExpandToResult { expansions, path })
 }
 
+/// Formato compatto per get_expanded_slice: tuple invece di oggetti JSON con nomi
+/// di campo ripetuti. Ogni row è [id, parent_id, key_idx, type, preview, n_children, depth]
+/// con key_idx come indice nel pool locale di chiavi deduplicate (-1 = nessuna chiave).
+/// Risparmio tipico: ~70% vs ExpandedSliceResult con NodeDto a campi nominati.
+#[derive(Serialize)]
+pub struct CompactExpandedSliceResult {
+    pub offset: usize,
+    pub total_count: usize,
+    /// Pool locale di chiavi uniche per questo slice; indexato da key_idx nelle row.
+    pub key_pool: Vec<String>,
+    /// [id, parent_id (-1=root), key_idx (-1=none), type_byte, preview, children_count, depth]
+    pub rows: Vec<(u32, i32, i32, u8, String, u32, u32)>,
+}
+
 #[tauri::command]
 pub async fn get_expanded_slice(
     offset: usize,
     limit: usize,
     state: State<'_, AppState>,
-) -> Result<ExpandedSliceResult, String> {
+) -> Result<CompactExpandedSliceResult, String> {
     let guard = state.index.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
-    let rows = index
-        .get_expanded_slice(offset, limit)
-        .into_iter()
-        .map(|VisibleSliceRow { id, depth }| VisibleNode {
-            node: node_to_dto(index, id),
-            depth,
-        })
-        .collect();
-    Ok(ExpandedSliceResult {
+    let slice = index.get_expanded_slice(offset, limit);
+
+    // Pool locale di chiavi per questo slice: evita di ripetere la stessa stringa
+    // per ogni nodo che condivide il nome di campo (es. "id", "name", …).
+    let mut key_pool: Vec<String> = Vec::new();
+    let mut key_pool_ids: Vec<u32> = Vec::new(); // parallel: key_pool_ids[i] = string-pool id
+
+    let mut rows = Vec::with_capacity(slice.len());
+    for VisibleSliceRow { id, depth } in slice {
+        let node = &index.nodes[id as usize];
+        let children_len = node.children_len as usize;
+
+        let key_idx: i32 = match node.key {
+            None => -1,
+            Some(kid) => {
+                // ricerca lineare sul pool locale (solitamente < 200 entry → cache-friendly)
+                match key_pool_ids.iter().position(|&k| k == kid) {
+                    Some(pos) => pos as i32,
+                    None => {
+                        let pos = key_pool.len() as i32;
+                        key_pool.push(index.keys.get(kid).to_string());
+                        key_pool_ids.push(kid);
+                        pos
+                    }
+                }
+            }
+        };
+
+        rows.push((
+            id,
+            node.parent.map(|p| p as i32).unwrap_or(-1),
+            key_idx,
+            node_type_byte(&node.value),
+            node_value_preview(&node.value, children_len).into_owned(),
+            node.children_len,
+            depth as u32,
+        ));
+    }
+
+    Ok(CompactExpandedSliceResult {
         offset,
         total_count: index.expanded_visible_count(),
+        key_pool,
         rows,
     })
 }
