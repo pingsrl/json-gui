@@ -4,7 +4,7 @@ import { useJsonStore } from "../store";
 import { useI18n } from "../i18n";
 
 export const ContextMenu: FC = () => {
-  const { contextMenu, hideContextMenu, setSearchScopePath } = useJsonStore();
+  const { contextMenu, hideContextMenu, setSearchScopePath, expandSubtree } = useJsonStore();
   const { t } = useI18n();
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -24,6 +24,7 @@ export const ContextMenu: FC = () => {
   const { x, y, nodeId, parentId, nodeKey, valueType } = contextMenu;
   const hasNodeKey = nodeKey !== null;
   const hasParentNode = parentId !== null;
+  const isContainer = valueType === "object" || valueType === "array";
   const itemClassName =
     "w-full text-left px-3 py-1.5 transition-colors hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent";
 
@@ -118,6 +119,21 @@ export const ContextMenu: FC = () => {
       >
         {t.searchInParentNode}
       </button>
+      {isContainer && (
+        <>
+          <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
+          <button
+            type="button"
+            className={itemClassName}
+            onClick={() => {
+              void expandSubtree(nodeId);
+              hideContextMenu();
+            }}
+          >
+            {t.expandFromHere}
+          </button>
+        </>
+      )}
       <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
       <button
         type="button"

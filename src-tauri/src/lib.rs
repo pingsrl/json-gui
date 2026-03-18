@@ -236,6 +236,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::get_children,
+            commands::expand_subtree,
             commands::get_path,
             commands::search,
             commands::search_objects,

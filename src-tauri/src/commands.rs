@@ -254,6 +254,52 @@ pub async fn get_children(
     Ok(children)
 }
 
+/// Espande ricorsivamente il sotto-albero radicato in `node_id`.
+/// Restituisce una lista di coppie (parent_id, figli) per ogni nodo con figli
+/// nel sotto-albero. Limitato a `max_nodes` nodi totali (default 50_000) per
+/// evitare IPC eccessivi su sotto-alberi enormi.
+#[tauri::command]
+pub async fn expand_subtree(
+    node_id: u32,
+    max_nodes: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<(u32, Vec<NodeDto>)>, String> {
+    let guard = state.index.read().unwrap();
+    let index = guard.as_ref().ok_or("Nessun file aperto")?;
+
+    let limit = max_nodes.unwrap_or(50_000) as usize;
+    let mut result: Vec<(u32, Vec<NodeDto>)> = Vec::new();
+    let mut queue: Vec<u32> = vec![node_id];
+    let mut qi = 0;
+    let mut total_nodes: usize = 0;
+
+    while qi < queue.len() && total_nodes < limit {
+        let parent_id = queue[qi];
+        qi += 1;
+
+        let children_ids = index.get_children_slice(parent_id);
+        if children_ids.is_empty() {
+            continue;
+        }
+
+        total_nodes += children_ids.len();
+
+        for &child_id in children_ids {
+            if total_nodes < limit && index.nodes[child_id as usize].children_len > 0 {
+                queue.push(child_id);
+            }
+        }
+
+        let children: Vec<NodeDto> = children_ids
+            .iter()
+            .map(|&id| node_to_dto(index, id))
+            .collect();
+        result.push((parent_id, children));
+    }
+
+    Ok(result)
+}
+
 #[tauri::command]
 pub async fn get_path(node_id: u32, state: State<'_, AppState>) -> Result<String, String> {
     let guard = state.index.read().unwrap();

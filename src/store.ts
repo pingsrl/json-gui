@@ -278,6 +278,7 @@ interface JsonStore {
   setSearchScopePath: (path: string) => void;
   setSearchSort: (sortMode: SearchSortMode) => void;
   expandAll: () => Promise<void>;
+  expandSubtree: (nodeId: number) => Promise<void>;
   fetchExpandedSlice: (offset: number, limit: number) => Promise<void>;
   collapseAll: () => void;
   clearSearch: () => void;
@@ -683,6 +684,22 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     if (expandGeneration === myGen) {
       set({ loading: false, expandProgress: null });
     }
+  },
+
+  expandSubtree: async (nodeId: number) => {
+    const { expandedNodes, rootChildren } = get();
+    const expansions = await invoke<[number, NodeDto[]][]>("expand_subtree", { nodeId });
+    const next = new Map(expandedNodes);
+    for (const [parentId, children] of expansions) {
+      next.set(parentId, children);
+      cacheSet(parentId, children);
+      registerChildren(parentId, children);
+      for (const child of children) {
+        nodeMapCache.set(child.id, child);
+      }
+    }
+    const visibleNodes = buildVisibleNodes(rootChildren, next);
+    set({ expandedNodes: next, visibleNodes });
   },
 
   collapseAll: () => {
