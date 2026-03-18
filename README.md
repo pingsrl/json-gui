@@ -6,7 +6,8 @@
 A fast, native desktop app for exploring and searching large JSON files.
 Built with Tauri 2 + React 19 + TypeScript.
 
-<img src="docs/screenshot.png" alt="JsonGUI screenshot" width="800" />
+<img src="docs/screenshot_1.png" alt="JsonGUI screenshot" width="800" />
+<img src="docs/screenshot_2.png" alt="JsonGUI screenshot" width="800" />
 
 ---
 
