@@ -83,7 +83,9 @@ pub struct SearchResult {
     pub key: Option<String>,
     pub value_preview: String,
     pub kind: &'static str,
-    pub match_preview: Option<String>,
+    /// Arc<str> invece di String: tutti i risultati dello stesso search_objects
+    /// condividono la stessa stringa via reference-counting (O(1) clone).
+    pub match_preview: Option<Arc<str>>,
 }
 
 #[derive(Deserialize)]
@@ -362,7 +364,7 @@ pub async fn search_objects(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let match_preview = build_object_match_preview(&query.filters);
+    let match_preview: Arc<str> = Arc::from(build_object_match_preview(&query.filters).as_str());
     let ids = index.search_objects(
         &filters,
         query.key_case_sensitive,
@@ -388,7 +390,7 @@ pub async fn search_objects(
                 key: node.key.map(|kid| index.keys.get(kid).to_string()),
                 value_preview,
                 kind: "object",
-                match_preview: Some(match_preview.clone()),
+                match_preview: Some(Arc::clone(&match_preview)),
             }
         })
         .collect();
