@@ -98,6 +98,7 @@ const MODE_OPTIONS = [
 
 const PATH_SUGGESTION_LIMIT = 12;
 const SEARCH_FILTERS_STORAGE_PREFIX = "searchFilters:";
+const MAX_SUGGESTION_CACHE = 50;
 
 interface ObjectFilterRow {
   id: number;
@@ -365,6 +366,11 @@ export const SearchBar: FC = () => {
           const latest = latestAutocompleteRequest.current;
           if (!latest || latest.rowId !== rowId || latest.prefix !== trimmed) {
             return;
+          }
+          // LRU semplice: rimuove la entry più vecchia se si supera il limite
+          if (suggestionCache.current.size >= MAX_SUGGESTION_CACHE) {
+            const firstKey = suggestionCache.current.keys().next().value;
+            if (firstKey !== undefined) suggestionCache.current.delete(firstKey);
           }
           suggestionCache.current.set(trimmed, suggestions);
           setAutocompleteRowId(rowId);

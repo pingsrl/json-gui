@@ -133,18 +133,17 @@ export default function App() {
     }
   };
 
-  // Cmd+F / Cmd+O / Cmd+R
+  // Cmd+F / Cmd+O / Cmd+R — early exit su non-modifier evita 3 confronti inutili
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      if (e.key === "f") {
         e.preventDefault();
         document.getElementById("primary-search-input")?.focus();
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === "o") {
+      } else if (e.key === "o") {
         e.preventDefault();
         handleOpenFile();
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === "r" && filePath) {
+      } else if (e.key === "r" && filePath) {
         e.preventDefault();
         openFile(filePath);
       }

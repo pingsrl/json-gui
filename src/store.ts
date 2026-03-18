@@ -69,6 +69,11 @@ const nodeMapCache = new Map<number, NodeDto>();
 // Mappa figlio→genitore per O(1) sibling lookup
 const parentMap = new Map<number, number>();
 
+// Lookup O(1) del genitore di un nodo (usato da TreePanel per ArrowLeft)
+export function getParentId(nodeId: number): number | undefined {
+  return parentMap.get(nodeId);
+}
+
 function registerChildren(parentId: number, children: NodeDto[]) {
   for (const c of children) parentMap.set(c.id, parentId);
 }
@@ -179,13 +184,24 @@ export function sortSearchResults(
   query: string,
   sortMode: SearchSortMode
 ): SearchResult[] {
+  if (results.length === 0) return results;
   const sorted = results.slice();
+
+  if (sortMode === "file") {
+    sorted.sort((a, b) => a.file_order - b.file_order);
+    return sorted;
+  }
+
+  // Pre-calcola gli score una sola volta: da O(n·log(n)·k) a O(n + n·log(n))
+  const scores = new Map<SearchResult, number>();
+  for (const r of sorted) {
+    if (r.kind !== "object") scores.set(r, getSearchRelevanceScore(r, query));
+  }
   sorted.sort((a, b) => {
-    if (sortMode === "file" || a.kind === "object" || b.kind === "object") {
+    if (a.kind === "object" || b.kind === "object") {
       return a.file_order - b.file_order;
     }
-    const relevanceDelta =
-      getSearchRelevanceScore(a, query) - getSearchRelevanceScore(b, query);
+    const relevanceDelta = (scores.get(a) ?? 4) - (scores.get(b) ?? 4);
     if (relevanceDelta !== 0) return relevanceDelta;
     return a.file_order - b.file_order;
   });
