@@ -7,9 +7,29 @@ on:
 
 jobs:
   # ─────────────────────────────────────────────────────────
+  # 0. Verifica che il commit del tag sia su master.
+  #    Blocca l'intera pipeline se il tag punta a un commit
+  #    non raggiungibile da origin/master.
+  # ─────────────────────────────────────────────────────────
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0          # history completa necessaria per merge-base
+      - name: Verify tag commit is on master
+        run: |
+          git fetch origin master
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master || {
+            echo "::error::Tag $GITHUB_REF_NAME points to a commit not on master. Aborting release."
+            exit 1
+          }
+
+  # ─────────────────────────────────────────────────────────
   # 1. Crea la release draft
   # ─────────────────────────────────────────────────────────
   create-release:
+    needs: guard
     runs-on: ubuntu-latest
     permissions:
       contents: write
