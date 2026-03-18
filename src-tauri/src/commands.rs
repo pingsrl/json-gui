@@ -97,6 +97,7 @@ pub struct NodeDto {
 pub struct FileInfo {
     pub node_count: usize,
     pub size_bytes: usize,
+    pub root_node: NodeDto,
     pub root_children: Vec<NodeDto>,
 }
 
@@ -266,6 +267,7 @@ pub async fn open_file(
     .map_err(|e| e.to_string())??;
 
     let node_count = index.nodes.len();
+    let root_node = node_to_dto(&index, index.root);
     let root_children: Vec<NodeDto> = index
         .get_children_slice(index.root)
         .iter()
@@ -275,6 +277,7 @@ pub async fn open_file(
     Ok(FileInfo {
         node_count,
         size_bytes,
+        root_node,
         root_children,
     })
 }
@@ -744,6 +747,7 @@ pub async fn open_from_string(
         .map_err(|e| e.to_string())??;
 
     let node_count = index.nodes.len();
+    let root_node = node_to_dto(&index, index.root);
     let root_children: Vec<NodeDto> = index
         .get_children_slice(index.root)
         .iter()
@@ -753,6 +757,7 @@ pub async fn open_from_string(
     Ok(FileInfo {
         node_count,
         size_bytes,
+        root_node,
         root_children,
     })
 }

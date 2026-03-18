@@ -39,6 +39,7 @@ export interface ObjectSearchFilter {
 interface FileInfo {
   node_count: number;
   size_bytes: number;
+  root_node: NodeDto;
   root_children: NodeDto[];
 }
 
@@ -243,6 +244,7 @@ interface JsonStore {
   filePath: string | null;
   nodeCount: number;
   sizeBytes: number;
+  rootNode: NodeDto | null;
   rootChildren: NodeDto[];
   expandedNodes: Map<number, NodeDto[]>;
   expandAllActive: boolean;
@@ -304,6 +306,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   filePath: null,
   nodeCount: 0,
   sizeBytes: 0,
+  rootNode: null,
   rootChildren: [],
   expandedNodes: new Map(),
   expandAllActive: false,
@@ -355,6 +358,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       filePath: path,
       nodeCount: info.node_count,
       sizeBytes: info.size_bytes,
+      rootNode: info.root_node,
       rootChildren: info.root_children,
       expandedNodes,
       expandAllActive: false,
@@ -397,6 +401,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       filePath: "(incollato)",
       nodeCount: info.node_count,
       sizeBytes: info.size_bytes,
+      rootNode: info.root_node,
       rootChildren: info.root_children,
       expandedNodes,
       expandAllActive: false,

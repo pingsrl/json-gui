@@ -1,5 +1,5 @@
 import { useRef, useEffect, useMemo, type FC } from "react";
-import { FolderOpen } from "lucide-react";
+import { FolderOpen, ChevronDown } from "lucide-react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useJsonStore, getParentId } from "../store";
 import { useI18n } from "../i18n";
@@ -7,6 +7,7 @@ import { TreeNode } from "./TreeNode";
 
 export const TreePanel: FC = () => {
   const {
+    rootNode,
     rootChildren,
     visibleNodes,
     expandAllActive,
@@ -223,6 +224,22 @@ export const TreePanel: FC = () => {
           >
             {t.collapseAll}
           </button>
+        </div>
+      )}
+      {rootNode && rootChildren.length > 0 && (
+        <div className="flex items-center gap-1 py-0.5 select-none text-sm font-mono border-b border-gray-100 dark:border-gray-800 flex-shrink-0"
+          style={{ paddingLeft: "8px" }}
+        >
+          <span className="w-4 text-gray-400 dark:text-gray-500 flex-shrink-0 flex items-center justify-center">
+            <ChevronDown size={12} />
+          </span>
+          <span className={`font-medium ${
+            rootNode.value_type === "array"
+              ? "text-orange-600 dark:text-orange-400"
+              : "text-purple-600 dark:text-purple-400"
+          }`}>
+            {rootNode.value_preview}
+          </span>
         </div>
       )}
       <div ref={treeRef} className="flex-1 overflow-auto app-scrollbar">
