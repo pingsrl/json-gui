@@ -140,6 +140,7 @@ pub fn run() {
             // ── Menu nativo ──────────────────────────────────────────────────
             let open_i = MenuItem::with_id(app, "open", "Apri...", true, Some("CmdOrCtrl+O"))?;
             let new_window_i = MenuItem::with_id(app, "new-window", "Nuova finestra", true, Some("CmdOrCtrl+N"))?;
+            let close_window_i = PredefinedMenuItem::close_window(app, None)?;
             let recent_i = MenuItem::with_id(app, "recent", "Recenti…", true, None::<&str>)?;
             let reload_i = MenuItem::with_id(app, "reload", "Ricarica", true, Some("CmdOrCtrl+R"))?;
             let check_update_i = MenuItem::with_id(
@@ -164,6 +165,7 @@ pub fn run() {
                 &[
                     &open_i,
                     &new_window_i,
+                    &close_window_i,
                     &recent_i,
                     &PredefinedMenuItem::separator(app)?,
                     &reload_i,
@@ -302,7 +304,15 @@ pub fn run() {
                 for url in urls {
                     if let Ok(path) = url.to_file_path() {
                         if let Some(path_str) = path.to_str() {
+                            // Emetti per finestre già aperte (app già in esecuzione)
                             let _ = app.emit("open-with", path_str.to_string());
+                            // Salva anche in initial_path: se il webview non era ancora
+                            // pronto all'emit, il frontend lo recupera via get_initial_path.
+                            let state = app.state::<AppState>();
+                            let mut guard = state.initial_path.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(path_str.to_string());
+                            }
                         }
                     }
                 }

@@ -404,7 +404,12 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
 
   toggleNode: async (nodeId: number) => {
     const { expandAllActive, expandedNodes, rootChildren, selectedNodeId } = get();
-    if (expandAllActive) return;
+    if (expandAllActive) {
+      // Esci da expand-all e mostra il nodo nel suo contesto (collassato).
+      // navigateToNode espande solo gli antenati e resetta expandAllActive.
+      await get().navigateToNode(nodeId);
+      return;
+    }
     let next: Map<number, NodeDto[]>;
     if (expandedNodes.has(nodeId)) {
       next = new Map(expandedNodes);
