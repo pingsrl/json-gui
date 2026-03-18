@@ -1146,9 +1146,9 @@ export const SearchBar: FC = () => {
                     return (
                       <div
                         key={row.id}
-                        className="grid grid-cols-[auto_minmax(220px,1.8fr)_150px_minmax(220px,1.4fr)_auto_auto_auto] items-start gap-2"
+                        className="grid grid-cols-[auto_minmax(220px,1.8fr)_150px_minmax(220px,1.4fr)_auto_auto_auto] items-center gap-2"
                       >
-                        <label className="flex items-center justify-center pt-2">
+                        <label className="flex items-center justify-center">
                           <input
                             type="checkbox"
                             checked={row.enabled}
