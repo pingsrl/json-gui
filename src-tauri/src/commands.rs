@@ -65,7 +65,6 @@ pub struct NodeDto {
     pub key: Option<String>,
     pub value_type: &'static str,
     pub value_preview: Cow<'static, str>,
-    pub has_children: bool,
     pub children_count: usize,
 }
 
@@ -184,7 +183,6 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
         key: node.key.map(|kid| index.keys.get(kid).to_string()),
         value_type,
         value_preview,
-        has_children,
         children_count: children_len,
     }
 }

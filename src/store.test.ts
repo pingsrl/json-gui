@@ -16,7 +16,6 @@ function makeNode(
   id: number,
   key: string | null,
   type: string = 'string',
-  hasChildren = false,
   childrenCount = 0,
 ): NodeDto {
   return {
@@ -24,7 +23,6 @@ function makeNode(
     key,
     value_type: type,
     value_preview: String(id),
-    has_children: hasChildren,
     children_count: childrenCount,
   }
 }
@@ -53,7 +51,7 @@ describe('buildVisibleNodes', () => {
   it('i figli di un nodo espanso hanno depth 1', () => {
     const child1 = makeNode(10, 'x')
     const child2 = makeNode(11, 'y')
-    const parent = makeNode(1, 'root', 'object', true, 2)
+    const parent = makeNode(1, 'root', 'object', 2)
     const expanded = new Map([[1, [child1, child2]]])
     const result = buildVisibleNodes([parent], expanded)
     expect(result).toHaveLength(3)
@@ -65,7 +63,7 @@ describe('buildVisibleNodes', () => {
   it("rispetta l'ordine DFS: parent poi figli poi fratelli", () => {
     const c1 = makeNode(10, 'c1')
     const c2 = makeNode(11, 'c2')
-    const p1 = makeNode(1, 'p1', 'object', true, 2)
+    const p1 = makeNode(1, 'p1', 'object', 2)
     const p2 = makeNode(2, 'p2')
     const expanded = new Map([[1, [c1, c2]]])
     const result = buildVisibleNodes([p1, p2], expanded)
@@ -74,8 +72,8 @@ describe('buildVisibleNodes', () => {
 
   it('nodo non espanso non mostra i figli anche se la mappa ha altri espansi', () => {
     const child = makeNode(10, 'c')
-    const p1 = makeNode(1, 'p1', 'object', true, 1)
-    const p2 = makeNode(2, 'p2', 'object', true, 1) // non espanso
+    const p1 = makeNode(1, 'p1', 'object', 1)
+    const p2 = makeNode(2, 'p2', 'object', 1) // non espanso
     const expanded = new Map([[1, [child]]]) // solo p1 espanso
     const result = buildVisibleNodes([p1, p2], expanded)
     expect(result.map((v) => v.node.id)).toEqual([1, 10, 2])
@@ -83,9 +81,9 @@ describe('buildVisibleNodes', () => {
 
   it('supporta espansione profonda ricorsiva', () => {
     const level3 = makeNode(100, 'deep')
-    const level2 = makeNode(20, 'mid', 'object', true, 1)
-    const level1 = makeNode(10, 'top', 'object', true, 1)
-    const root = makeNode(1, 'root', 'object', true, 1)
+    const level2 = makeNode(20, 'mid', 'object', 1)
+    const level1 = makeNode(10, 'top', 'object', 1)
+    const root = makeNode(1, 'root', 'object', 1)
     const expanded = new Map([
       [1, [level1]],
       [10, [level2]],
@@ -98,8 +96,8 @@ describe('buildVisibleNodes', () => {
 
   it('collassare un nodo rimuove tutti i discendenti', () => {
     const grandchild = makeNode(100, 'gc')
-    const child = makeNode(10, 'c', 'object', true, 1)
-    const parent = makeNode(1, 'p', 'object', true, 1)
+    const child = makeNode(10, 'c', 'object', 1)
+    const parent = makeNode(1, 'p', 'object', 1)
 
     // tutto espanso
     const fullyExpanded = new Map([
@@ -118,7 +116,7 @@ describe('buildVisibleNodes', () => {
 
   it('non mostra i figli di un nodo rimosso dalla mappa expanded', () => {
     const child = makeNode(10, 'c')
-    const parent = makeNode(1, 'p', 'object', true, 1)
+    const parent = makeNode(1, 'p', 'object', 1)
     const expanded = new Map([[1, [child]]])
 
     const withChild = buildVisibleNodes([parent], expanded)
@@ -137,7 +135,7 @@ describe('buildVisibleNodes', () => {
 
   it('gestisce un array di elementi con chiavi numeriche', () => {
     const items = [0, 1, 2].map((i) => makeNode(i + 10, String(i)))
-    const arrayNode = makeNode(1, 'arr', 'array', true, 3)
+    const arrayNode = makeNode(1, 'arr', 'array', 3)
     const expanded = new Map([[1, items]])
     const result = buildVisibleNodes([arrayNode], expanded)
     expect(result).toHaveLength(4)
@@ -149,7 +147,7 @@ describe('buildVisibleNodes', () => {
 
 describe('insertVisibleChildren', () => {
   it('inserisce i figli subito dopo il parent mantenendo depth +1', () => {
-    const parent = makeNode(1, 'parent', 'object', true, 2)
+    const parent = makeNode(1, 'parent', 'object', 2)
     const sibling = makeNode(2, 'sibling')
     const child1 = makeNode(10, 'c1')
     const child2 = makeNode(11, 'c2')
@@ -164,8 +162,8 @@ describe('insertVisibleChildren', () => {
   })
 
   it('gestisce espansioni successive su livelli già visibili', () => {
-    const parent = makeNode(1, 'parent', 'object', true, 1)
-    const child = makeNode(10, 'child', 'object', true, 1)
+    const parent = makeNode(1, 'parent', 'object', 1)
+    const child = makeNode(10, 'child', 'object', 1)
     const grandchild = makeNode(100, 'gc')
 
     const withChild = insertVisibleChildren(
@@ -182,14 +180,13 @@ describe('insertVisibleChildren', () => {
 // ── NodeDto type contract ─────────────────────────────────────────────────────
 
 describe('NodeDto shape', () => {
-  it('has_children è false quando children_count è 0', () => {
-    const node = makeNode(1, 'x', 'string', false, 0)
-    expect(node.has_children).toBe(false)
+  it('children_count è 0 per nodi foglia', () => {
+    const node = makeNode(1, 'x', 'string', 0)
     expect(node.children_count).toBe(0)
   })
 
   it('key può essere null per nodi radice array', () => {
-    const node = makeNode(1, null, 'object', false, 0)
+    const node = makeNode(1, null, 'object', 0)
     expect(node.key).toBeNull()
   })
 })

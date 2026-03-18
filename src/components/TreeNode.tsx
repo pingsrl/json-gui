@@ -26,13 +26,14 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
     focusedNodeId,
     showContextMenu
   } = useJsonStore();
-  const isExpanded = expandAllActive ? node.has_children : expandedNodes.has(node.id);
+  const hasChildren = node.children_count > 0;
+  const isExpanded = expandAllActive ? hasChildren : expandedNodes.has(node.id);
   const isSelected = selectedNodeId === node.id;
   const isFocused = focusedNodeId === node.id;
 
   const handleClick = () => {
     selectNode(node);
-    if (!expandAllActive && node.has_children) {
+    if (!expandAllActive && hasChildren) {
       toggleNode(node.id);
     }
   };
@@ -68,7 +69,7 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
       data-node-id={node.id}
     >
       <span className="w-4 text-gray-400 dark:text-gray-500 flex-shrink-0 flex items-center justify-center">
-        {node.has_children ? (
+        {hasChildren ? (
           isExpanded ? (
             <ChevronDown size={12} />
           ) : (
@@ -86,7 +87,7 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
       >
         {node.value_preview}
       </span>
-      {node.has_children && (
+      {hasChildren && (
         <span className="text-gray-400 dark:text-gray-600 text-xs ml-1 flex-shrink-0">
           ({node.children_count})
         </span>

@@ -7,7 +7,6 @@ export interface NodeDto {
   key: string | null;
   value_type: string;
   value_preview: string;
-  has_children: boolean;
   children_count: number;
 }
 

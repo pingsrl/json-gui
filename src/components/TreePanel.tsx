@@ -181,7 +181,7 @@ export const TreePanel: FC = () => {
         return;
       } else if (e.key === "ArrowRight") {
         const vNode = getVNodeAt(idx);
-        if (vNode?.node.has_children && !expandedNodes.has(vNode.node.id))
+        if ((vNode?.node.children_count ?? 0) > 0 && !expandedNodes.has(vNode.node.id))
           toggleNode(vNode.node.id);
       } else if (e.key === "ArrowLeft") {
         const vNode = getVNodeAt(idx);
@@ -200,7 +200,7 @@ export const TreePanel: FC = () => {
         }
       } else if (e.key === "Enter") {
         const vNode = getVNodeAt(idx);
-        if (vNode?.node.has_children) toggleNode(vNode.node.id);
+        if ((vNode?.node.children_count ?? 0) > 0) toggleNode(vNode.node.id);
       }
     };
     window.addEventListener("keydown", handler);
