@@ -6,6 +6,7 @@ use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::io::{BufReader, Read};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tauri::{Emitter, State};
 
@@ -48,10 +49,34 @@ impl<R: Read, F: Fn(u8)> Read for ProgressReader<R, F> {
 }
 
 pub struct AppState {
-    // RwLock: letture concorrenti (search, get_children, get_path, get_expanded_slice)
-    // senza bloccarsi a vicenda; write lock solo su open_file/open_from_string.
-    pub index: Arc<RwLock<Option<JsonIndex>>>,
+    /// Mappa label-finestra → indice JSON per questa finestra.
+    /// RwLock esterno protegge la mappa; RwLock interno protegge l'indice per finestra,
+    /// permettendo letture concorrenti (search, get_children, …) sulla stessa finestra.
+    pub windows: RwLock<HashMap<String, Arc<RwLock<Option<JsonIndex>>>>>,
     pub initial_path: std::sync::Mutex<Option<String>>,
+}
+
+impl AppState {
+    /// Restituisce (o crea) l'Arc<RwLock<Option<JsonIndex>>> per la finestra indicata.
+    pub fn window_index(&self, label: &str) -> Arc<RwLock<Option<JsonIndex>>> {
+        {
+            let read = self.windows.read().unwrap();
+            if let Some(idx) = read.get(label) {
+                return Arc::clone(idx);
+            }
+        }
+        let mut write = self.windows.write().unwrap();
+        Arc::clone(
+            write
+                .entry(label.to_string())
+                .or_insert_with(|| Arc::new(RwLock::new(None))),
+        )
+    }
+
+    /// Rimuove l'indice associato a una finestra (chiamato alla sua distruzione).
+    pub fn remove_window(&self, label: &str) {
+        self.windows.write().unwrap().remove(label);
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -201,19 +226,19 @@ const STREAMING_THRESHOLD: u64 = 200 * 1024 * 1024; // 200 MB
 pub async fn open_file(
     path: String,
     state: State<'_, AppState>,
-    app: tauri::AppHandle,
+    webview_window: tauri::WebviewWindow,
 ) -> Result<FileInfo, String> {
     let path_clone = path.clone();
-    let app_clone = app.clone();
+    let window_clone = webview_window.clone();
 
     let (index, size_bytes) = tauri::async_runtime::spawn_blocking(move || {
         let file_size = std::fs::metadata(&path_clone).map(|m| m.len()).unwrap_or(0);
 
         let index = if file_size > STREAMING_THRESHOLD {
-            // File >200MB: streaming con progress events
+            // File >200MB: streaming con progress events solo alla finestra chiamante
             let file = std::fs::File::open(&path_clone).map_err(|e| e.to_string())?;
             let reader = ProgressReader::new(BufReader::new(file), file_size, move |pct| {
-                app_clone.emit("parse-progress", pct).ok();
+                window_clone.emit("parse-progress", pct).ok();
             });
             JsonIndex::from_reader(reader)
         } else {
@@ -231,7 +256,7 @@ pub async fn open_file(
         .iter()
         .map(|&id| node_to_dto(&index, id))
         .collect();
-    *state.index.write().unwrap() = Some(index);
+    *state.window_index(webview_window.label()).write().unwrap() = Some(index);
     Ok(FileInfo {
         node_count,
         size_bytes,
@@ -243,8 +268,10 @@ pub async fn open_file(
 pub async fn get_children(
     node_id: u32,
     state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
 ) -> Result<Vec<NodeDto>, String> {
-    let guard = state.index.read().unwrap();
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let children: Vec<NodeDto> = index
         .get_children_slice(node_id)
@@ -263,8 +290,10 @@ pub async fn expand_subtree(
     node_id: u32,
     max_nodes: Option<u32>,
     state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
 ) -> Result<Vec<(u32, Vec<NodeDto>)>, String> {
-    let guard = state.index.read().unwrap();
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
     let limit = max_nodes.unwrap_or(50_000) as usize;
@@ -301,8 +330,13 @@ pub async fn expand_subtree(
 }
 
 #[tauri::command]
-pub async fn get_path(node_id: u32, state: State<'_, AppState>) -> Result<String, String> {
-    let guard = state.index.read().unwrap();
+pub async fn get_path(
+    node_id: u32,
+    state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
+) -> Result<String, String> {
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     Ok(index.get_path(node_id))
 }
@@ -311,8 +345,10 @@ pub async fn get_path(node_id: u32, state: State<'_, AppState>) -> Result<String
 pub async fn search(
     query: SearchQuery,
     state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
 ) -> Result<Vec<SearchResult>, String> {
-    let guard = state.index.read().unwrap();
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let results = index.search(
         &query.text,
@@ -388,8 +424,10 @@ fn build_object_match_preview(filters: &[ObjectSearchFilterInput]) -> String {
 pub async fn search_objects(
     query: ObjectSearchQuery,
     state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
 ) -> Result<Vec<SearchResult>, String> {
-    let guard = state.index.read().unwrap();
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
     let filters: Vec<IndexObjectSearchFilter> = query
@@ -444,8 +482,10 @@ pub async fn suggest_property_paths(
     prefix: String,
     limit: usize,
     state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
 ) -> Result<Vec<String>, String> {
-    let guard = state.index.read().unwrap();
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     Ok(index.suggest_property_paths(&prefix, limit))
 }
@@ -454,8 +494,13 @@ pub async fn suggest_property_paths(
 /// piu' il path del nodo target, così il frontend può espandere l'intero path
 /// e ottenere il path in un singolo IPC call.
 #[tauri::command]
-pub async fn expand_to(node_id: u32, state: State<'_, AppState>) -> Result<ExpandToResult, String> {
-    let guard = state.index.read().unwrap();
+pub async fn expand_to(
+    node_id: u32,
+    state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
+) -> Result<ExpandToResult, String> {
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
     let mut chain: Vec<u32> = Vec::new();
@@ -508,8 +553,10 @@ pub async fn get_expanded_slice(
     offset: usize,
     limit: usize,
     state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
 ) -> Result<CompactExpandedSliceResult, String> {
-    let guard = state.index.read().unwrap();
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let slice = index.get_expanded_slice(offset, limit);
 
@@ -560,15 +607,25 @@ pub async fn get_expanded_slice(
 
 
 #[tauri::command]
-pub async fn get_raw(node_id: u32, state: State<'_, AppState>) -> Result<String, String> {
-    let guard = state.index.read().unwrap();
+pub async fn get_raw(
+    node_id: u32,
+    state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
+) -> Result<String, String> {
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     Ok(index.build_raw(node_id))
 }
 
 #[tauri::command]
-pub async fn export_types(lang: String, state: State<'_, AppState>) -> Result<String, String> {
-    let guard = state.index.read().unwrap();
+pub async fn export_types(
+    lang: String,
+    state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
+) -> Result<String, String> {
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let result = match lang.as_str() {
         "typescript" => schema::generate_typescript(index),
@@ -591,6 +648,7 @@ pub fn get_initial_path(state: State<'_, AppState>) -> Option<String> {
 pub async fn open_from_string(
     content: String,
     state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
 ) -> Result<FileInfo, String> {
     let size_bytes = content.len();
     let index = tauri::async_runtime::spawn_blocking(move || JsonIndex::from_str(&content))
@@ -603,7 +661,7 @@ pub async fn open_from_string(
         .iter()
         .map(|&id| node_to_dto(&index, id))
         .collect();
-    *state.index.write().unwrap() = Some(index);
+    *state.window_index(webview_window.label()).write().unwrap() = Some(index);
     Ok(FileInfo {
         node_count,
         size_bytes,

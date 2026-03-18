@@ -4,15 +4,14 @@ mod schema;
 
 use commands::AppState;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewWindow, WindowEvent};
-
-const WINDOW_STATE_FILE: &str = "window-state.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedWindowState {
@@ -28,7 +27,13 @@ fn window_state_path<R: tauri::Runtime>(window: &WebviewWindow<R>) -> Option<Pat
     if fs::create_dir_all(&path).is_err() {
         return None;
     }
-    path.push(WINDOW_STATE_FILE);
+    let label = window.label();
+    let filename = if label == "main" {
+        "window-state.json".to_string()
+    } else {
+        format!("window-state-{label}.json")
+    };
+    path.push(filename);
     Some(path)
 }
 
@@ -119,7 +124,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState {
-            index: Arc::new(RwLock::new(None)),
+            windows: RwLock::new(HashMap::new()),
             initial_path: std::sync::Mutex::new(None),
         })
         .setup(|app| {
@@ -133,6 +138,7 @@ pub fn run() {
 
             // ── Menu nativo ──────────────────────────────────────────────────
             let open_i = MenuItem::with_id(app, "open", "Apri...", true, Some("CmdOrCtrl+O"))?;
+            let new_window_i = MenuItem::with_id(app, "new-window", "Nuova finestra", true, Some("CmdOrCtrl+N"))?;
             let recent_i = MenuItem::with_id(app, "recent", "Recenti…", true, None::<&str>)?;
             let reload_i = MenuItem::with_id(app, "reload", "Ricarica", true, Some("CmdOrCtrl+R"))?;
             let check_update_i = MenuItem::with_id(
@@ -156,6 +162,7 @@ pub fn run() {
                 true,
                 &[
                     &open_i,
+                    &new_window_i,
                     &recent_i,
                     &PredefinedMenuItem::separator(app)?,
                     &reload_i,
@@ -221,6 +228,34 @@ pub fn run() {
                 "export" => {
                     app.emit("menu-export", ()).ok();
                 }
+                "new-window" => {
+                    let label = format!(
+                        "w{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis()
+                    );
+                    let _ = tauri::WebviewWindowBuilder::new(
+                        app,
+                        &label,
+                        tauri::WebviewUrl::App("index.html".into()),
+                    )
+                    .title("JsonGUI")
+                    .inner_size(1200.0, 800.0)
+                    .min_inner_size(600.0, 400.0)
+                    .build()
+                    .map(|new_window| {
+                        setup_window_state_persistence(&new_window);
+                        let app_for_destroy = app.clone();
+                        let lbl = label.clone();
+                        new_window.on_window_event(move |event| {
+                            if let WindowEvent::Destroyed = event {
+                                app_for_destroy.state::<AppState>().remove_window(&lbl);
+                            }
+                        });
+                    });
+                }
                 _ => {}
             });
 
@@ -229,6 +264,13 @@ pub fn run() {
                 .or_else(|| app.webview_windows().into_values().next())
             {
                 setup_window_state_persistence(&main_window);
+                let app_handle_for_destroy = app.handle().clone();
+                let main_label = main_window.label().to_string();
+                main_window.on_window_event(move |event| {
+                    if let WindowEvent::Destroyed = event {
+                        app_handle_for_destroy.state::<AppState>().remove_window(&main_label);
+                    }
+                });
             }
 
             Ok(())
