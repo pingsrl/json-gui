@@ -27,10 +27,22 @@ export const SearchPanel: FC = () => {
   const { t } = useI18n();
 
   const handleResultClick = async (result: (typeof searchResults)[number]) => {
+    if (result.kind === "object") {
+      const alreadyExpanded = expandedNodes.has(result.node_id);
+      await navigateToNode(result.node_id);
+      if (!alreadyExpanded) {
+        await toggleNode(result.node_id);
+      }
+      // Seleziona la prima proprietà dell'oggetto invece del nodo oggetto stesso
+      const children = useJsonStore.getState().expandedNodes.get(result.node_id);
+      if (children && children.length > 0) {
+        await navigateToNode(children[0].id);
+      }
+      return;
+    }
+
     const shouldExpandOneLevel =
-      result.kind === "object" ||
-      result.value_preview === "[object]" ||
-      result.value_preview === "[array]";
+      result.value_preview === "[object]" || result.value_preview === "[array]";
     const alreadyExpanded = expandedNodes.has(result.node_id);
     await navigateToNode(result.node_id);
     if (shouldExpandOneLevel && !alreadyExpanded) {
