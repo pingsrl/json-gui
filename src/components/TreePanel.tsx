@@ -10,34 +10,25 @@ export const TreePanel: FC = () => {
     rootNode,
     rootChildren,
     visibleNodes,
-    expandAllActive,
-    expandAllTotalCount,
-    expandAllRows,
     selectedNodeId,
     focusedNodeId,
     expandedNodes,
     expandAll,
     collapseAll,
-    fetchExpandedSlice,
     toggleNode,
     setFocusedNode
   } = useJsonStore();
   const { t } = useI18n();
   const treeRef = useRef<HTMLDivElement>(null);
-  const visibleCount = expandAllActive ? expandAllTotalCount : visibleNodes.length;
-  const getVNodeAt = (index: number) =>
-    expandAllActive ? (expandAllRows.get(index) ?? null) : (visibleNodes[index] ?? null);
+  const getVNodeAt = (index: number) => visibleNodes[index] ?? null;
 
   const rowVirtualizer = useVirtualizer({
-    count: visibleCount,
+    count: visibleNodes.length,
     getScrollElement: () => treeRef.current,
     estimateSize: () => 24,
     overscan: 20
   });
   const virtualItems = rowVirtualizer.getVirtualItems();
-  const firstVirtualIndex = virtualItems[0]?.index ?? 0;
-  const lastVirtualIndex =
-    virtualItems.length > 0 ? virtualItems[virtualItems.length - 1].index : 0;
 
   // Indice O(1): nodeId → posizione in visibleNodes; ricalcolato solo su expand/collapse
   const visibleIndexMap = useMemo(() => {
@@ -46,69 +37,33 @@ export const TreePanel: FC = () => {
     return map;
   }, [visibleNodes]);
 
-  // Indice O(1): nodeId → posizione in expandAllRows; ricalcolato solo su nuovi slice
-  const expandAllIndexMap = useMemo(() => {
-    const map = new Map<number, number>();
-    expandAllRows.forEach((vNode, idx) => map.set(vNode.node.id, idx));
-    return map;
-  }, [expandAllRows]);
-
-  useEffect(() => {
-    if (!expandAllActive || visibleCount === 0) return;
-    const start = Math.max(0, firstVirtualIndex - 40);
-    const limit = Math.max(1, lastVirtualIndex - start + 41);
-    void fetchExpandedSlice(start, limit);
-  }, [
-    expandAllActive,
-    visibleCount,
-    firstVirtualIndex,
-    lastVirtualIndex,
-    fetchExpandedSlice
-  ]);
-
-  // Ref sempre aggiornati: permettono all'effect di leggere le mappe correnti
-  // senza dover dipendere da esse (evita lo scroll-to-selected su ogni expand/collapse)
+  // Ref sempre aggiornato: permette all'effect di leggere la mappa corrente
+  // senza dipendere da essa (evita lo scroll-to-selected su ogni expand/collapse)
   const visibleIndexMapRef = useRef(visibleIndexMap);
-  const expandAllIndexMapRef = useRef(expandAllIndexMap);
   visibleIndexMapRef.current = visibleIndexMap;
-  expandAllIndexMapRef.current = expandAllIndexMap;
 
-  // Scroll al nodo selezionato — scatta SOLO quando selectedNodeId cambia,
-  // non ad ogni expand/collapse (che cambierebbe visibleIndexMap e riporterebbe
-  // la vista all'inizio della lista)
+  // Scroll al nodo selezionato — scatta SOLO quando selectedNodeId cambia
   useEffect(() => {
     if (selectedNodeId === null) return;
-    const idx = expandAllActive
-      ? (expandAllIndexMapRef.current.get(selectedNodeId) ?? -1)
-      : (visibleIndexMapRef.current.get(selectedNodeId) ?? -1);
+    const idx = visibleIndexMapRef.current.get(selectedNodeId) ?? -1;
     if (idx >= 0) rowVirtualizer.scrollToIndex(idx, { align: "center" });
-  }, [selectedNodeId, expandAllActive, rowVirtualizer]);
+  }, [selectedNodeId, rowVirtualizer]);
 
   // Ref sempre aggiornato con i valori correnti — evita di ri-registrare il listener
-  // ad ogni expand/collapse (da 12 dipendenze a 1)
+  // ad ogni expand/collapse (da N dipendenze a 1)
   const kbStateRef = useRef({
-    expandAllActive,
-    expandAllIndexMap,
     visibleIndexMap,
-    visibleCount,
-    expandAllRows,
     visibleNodes,
     expandedNodes,
-    fetchExpandedSlice,
     toggleNode,
     setFocusedNode,
     rowVirtualizer,
     focusedNodeId
   });
   kbStateRef.current = {
-    expandAllActive,
-    expandAllIndexMap,
     visibleIndexMap,
-    visibleCount,
-    expandAllRows,
     visibleNodes,
     expandedNodes,
-    fetchExpandedSlice,
     toggleNode,
     setFocusedNode,
     rowVirtualizer,
@@ -130,59 +85,36 @@ export const TreePanel: FC = () => {
       e.preventDefault();
 
       const {
-        expandAllActive,
-        expandAllIndexMap,
         visibleIndexMap,
-        visibleCount,
-        expandAllRows,
         visibleNodes,
         expandedNodes,
-        fetchExpandedSlice,
         toggleNode,
         setFocusedNode,
         rowVirtualizer,
         focusedNodeId
       } = kbStateRef.current;
 
-      if (visibleCount === 0) return;
+      if (visibleNodes.length === 0) return;
 
-      const getVNodeAt = (i: number) =>
-        expandAllActive ? (expandAllRows.get(i) ?? null) : (visibleNodes[i] ?? null);
+      const getVNodeAt = (i: number) => visibleNodes[i] ?? null;
 
       // Lookup O(1) via index map invece di findIndex O(n)
-      const idx =
-        focusedNodeId !== null
-          ? expandAllActive
-            ? (expandAllIndexMap.get(focusedNodeId) ?? -1)
-            : (visibleIndexMap.get(focusedNodeId) ?? -1)
-          : -1;
+      const idx = focusedNodeId !== null ? (visibleIndexMap.get(focusedNodeId) ?? -1) : -1;
 
       if (e.key === "ArrowDown") {
-        const nextIdx = idx < visibleCount - 1 ? idx + 1 : 0;
+        const nextIdx = idx < visibleNodes.length - 1 ? idx + 1 : 0;
         const next = getVNodeAt(nextIdx);
-        if (!next && expandAllActive) {
-          void fetchExpandedSlice(nextIdx, 80);
-          rowVirtualizer.scrollToIndex(nextIdx, { align: "auto" });
-          return;
-        }
         if (next) {
           setFocusedNode(next.node.id);
           rowVirtualizer.scrollToIndex(nextIdx, { align: "auto" });
         }
       } else if (e.key === "ArrowUp") {
-        const prevIdx = idx > 0 ? idx - 1 : visibleCount - 1;
+        const prevIdx = idx > 0 ? idx - 1 : visibleNodes.length - 1;
         const prev = getVNodeAt(prevIdx);
-        if (!prev && expandAllActive) {
-          void fetchExpandedSlice(prevIdx, 80);
-          rowVirtualizer.scrollToIndex(prevIdx, { align: "auto" });
-          return;
-        }
         if (prev) {
           setFocusedNode(prev.node.id);
           rowVirtualizer.scrollToIndex(prevIdx, { align: "auto" });
         }
-      } else if (expandAllActive) {
-        return;
       } else if (e.key === "ArrowRight") {
         const vNode = getVNodeAt(idx);
         if (vNode && vNode.node.children_count > 0 && !expandedNodes.has(vNode.node.id))
@@ -274,11 +206,7 @@ export const TreePanel: FC = () => {
                     width: "100%"
                   }}
                 >
-                  {vNode ? (
-                    <TreeNode node={vNode.node} depth={vNode.depth} />
-                  ) : (
-                    <div className="h-6 mx-2 rounded bg-gray-100/70 dark:bg-gray-800/70" />
-                  )}
+                  {vNode && <TreeNode node={vNode.node} depth={vNode.depth} />}
                 </div>
               );
             })}

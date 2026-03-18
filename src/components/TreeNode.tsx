@@ -18,7 +18,6 @@ interface Props {
 
 export const TreeNode: FC<Props> = ({ node, depth }) => {
   const {
-    expandAllActive,
     expandedNodes,
     toggleNode,
     selectNode,
@@ -27,13 +26,13 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
     showContextMenu
   } = useJsonStore();
   const hasChildren = node.children_count > 0;
-  const isExpanded = expandAllActive ? hasChildren : expandedNodes.has(node.id);
+  const isExpanded = expandedNodes.has(node.id);
   const isSelected = selectedNodeId === node.id;
   const isFocused = focusedNodeId === node.id;
 
   const handleClick = () => {
     selectNode(node);
-    if (!expandAllActive && hasChildren) {
+    if (hasChildren) {
       toggleNode(node.id);
     }
   };
