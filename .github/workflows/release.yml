@@ -40,12 +40,37 @@ jobs:
       release_id: ${{ steps.create.outputs.id }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0          # necessario per trovare il tag precedente
+      - name: Generate release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -1)
+          if [ -n "$PREV_TAG" ]; then
+            NOTES=$(gh api "repos/${REPO}/releases/generate-notes" \
+              --method POST \
+              -f tag_name="${TAG}" \
+              -f previous_tag_name="${PREV_TAG}" \
+              --jq '.body')
+          else
+            NOTES=$(gh api "repos/${REPO}/releases/generate-notes" \
+              --method POST \
+              -f tag_name="${TAG}" \
+              --jq '.body')
+          fi
+          echo "body<<RELEASE_NOTES_EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_NOTES_EOF" >> "$GITHUB_OUTPUT"
       - name: Create draft release
         id: create
         uses: softprops/action-gh-release@v2.6.1
         with:
           draft: true
-          generate_release_notes: true
+          body: ${{ steps.notes.outputs.body }}
 
   # ─────────────────────────────────────────────────────────
   # 2a. macOS — universal binary (arm64 + x86_64)
