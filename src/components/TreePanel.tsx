@@ -226,30 +226,33 @@ export const TreePanel: FC = () => {
           </button>
         </div>
       )}
-      {rootNode && rootChildren.length > 0 && (
+      {rootNode && (
         <div className="flex items-center gap-1 py-0.5 select-none text-sm font-mono border-b border-gray-100 dark:border-gray-800 flex-shrink-0"
           style={{ paddingLeft: "8px" }}
         >
           <span className="w-4 text-gray-400 dark:text-gray-500 flex-shrink-0 flex items-center justify-center">
-            <ChevronDown size={12} />
+            {rootChildren.length > 0 && <ChevronDown size={12} />}
           </span>
-          <span className={`font-medium ${
-            rootNode.value_type === "array"
-              ? "text-orange-600 dark:text-orange-400"
-              : "text-purple-600 dark:text-purple-400"
-          }`}>
+          <span className={`font-medium ${{
+            array: "text-orange-600 dark:text-orange-400",
+            object: "text-purple-600 dark:text-purple-400",
+            string: "text-green-600 dark:text-green-400",
+            number: "text-blue-600 dark:text-blue-400",
+            boolean: "text-amber-600 dark:text-yellow-400",
+            null: "text-gray-400 dark:text-gray-500",
+          }[rootNode.value_type] ?? ""}`}>
             {rootNode.value_preview}
           </span>
         </div>
       )}
       <div ref={treeRef} className="flex-1 overflow-auto app-scrollbar">
-        {rootChildren.length === 0 ? (
+        {!rootNode ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-400 dark:text-gray-500 gap-3">
             <FolderOpen size={40} className="opacity-30" />
             <span className="text-sm">{t.openJsonFile}</span>
             <span className="text-xs opacity-50">{t.anySize}</span>
           </div>
-        ) : (
+        ) : rootChildren.length === 0 ? null : (
           <div
             style={{
               height: `${rowVirtualizer.getTotalSize()}px`,

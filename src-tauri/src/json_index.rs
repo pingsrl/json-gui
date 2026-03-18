@@ -1049,7 +1049,7 @@ mod tests {
     #[test]
     fn search_by_value() {
         let index = idx(r#"{"name":"Alice","city":"Rome"}"#);
-        let results = index.search("Alice", "values", false, false, false, 10, None);
+        let results = index.search("Alice", "values", false, false, false, 10, None, false, false);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, "$.name");
     }
@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn search_by_key() {
         let index = idx(r#"{"username":"bob","email":"b@b.com"}"#);
-        let results = index.search("email", "keys", false, false, false, 10, None);
+        let results = index.search("email", "keys", false, false, false, 10, None, false, false);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, "$.email");
     }
@@ -1065,21 +1065,21 @@ mod tests {
     #[test]
     fn search_case_insensitive() {
         let index = idx(r#"{"msg":"Hello World"}"#);
-        let results = index.search("hello", "values", false, false, false, 10, None);
+        let results = index.search("hello", "values", false, false, false, 10, None, false, false);
         assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn search_case_sensitive_no_match() {
         let index = idx(r#"{"msg":"Hello World"}"#);
-        let results = index.search("hello", "values", true, false, false, 10, None);
+        let results = index.search("hello", "values", true, false, false, 10, None, false, false);
         assert_eq!(results.len(), 0);
     }
 
     #[test]
     fn search_regex() {
         let index = idx(r#"{"a":"foo123","b":"bar456","c":"baz"}"#);
-        let results = index.search(r"\d+", "values", false, true, false, 10, None);
+        let results = index.search(r"\d+", "values", false, true, false, 10, None, false, false);
         assert_eq!(results.len(), 2);
     }
 
@@ -1091,21 +1091,21 @@ mod tests {
             .join(",");
         let json = format!("[{}]", arr);
         let index = idx(&json);
-        let results = index.search("item", "values", false, false, false, 5, None);
+        let results = index.search("item", "values", false, false, false, 5, None, false, false);
         assert_eq!(results.len(), 5);
     }
 
     #[test]
     fn search_no_results() {
         let index = idx(r#"{"a":"hello"}"#);
-        let results = index.search("xyz", "both", false, false, false, 10, None);
+        let results = index.search("xyz", "both", false, false, false, 10, None, false, false);
         assert_eq!(results.len(), 0);
     }
 
     #[test]
     fn search_both_keys_and_values() {
         let index = idx(r#"{"target":"other","other":"value"}"#);
-        let results = index.search("other", "both", false, false, false, 10, None);
+        let results = index.search("other", "both", false, false, false, 10, None, false, false);
         // "other" appare come chiave di "other" e come valore di "target"
         assert_eq!(results.len(), 2);
     }
@@ -1113,17 +1113,17 @@ mod tests {
     #[test]
     fn search_exact_match() {
         let index = idx(r#"{"a":"hello world","b":"hello","c":"say hello"}"#);
-        let exact = index.search("hello", "values", false, false, true, 10, None);
+        let exact = index.search("hello", "values", false, false, true, 10, None, false, false);
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].1, "$.b");
-        let partial = index.search("hello", "values", false, false, false, 10, None);
+        let partial = index.search("hello", "values", false, false, false, 10, None, false, false);
         assert_eq!(partial.len(), 3);
     }
 
     #[test]
     fn search_limited_to_path() {
         let index = idx(r#"{"users":[{"name":"Alice"},{"name":"Bob"}],"meta":{"name":"Catalog"}}"#);
-        let results = index.search("name", "keys", false, false, false, 10, Some("$.users.0"));
+        let results = index.search("name", "keys", false, false, false, 10, Some("$.users.0"), false, false);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, "$.users.0.name");
     }
@@ -1139,8 +1139,43 @@ mod tests {
             false,
             10,
             Some("$.missing"),
+            false,
+            false,
         );
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn scalar_root_string() {
+        let index = idx(r#""hello world""#);
+        assert_eq!(index.nodes.len(), 1);
+        assert_eq!(index.get_children_slice(index.root).len(), 0);
+        let root = &index.nodes[index.root as usize];
+        assert!(matches!(root.value, NodeValue::Str(_)));
+    }
+
+    #[test]
+    fn scalar_root_number() {
+        let index = idx("42");
+        assert_eq!(index.nodes.len(), 1);
+        let root = &index.nodes[index.root as usize];
+        assert!(matches!(root.value, NodeValue::Num(_)));
+    }
+
+    #[test]
+    fn scalar_root_bool() {
+        let index = idx("true");
+        assert_eq!(index.nodes.len(), 1);
+        let root = &index.nodes[index.root as usize];
+        assert!(matches!(root.value, NodeValue::Bool(true)));
+    }
+
+    #[test]
+    fn scalar_root_null() {
+        let index = idx("null");
+        assert_eq!(index.nodes.len(), 1);
+        let root = &index.nodes[index.root as usize];
+        assert!(matches!(root.value, NodeValue::Null));
     }
 
     #[test]
