@@ -208,6 +208,11 @@ Each run publishes:
 This is meant to track trends over time from the Actions panel, not to act as a
 strict pass/fail performance budget: GitHub-hosted runners are noisy.
 
+For tagged releases, the same benchmark snapshot is also appended to the draft
+release notes by [`/.github/workflows/release.yml`](.github/workflows/release.yml),
+so the release page contains the measured `load`, `search_regex`, and
+`expand_all` numbers for that version.
+
 You can run the same smoke test locally with:
 
 ```bash

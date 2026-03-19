@@ -73,6 +73,154 @@ jobs:
           body: ${{ steps.notes.outputs.body }}
 
   # ─────────────────────────────────────────────────────────
+  # 1b. Benchmark snapshot appended to the draft release body
+  # ─────────────────────────────────────────────────────────
+  release-benchmarks:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Run Rust performance smoke test
+        run: |
+          cargo run \
+            --manifest-path src-tauri/Cargo.toml \
+            --release \
+            --example perf_ci \
+            -- \
+            --size-mib 64 \
+            --iterations 3 \
+            --sample-path src-tauri/target/perf-ci-sample.json \
+            --output src-tauri/target/perf-ci.json
+
+      - name: Generate benchmark summary
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads(Path("src-tauri/target/perf-ci.json").read_text())
+
+          release_lines = [
+              "<!-- benchmark-section:start -->",
+              "## CI Benchmarks",
+              "",
+              (
+                  "Release snapshot measured on GitHub Actions using the deterministic "
+                  "Rust perf smoke dataset."
+              ),
+              "",
+              f"- Dataset: `{report['dataset']['size_mib']:.1f} MiB`, `{report['dataset']['node_count']}` nodes",
+              f"- Search pattern: `{report['search']['pattern']}` over `{report['search']['target']}`",
+              f"- Source run: [#{os.environ['RUN_NUMBER']}](https://github.com/{os.environ['REPO']}/actions/runs/{os.environ['RUN_ID']})",
+              "",
+              "| Metric | Best | Median | Samples |",
+              "|---|---:|---:|---|",
+          ]
+
+          action_lines = [
+              "## Release benchmark snapshot",
+              "",
+              f"Dataset: `{report['dataset']['size_mib']:.1f} MiB`, `{report['dataset']['node_count']}` nodes",
+              "",
+              "| Metric | Best | Median | Samples |",
+              "|---|---:|---:|---|",
+          ]
+
+          for metric_name, key in [
+              ("load", "load"),
+              ("search_regex", "search_regex"),
+              ("expand_all", "expand_all"),
+          ]:
+              metric = report[key]
+              samples = ", ".join(f"{value:.2f} ms" for value in metric["samples_ms"])
+              row = (
+                  f"| {metric_name} | {metric['best_ms']:.2f} ms | "
+                  f"{metric['median_ms']:.2f} ms | {samples} |"
+              )
+              release_lines.append(row)
+              action_lines.append(row)
+
+          release_lines.extend(
+              [
+                  "",
+                  "These numbers are useful as a release snapshot, not as a strict performance budget.",
+                  "<!-- benchmark-section:end -->",
+                  "",
+              ]
+          )
+          action_lines.extend(
+              [
+                  "",
+                  "This snapshot is also appended to the draft release body.",
+                  "",
+              ]
+          )
+
+          Path("src-tauri/target/perf-ci-release-section.md").write_text("\n".join(release_lines))
+          summary = "\n".join(action_lines)
+          Path("src-tauri/target/perf-ci-summary.md").write_text(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(summary)
+          PY
+
+      - name: Append benchmarks to draft release body
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          from pathlib import Path
+
+          current = subprocess.check_output(
+              ["gh", "release", "view", os.environ["TAG"], "--json", "body", "--jq", ".body"],
+              text=True,
+          ).rstrip()
+          section = Path("src-tauri/target/perf-ci-release-section.md").read_text().strip()
+          start_marker = "<!-- benchmark-section:start -->"
+          end_marker = "<!-- benchmark-section:end -->"
+          if start_marker in current and end_marker in current:
+              prefix, rest = current.split(start_marker, 1)
+              _, suffix = rest.split(end_marker, 1)
+              body = prefix.rstrip() + "\n\n" + section + "\n" + suffix.lstrip()
+          else:
+              body = current + "\n\n" + section + "\n"
+          Path("src-tauri/target/release-body.md").write_text(body)
+          PY
+          gh release edit "$TAG" --notes-file src-tauri/target/release-body.md
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-perf-report
+          path: |
+            src-tauri/target/perf-ci.json
+            src-tauri/target/perf-ci-summary.md
+            src-tauri/target/perf-ci-release-section.md
+
+  # ─────────────────────────────────────────────────────────
   # 2a. macOS — universal binary (arm64 + x86_64)
   # ─────────────────────────────────────────────────────────
   release-macos:
@@ -330,7 +478,7 @@ jobs:
   # 3. Genera latest.json e pubblica la release
   # ─────────────────────────────────────────────────────────
   publish-release:
-    needs: [release-macos, release-windows, release-linux]
+    needs: [release-macos, release-windows, release-linux, release-benchmarks]
     runs-on: ubuntu-latest
     permissions:
       contents: write
