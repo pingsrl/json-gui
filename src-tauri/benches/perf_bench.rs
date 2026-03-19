@@ -71,7 +71,7 @@ fn bfs_all_children(index: &JsonIndex) -> usize {
 
 // ── Benchmarks ────────────────────────────────────────────────────────────────
 
-/// Parsing + index build (load time).
+/// Parsing + index build via from_str (in-memory, sonic-rs).
 fn bench_load(c: &mut Criterion) {
     let mut group = c.benchmark_group("load");
     group.warm_up_time(Duration::from_secs(2));
@@ -92,6 +92,38 @@ fn bench_load(c: &mut Criterion) {
             BenchmarkId::new("nested", format!("{}k_nodes", n * 7 / 1000)),
             &json,
             |b, j| b.iter(|| JsonIndex::from_str(black_box(j)).unwrap()),
+        );
+    }
+    group.finish();
+}
+
+/// Parsing + index build via from_file (mmap + sonic-rs).
+/// Writes a temp file, then benchmarks from_file vs from_str for the same data.
+fn bench_load_from_file(c: &mut Criterion) {
+    use std::io::Write;
+    let mut group = c.benchmark_group("load_from_file");
+    group.warm_up_time(Duration::from_secs(1));
+
+    for &n in &[10_000usize, 50_000] {
+        let json = flat_array(n);
+        let bytes = json.len();
+
+        // Write to a temp file once, reuse across iterations.
+        let tmp = std::env::temp_dir().join(format!("perf_bench_flat_{n}.json"));
+        std::fs::write(&tmp, &json).unwrap();
+        let path = tmp.to_str().unwrap().to_string();
+
+        group.throughput(Throughput::Bytes(bytes as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("from_str", format!("{}k_nodes", n * 5 / 1000)),
+            &json,
+            |b, j| b.iter(|| JsonIndex::from_str(black_box(j)).unwrap()),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("from_file_mmap", format!("{}k_nodes", n * 5 / 1000)),
+            &path,
+            |b, p| b.iter(|| JsonIndex::from_file(black_box(p)).unwrap()),
         );
     }
     group.finish();
@@ -283,6 +315,7 @@ criterion_group!(
     benches,
     bench_memory_layout,
     bench_load,
+    bench_load_from_file,
     bench_search,
     bench_expand_all,
     bench_get_path,

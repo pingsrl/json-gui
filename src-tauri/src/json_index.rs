@@ -1,5 +1,4 @@
 use rayon::prelude::*;
-use std::io::BufReader;
 use regex::Regex;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::cell::RefCell;
@@ -491,21 +490,39 @@ impl JsonIndex {
         parse_streaming(&mut de).map_err(|e| e.to_string())
     }
 
-    /// Carica da file: BufReader da 1MB per parsing streaming a basso consumo RAM.
-    /// Stima il numero di nodi dal file_size (≈ 1 nodo ogni 50 byte) per pre-allocare
-    /// i Vec interni ed evitare il raddoppio della capacità durante il parsing.
+    /// Loads from file via mmap + sonic-rs (SIMD parsing).
+    ///
+    /// The file is memory-mapped read-only for the duration of parsing: the OS
+    /// demand-pages only the bytes actually needed and can evict already-parsed
+    /// pages, so peak heap allocation is just the growing index (no 1 MB BufReader
+    /// buffer). The mmap is released as soon as parsing finishes.
+    ///
+    /// # Safety
+    /// The mapped file must not be modified externally while this function runs.
+    /// This is the standard documented caveat for memory-mapped I/O.
     pub fn from_file(path: &str) -> Result<Self, String> {
         let file = File::open(path).map_err(|e| e.to_string())?;
         let file_size = file.metadata().map_err(|e| e.to_string())?.len();
-        // Conservative estimate: 1 node per 50 bytes. Sets initial capacity without
-        // over-allocating, so the Vec grows at most once instead of doing
-        // log2(N) doublings from 0 → 32M with a 2× peak capacity needed.
-        let node_cap = (file_size / 50).min(200_000_000) as usize;
-        // Estimated unique bytes for val_strings: ~10% of the file (deduplication + JSON structure)
+
+        if file_size == 0 {
+            return Err("file is empty".to_string());
+        }
+
+        // Conservative capacity hints so the internal Vecs grow at most once.
+        let node_cap  = (file_size / 50).min(200_000_000) as usize;
         let str_bytes = (file_size / 10).min(500_000_000) as usize;
-        let reader = BufReader::with_capacity(1 << 20, file);
-        let mut de = serde_json::Deserializer::from_reader(reader);
-        parse_streaming_with_cap(&mut de, node_cap, str_bytes).map_err(|e| e.to_string())
+
+        // Map the file read-only. Safety: we only read, and the file is not
+        // modified during this call.
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+
+        let mut de = sonic_rs::Deserializer::from_slice(&mmap[..]);
+        let result = parse_streaming_with_cap(&mut de, node_cap, str_bytes)
+            .map_err(|e| e.to_string());
+
+        // mmap is dropped here: virtual address space released, no persistent overhead.
+        drop(mmap);
+        result
     }
 
     /// Truly streaming parsing: reads from disk in chunks without buffering in RAM.
