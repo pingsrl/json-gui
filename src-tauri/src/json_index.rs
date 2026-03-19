@@ -1187,6 +1187,7 @@ impl JsonIndex {
         // Map the file read-only for SIMD-accelerated parsing.
         // SAFETY: we only read; the file must not be modified while mapped.
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
 
         let str_max = if file_size >= VERY_LARGE_FILE_THRESHOLD_BYTES {
