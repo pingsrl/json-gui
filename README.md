@@ -190,6 +190,35 @@ cp .bench.env.example .bench.env
 cd src-tauri && cargo bench -- real_file
 ```
 
+### GitHub Actions perf smoke test
+
+A lightweight CI workflow is available in
+[`/.github/workflows/performance.yml`](.github/workflows/performance.yml).
+It generates a deterministic JSON dataset of about 64 MiB, then measures:
+
+- `load` via `JsonIndex::from_file`
+- `search_regex` over values
+- `expand_all` via the same BFS helper used by the Rust benchmarks
+
+Each run publishes:
+
+- a Markdown summary directly in the GitHub Actions job summary
+- a `rust-perf-smoke` artifact containing `perf-ci.json` and `perf-ci-summary.md`
+
+This is meant to track trends over time from the Actions panel, not to act as a
+strict pass/fail performance budget: GitHub-hosted runners are noisy.
+
+You can run the same smoke test locally with:
+
+```bash
+cd src-tauri
+cargo run --release --example perf_ci -- \
+  --size-mib 64 \
+  --iterations 3 \
+  --sample-path target/perf-ci-sample.json \
+  --output target/perf-ci.json
+```
+
 ### JavaScript (frontend)
 
 Measures `buildVisibleNodes`, Map copy cost, and streaming overhead on synthetic trees:

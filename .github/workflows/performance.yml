@@ -1,0 +1,126 @@
+name: Performance
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - ".github/workflows/performance.yml"
+      - "src-tauri/**"
+  pull_request:
+    paths:
+      - ".github/workflows/performance.yml"
+      - "src-tauri/**"
+  workflow_dispatch:
+
+concurrency:
+  group: performance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-perf-smoke:
+    name: Rust perf smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Run Rust performance smoke test
+        run: |
+          cargo run \
+            --manifest-path src-tauri/Cargo.toml \
+            --release \
+            --example perf_ci \
+            -- \
+            --size-mib 64 \
+            --iterations 3 \
+            --sample-path src-tauri/target/perf-ci-sample.json \
+            --output src-tauri/target/perf-ci.json
+
+      - name: Publish performance summary
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report_path = Path("src-tauri/target/perf-ci.json")
+          report = json.loads(report_path.read_text())
+
+          lines = [
+              "## Rust performance smoke test",
+              "",
+              (
+                  f"Dataset: `{report['dataset']['size_mib']:.1f} MiB`, "
+                  f"`{report['dataset']['node_count']}` nodes"
+              ),
+          ]
+          if report["dataset"]["generated"]:
+              lines.append(
+                  f"Generated items: `{report['dataset']['items']}` from "
+                  f"`{report['dataset']['path']}`"
+              )
+          else:
+              lines.append(f"Input file: `{report['dataset']['path']}`")
+          lines.extend(
+              [
+                  "",
+                  f"Search pattern: `{report['search']['pattern']}` over "
+                  f"`{report['search']['target']}` "
+                  f"(max `{report['search']['max_results']}` results, "
+                  f"observed `{report['search']['matches']}`)",
+                  f"Expand-all descendants visited: `{report['expand']['total_descendants']}`",
+                  "",
+                  "| Metric | Best | Median | Samples |",
+                  "|---|---:|---:|---|",
+              ]
+          )
+
+          for metric_name, key in [
+              ("load", "load"),
+              ("search_regex", "search_regex"),
+              ("expand_all", "expand_all"),
+          ]:
+              metric = report[key]
+              samples = ", ".join(f"{value:.2f} ms" for value in metric["samples_ms"])
+              lines.append(
+                  f"| {metric_name} | {metric['best_ms']:.2f} ms | "
+                  f"{metric['median_ms']:.2f} ms | {samples} |"
+              )
+
+          lines.extend(
+              [
+                  "",
+                  "These CI numbers are trend-oriented only. "
+                  "GitHub-hosted runners are noisy, so treat them as a smoke test "
+                  "and historical trace, not as a hard performance budget.",
+                  "",
+              ]
+          )
+
+          summary = "\n".join(lines)
+          Path("src-tauri/target/perf-ci-summary.md").write_text(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(summary)
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rust-perf-smoke
+          path: |
+            src-tauri/target/perf-ci.json
+            src-tauri/target/perf-ci-summary.md
+          retention-days: 30
