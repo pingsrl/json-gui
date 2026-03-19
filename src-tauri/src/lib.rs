@@ -130,7 +130,7 @@ pub fn run() {
             pending_content: std::sync::Mutex::new(HashMap::new()),
         })
         .setup(|app| {
-            // Windows/Linux: il file viene passato come argomento CLI
+            // Windows/Linux: the file is passed as a CLI argument
             let args: Vec<String> = std::env::args().collect();
             if let Some(path) = args.get(1) {
                 if path.ends_with(".json") {
@@ -138,7 +138,7 @@ pub fn run() {
                 }
             }
 
-            // ── Menu nativo ──────────────────────────────────────────────────
+            // ── Native menu ──────────────────────────────────────────────────
             let open_i = MenuItem::with_id(app, "open", "Apri...", true, Some("CmdOrCtrl+O"))?;
             let new_window_i = MenuItem::with_id(app, "new-window", "Nuova finestra", true, Some("CmdOrCtrl+N"))?;
             let close_window_i = PredefinedMenuItem::close_window(app, None)?;
@@ -300,16 +300,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            // macOS: file aperto via Finder / "Apri con"
+            // macOS: file opened via Finder / "Open with"
             #[cfg(target_os = "macos")]
             if let RunEvent::Opened { urls } = event {
                 for url in urls {
                     if let Ok(path) = url.to_file_path() {
                         if let Some(path_str) = path.to_str() {
-                            // Emetti per finestre già aperte (app già in esecuzione)
+                            // Emit for already-open windows (app already running)
                             let _ = app.emit("open-with", path_str.to_string());
-                            // Salva anche in initial_path: se il webview non era ancora
-                            // pronto all'emit, il frontend lo recupera via get_initial_path.
+                            // Also store in initial_path: if the webview was not yet
+                            // ready for the emit, the frontend retrieves it via get_initial_path.
                             let state = app.state::<AppState>();
                             let mut guard = state.initial_path.lock().unwrap();
                             if guard.is_none() {

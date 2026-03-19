@@ -2,7 +2,7 @@ use crate::json_index::{JsonIndex, NodeValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
-// ─── Schema (albero dei tipi inferiti) ───────────────────────────────────────
+// ─── Schema (inferred type tree) ─────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 enum Schema {
@@ -12,7 +12,7 @@ enum Schema {
     Null,
     Any,
     Arr(Box<Schema>),
-    /// (chiave, tipo, opzionale)
+    /// (key, type, optional)
     Obj(Vec<(String, Schema, bool)>),
 }
 
@@ -119,7 +119,7 @@ fn merge_obj_fields(a: Vec<(String, Schema, bool)>, b: Vec<(String, Schema, bool
     Schema::Obj(map.into_iter().map(|(k, (s, opt))| (k, s, opt)).collect())
 }
 
-// ─── TypeRef (riferimenti a tipi nominati) ────────────────────────────────────
+// ─── TypeRef (named type references) ─────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 enum TypeRef {
@@ -137,7 +137,7 @@ struct NamedObj {
     fields: Vec<(String, TypeRef, bool)>,
 }
 
-// ─── Namer ────────────────────────────────────────────────────────────────────
+// ─── Namer ───────────────────────────────────────────────────────────────────
 
 struct Namer {
     used: HashMap<String, u32>,
@@ -243,7 +243,7 @@ fn build_named_types(index: &JsonIndex) -> (Vec<NamedObj>, TypeRef) {
     (out, root_ref)
 }
 
-// ─── Helpers comuni ───────────────────────────────────────────────────────────
+// ─── Common helpers ───────────────────────────────────────────────────────────
 
 fn is_identifier(s: &str) -> bool {
     if s.is_empty() {
@@ -273,7 +273,7 @@ fn to_snake(s: &str) -> String {
             prev_upper = false;
         }
     }
-    // Rimuovi underscore consecutivi
+    // Remove consecutive underscores
     let deduped: String = result.chars().fold(String::new(), |mut acc, c| {
         if c == '_' && acc.ends_with('_') {
         } else {
@@ -282,7 +282,7 @@ fn to_snake(s: &str) -> String {
         acc
     });
     let trimmed = deduped.trim_matches('_').to_string();
-    // Parole riservate Rust
+    // Rust reserved words
     const RUST_KW: &[&str] = &[
         "type", "fn", "struct", "enum", "match", "use", "mod", "impl", "pub", "crate", "self",
         "super", "where", "let", "mut", "ref", "move", "dyn", "trait", "for", "in", "if", "else",
@@ -570,7 +570,7 @@ pub fn generate_python(index: &JsonIndex) -> String {
 
 // ─── JSON Schema ──────────────────────────────────────────────────────────────
 
-/// Scrive `s` come stringa JSON con escaping minimo.
+/// Writes `s` as a JSON string with minimal escaping.
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -592,7 +592,7 @@ fn json_str(s: &str) -> String {
     out
 }
 
-/// Restituisce lo schema JSON compatto come stringa (senza pretty-print).
+/// Returns the compact JSON schema as a string (no pretty-printing).
 fn typeref_to_json_schema(tr: &TypeRef) -> String {
     match tr {
         TypeRef::Str => r#"{"type":"string"}"#.to_string(),
@@ -610,8 +610,8 @@ fn typeref_to_json_schema(tr: &TypeRef) -> String {
 pub fn generate_json_schema(index: &JsonIndex) -> String {
     let (types, root_ref) = build_named_types(index);
 
-    // Costruisce il JSON Schema come stringa compatta, poi usa sonic_rs per
-    // il pretty-print (evita qualsiasi dipendenza da serde_json).
+    // Build the JSON Schema as a compact string, then use sonic_rs for
+    // pretty-printing (avoids any dependency on serde_json).
     let mut out = String::from(r#"{"$schema":"https://json-schema.org/draft/2020-12/schema""#);
 
     if !types.is_empty() {
@@ -652,7 +652,7 @@ pub fn generate_json_schema(index: &JsonIndex) -> String {
         out.push('}');
     }
 
-    // Fonde i campi del root schema nel top-level
+    // Merge the root schema fields into the top-level object
     let root_schema = typeref_to_json_schema(&root_ref);
     let inner = &root_schema[1..root_schema.len() - 1]; // strip { }
     if !inner.is_empty() {
@@ -661,7 +661,7 @@ pub fn generate_json_schema(index: &JsonIndex) -> String {
     }
     out.push('}');
 
-    // Pretty-print via sonic_rs
+    // Pretty-print using sonic_rs
     sonic_rs::from_str::<sonic_rs::Value>(&out)
         .ok()
         .and_then(|v| sonic_rs::to_string_pretty(&v).ok())

@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 // ---- StringPool ----
-// Usa Arc<str> per evitare la duplicazione dei byte tra Vec e HashMap:
-// Vec e HashMap condividono lo stesso heap tramite reference counting.
+// Uses Arc<str> to avoid byte duplication between Vec and HashMap:
+// Vec and HashMap share the same heap via reference counting.
 
 pub struct StringPool {
     pub strings: Vec<Arc<str>>,
@@ -46,28 +46,41 @@ impl StringPool {
 }
 
 // ---- InternedStrings ----
-// Pool compatto per i valori stringa: un unico Vec<u8> per i byte + tabella hash
-// open-addressing su Vec<u32> (4 byte/slot). Zero allocazioni per stringa,
-// zero raddoppio dei byte come in HashMap<String> o HashMap<Arc<str>>.
-// Memory per N stringhe uniche, T byte totali: T + 13N byte.
+// Compact pool for string values: a single Vec<u8> for bytes + open-addressing
+// hash table on Vec<u32> (4 bytes/slot). Zero allocations per string,
+// zero byte doubling as in HashMap<String> or HashMap<Arc<str>>.
+// Memory for N unique strings, T total bytes: T + 13N bytes.
 
 pub struct InternedStrings {
-    pub data: Vec<u8>,    // byte di tutte le stringhe uniche, concatenati
-    pub offsets: Vec<u32>, // inizio di ogni stringa in data
-    pub lens: Vec<u32>,   // lunghezza in byte di ogni stringa
-    index: Vec<u32>,      // tabella hash open-addressing: slot → (id+1), 0=libero
-    index_mask: u32,      // capacità - 1 (capacità è potenza di 2)
+    pub data: Vec<u8>,    // bytes of all unique strings, concatenated
+    pub offsets: Vec<u32>, // start of each string in data
+    pub lens: Vec<u32>,   // byte length of each string
+    index: Vec<u32>,      // open-addressing hash table: slot → (id+1), 0=empty
+    index_mask: u32,      // capacity - 1 (capacity is a power of 2)
 }
 
 impl InternedStrings {
     pub fn new() -> Self {
-        let cap = 1024usize;
+        Self::with_capacity(0, 0)
+    }
+
+    /// Pre-allocates internal buffers to avoid doublings during parsing.
+    /// `n_strings`: estimated number of unique strings (for offsets/lens/index).
+    /// `data_bytes`: estimated total bytes of unique strings (for data).
+    pub fn with_capacity(n_strings: usize, data_bytes: usize) -> Self {
+        // The hash table must have power-of-2 capacity ≥ n_strings / 0.75
+        let hash_cap = if n_strings == 0 {
+            1024usize
+        } else {
+            let min_cap = (n_strings * 4 / 3).next_power_of_two().max(1024);
+            min_cap
+        };
         Self {
-            data: Vec::new(),
-            offsets: Vec::new(),
-            lens: Vec::new(),
-            index: vec![0u32; cap],
-            index_mask: (cap - 1) as u32,
+            data: Vec::with_capacity(data_bytes),
+            offsets: Vec::with_capacity(n_strings),
+            lens: Vec::with_capacity(n_strings),
+            index: vec![0u32; hash_cap],
+            index_mask: (hash_cap - 1) as u32,
         }
     }
 
@@ -82,7 +95,7 @@ impl InternedStrings {
     }
 
     pub fn intern(&mut self, s: &str) -> u32 {
-        // Cresce l'indice se carico > 75%
+        // Grow the index if load > 75%
         if (self.offsets.len() + 1) * 4 > self.index.len() * 3 {
             self.grow_index();
         }
@@ -92,7 +105,7 @@ impl InternedStrings {
         loop {
             let entry = self.index[slot as usize];
             if entry == 0 {
-                // Slot libero: inserisce nuova stringa
+                // Empty slot: insert new string
                 let id = self.offsets.len() as u32;
                 self.offsets.push(self.data.len() as u32);
                 self.lens.push(bytes.len() as u32);
@@ -100,14 +113,14 @@ impl InternedStrings {
                 self.index[slot as usize] = id + 1;
                 return id;
             }
-            // Controlla se la stringa già presente corrisponde
+            // Check if the already-stored string matches
             let eid = (entry - 1) as usize;
             let start = self.offsets[eid] as usize;
             let len = self.lens[eid] as usize;
             if &self.data[start..start + len] == bytes {
                 return eid as u32;
             }
-            // Collisione: probing lineare
+            // Collision: linear probing
             slot = (slot + 1) & self.index_mask;
         }
     }
@@ -134,78 +147,105 @@ impl InternedStrings {
     pub fn get(&self, id: u32) -> &str {
         let start = self.offsets[id as usize] as usize;
         let len = self.lens[id as usize] as usize;
-        // SAFETY: solo stringhe UTF-8 valide inserite via intern(&str)
+        // SAFETY: only valid UTF-8 strings inserted via intern(&str)
         unsafe { std::str::from_utf8_unchecked(&self.data[start..start + len]) }
     }
 
     pub fn len(&self) -> usize {
         self.offsets.len()
     }
+
+    /// Looks up the id of an already-interned string without inserting it. O(1) amortized.
+    pub fn id_of(&self, s: &str) -> Option<u32> {
+        if self.offsets.is_empty() {
+            return None;
+        }
+        let bytes = s.as_bytes();
+        let hash = Self::fnv1a(bytes);
+        let mut slot = hash & self.index_mask;
+        loop {
+            let entry = self.index[slot as usize];
+            if entry == 0 {
+                return None; // not found
+            }
+            let eid = (entry - 1) as usize;
+            let start = self.offsets[eid] as usize;
+            let len = self.lens[eid] as usize;
+            if &self.data[start..start + len] == bytes {
+                return Some(eid as u32);
+            }
+            slot = (slot + 1) & self.index_mask;
+        }
+    }
 }
 
 // ---- NodeValue ----
 
-// NodeValue usa u32 per tutti i payload (Str=index in val_strings, Num=index in nums_pool)
-// così il payload max è 4 byte → enum occupa 8 byte invece di 16 (con f64 diretta).
-// Risparmio: 21M nodi × 8 byte = ~168 MB su file da 1GB.
+// NodeValue uses u32 for all payloads (Str=index in val_strings, Num=index in nums_pool)
+// so the max payload is 4 bytes → enum occupies 8 bytes instead of 16 (with direct f64).
+// Savings: 21M nodes × 8 bytes = ~168 MB on a 1 GB file.
 #[derive(Debug, Clone)]
 pub enum NodeValue {
     Object,
     Array,
-    Str(u32),  // index in JsonIndex.val_strings
-    Num(u32),  // index in JsonIndex.nums_pool: Vec<f64>
+    Str(u32),  // index into JsonIndex.val_strings
+    Num(u32),  // index into JsonIndex.nums_pool: Vec<f64>
     Bool(bool),
     Null,
 }
 
 // ---- Node ----
+//
+// Note: the node id (index in the Vec) always coincides with the preorder DFS index,
+// because the streaming parser allocates the parent before its children and children in order.
+// It is therefore not necessary to store preorder_index separately.
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    // id rimosso - usa l'indice nel Vec
-    pub parent: u32,          // u32::MAX = nodo root (no parent)
+    // id removed - use the index in the Vec (= preorder DFS index)
+    pub parent: u32,          // u32::MAX = root node (no parent)
     pub key: u32,             // u32::MAX = no key
     pub value: NodeValue,
     pub children_start: u32,
     pub children_len: u32,
     pub subtree_len: u32,
-    pub preorder_index: u32,
 }
 
-// ---- Parser streaming: zero allocazioni intermedie ----
+// ---- Streaming parser: zero intermediate allocations ----
 //
-// I Node finali vengono allocati DIRETTAMENTE durante lo streaming DFS.
-// La linked-list per i figli usa tre Vec<u32> paralleli (first_child, last_child,
-// next_sibling) invece di per-nodo Vec<u32> → zero doppia allocazione durante parsing.
-// finish_index linearizza le linked-list nel flat children_arena e calcola
-// preorder/subtree, poi droppa le tre Vec temporanee.
+// Final Nodes are allocated DIRECTLY during DFS streaming.
+// No temporary linked-lists needed: children_len values are updated in alloc(),
+// finish_index builds children_arena with prefix-sum + fill-by-id-order
+// using a single temporary Vec<u32> (pos[]) instead of 3 × 84 MB.
 
 struct StreamCtx {
     nodes: Vec<Node>,
-    first_child: Vec<u32>,   // first_child[id] = primo figlio di id, u32::MAX se foglia
-    last_child: Vec<u32>,    // last_child[id]  = ultimo figlio di id, per append O(1)
-    next_sibling: Vec<u32>,  // next_sibling[id] = fratello successivo, u32::MAX se ultimo
-    keys: StringPool,
+    keys: InternedStrings,
     val_strings: InternedStrings,
-    nums_pool: Vec<f64>,     // pool f64: NodeValue::Num(idx) → nums_pool[idx]
+    nums_pool: Vec<f64>,     // f64 pool: NodeValue::Num(idx) → nums_pool[idx]
 }
 
 impl StreamCtx {
     fn new() -> Self {
-        Self::with_capacity(0)
+        Self::with_capacity(0, 0)
     }
 
-    /// Pre-alloca i Vec principali per evitare il raddoppio durante il parsing.
-    /// `node_cap` = stima del numero di nodi (es. file_size / 50).
-    fn with_capacity(node_cap: usize) -> Self {
+    /// Pre-allocates the main Vecs to avoid doublings during parsing.
+    /// `node_cap`    = estimated nodes (file_size / 50).
+    /// `str_bytes`   = estimated unique bytes for val_strings (file_size / 10).
+    fn with_capacity(node_cap: usize, str_bytes: usize) -> Self {
+        // JSON keys: few short strings (e.g. field names). Estimate: 1% of nodes, 20 bytes/key.
+        let key_n = (node_cap / 100).max(64);
+        let key_bytes = key_n * 20;
+        // String values: ~30% of nodes, deduplicated bytes already passed as str_bytes.
+        let val_n = node_cap * 3 / 10;
+        // Numbers: ~20% of nodes.
+        let num_cap = node_cap / 5;
         Self {
             nodes: Vec::with_capacity(node_cap),
-            first_child: Vec::with_capacity(node_cap),
-            last_child: Vec::with_capacity(node_cap),
-            next_sibling: Vec::with_capacity(node_cap),
-            keys: StringPool::new(),
-            val_strings: InternedStrings::new(),
-            nums_pool: Vec::new(),
+            keys: InternedStrings::with_capacity(key_n, key_bytes),
+            val_strings: InternedStrings::with_capacity(val_n, str_bytes),
+            nums_pool: Vec::with_capacity(num_cap),
         }
     }
 
@@ -215,22 +255,11 @@ impl StreamCtx {
             parent,
             key,
             value,
-            children_start: 0,  // riempito in finish_index
-            children_len: 0,    // incrementato ad ogni figlio
-            subtree_len: 1,     // riempito in finish_index
-            preorder_index: 0,  // riempito in finish_index
+            children_start: 0,  // filled in finish_index
+            children_len: 0,    // incremented below
+            subtree_len: 1,     // filled in finish_index
         });
-        self.first_child.push(u32::MAX);
-        self.last_child.push(u32::MAX);
-        self.next_sibling.push(u32::MAX);
         if parent != u32::MAX {
-            let last = self.last_child[parent as usize];
-            if last == u32::MAX {
-                self.first_child[parent as usize] = id;
-            } else {
-                self.next_sibling[last as usize] = id;
-            }
-            self.last_child[parent as usize] = id;
             self.nodes[parent as usize].children_len += 1;
         }
         id
@@ -259,7 +288,7 @@ struct ValVisitor {
 impl<'de> Visitor<'de> for ValVisitor {
     type Value = u32;
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "un valore JSON")
+        write!(f, "a JSON value")
     }
     fn visit_bool<E: de::Error>(self, v: bool) -> Result<u32, E> {
         Ok(self.ctx.borrow_mut().alloc(NodeValue::Bool(v), self.parent, self.key))
@@ -320,51 +349,52 @@ impl<'de> Visitor<'de> for ValVisitor {
     }
 }
 
-/// Finalizza il JsonIndex: linearizza le linked-list in un flat children_arena,
-/// poi calcola preorder_index e subtree_len. Le tre Vec temporanee vengono droppate
-/// non appena non servono più, minimizzando il picco di RAM.
+/// Finalizes the JsonIndex: builds children_arena with prefix-sum + fill-by-id-order,
+/// then computes subtree_len bottom-up.
+/// Zero temporary Vecs: reuses children_start as a fill cursor, then recomputes it.
+/// The property that makes the algorithm correct: the streaming parser allocates nodes in
+/// DFS preorder, so children of the same parent have increasing ids in visit order.
 fn finish_index(ctx: StreamCtx) -> JsonIndex {
-    let StreamCtx { mut nodes, first_child, last_child: _, next_sibling, keys, val_strings, nums_pool } = ctx;
+    let StreamCtx { mut nodes, keys, val_strings, nums_pool } = ctx;
 
     let n = nodes.len();
     let total_children: usize = nodes.iter().map(|nd| nd.children_len as usize).sum();
-    let mut children_arena: Vec<u32> = Vec::with_capacity(total_children);
 
-    // Linearizza le linked-list in children_arena e aggiorna children_start in ogni Node
-    for id in 0..n {
-        let children_start = children_arena.len() as u32;
-        let mut c = first_child[id];
-        while c != u32::MAX {
-            children_arena.push(c);
-            c = next_sibling[c as usize];
-        }
-        nodes[id].children_start = children_start;
-        // children_len già impostato durante alloc()
-    }
-
-    // Droppa subito le tre Vec temporanee (~3 × 84 MB = 252 MB liberati)
-    drop(first_child);
-    drop(next_sibling);
-
-    // Calcola preorder_index (DFS iterativo)
-    let mut next_preorder = 0u32;
-    let mut stack = vec![0u32];
-    while let Some(nid) = stack.pop() {
-        nodes[nid as usize].preorder_index = next_preorder;
-        next_preorder += 1;
-        let nd = &nodes[nid as usize];
-        let (s, e) = (nd.children_start as usize, (nd.children_start + nd.children_len) as usize);
-        for &c in children_arena[s..e].iter().rev() {
-            stack.push(c);
+    // Step 1: children_start = prefix-sum of children_len
+    {
+        let mut sum = 0u32;
+        for node in &mut nodes {
+            node.children_start = sum;
+            sum += node.children_len;
         }
     }
 
-    // Calcola subtree_len (bottom-up)
-    for idx in (0..nodes.len()).rev() {
-        let (s, e) = {
-            let nd = &nodes[idx];
-            (nd.children_start as usize, (nd.children_start + nd.children_len) as usize)
-        };
+    // Passo 2: riempie children_arena in ordine crescente di id.
+    // Usa children_start come cursore temporaneo (viene sovrascritto e poi ricalcolato).
+    // Zero allocazioni extra: nessun Vec<u32> pos[] separato.
+    let mut children_arena: Vec<u32> = vec![0u32; total_children];
+    for id in 1..n as u32 {
+        let parent = nodes[id as usize].parent;
+        let slot = nodes[parent as usize].children_start as usize;
+        children_arena[slot] = id;
+        nodes[parent as usize].children_start += 1;
+    }
+
+    // Passo 3: ripristina children_start ai valori corretti (prefix-sum)
+    {
+        let mut sum = 0u32;
+        for node in &mut nodes {
+            let len = node.children_len;
+            node.children_start = sum;
+            sum += len;
+        }
+    }
+
+    // Calcola subtree_len (bottom-up: foglie prima, poi risale)
+    for idx in (0..n).rev() {
+        let nd = &nodes[idx];
+        let s = nd.children_start as usize;
+        let e = s + nd.children_len as usize;
         let sub: u32 = children_arena[s..e].iter().map(|&c| nodes[c as usize].subtree_len).sum();
         nodes[idx].subtree_len = 1 + sub;
     }
@@ -373,11 +403,11 @@ fn finish_index(ctx: StreamCtx) -> JsonIndex {
 }
 
 fn parse_streaming<'de, D: de::Deserializer<'de>>(de: D) -> Result<JsonIndex, D::Error> {
-    parse_streaming_with_cap(de, 0)
+    parse_streaming_with_cap(de, 0, 0)
 }
 
-fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(de: D, node_cap: usize) -> Result<JsonIndex, D::Error> {
-    let ctx = Rc::new(RefCell::new(StreamCtx::with_capacity(node_cap)));
+fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(de: D, node_cap: usize, str_bytes: usize) -> Result<JsonIndex, D::Error> {
+    let ctx = Rc::new(RefCell::new(StreamCtx::with_capacity(node_cap, str_bytes)));
     de.deserialize_any(ValVisitor { ctx: Rc::clone(&ctx), parent: u32::MAX, key: u32::MAX })?;
     Ok(finish_index(Rc::try_unwrap(ctx).ok().expect("ctx: more than one Rc reference").into_inner()))
 }
@@ -387,7 +417,7 @@ fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(de: D, node_cap: usiz
 pub struct JsonIndex {
     pub nodes: Vec<Node>,
     pub children: Vec<u32>,
-    pub keys: StringPool,
+    pub keys: InternedStrings,
     pub val_strings: InternedStrings, // stringhe dei valori: pool compatto zero-alloc
     pub nums_pool: Vec<f64>,          // valori numerici: NodeValue::Num(idx) → nums_pool[idx]
     pub root: u32,
@@ -458,9 +488,11 @@ impl JsonIndex {
         // sovra-allocare, così il Vec cresce al massimo una volta invece di fare
         // log2(N) raddoppi da 0 → 32M con un picco di capacità 2× necessario.
         let node_cap = (file_size / 50).min(200_000_000) as usize;
+        // Stima byte unici per val_strings: ~10% del file (deduplicazione + struttura JSON)
+        let str_bytes = (file_size / 10).min(500_000_000) as usize;
         let reader = BufReader::with_capacity(1 << 20, file);
         let mut de = serde_json::Deserializer::from_reader(reader);
-        parse_streaming_with_cap(&mut de, node_cap).map_err(|e| e.to_string())
+        parse_streaming_with_cap(&mut de, node_cap, str_bytes).map_err(|e| e.to_string())
     }
 
     /// Parsing veramente streaming: legge dal disco a chunk senza buffering in RAM.
@@ -1031,7 +1063,8 @@ impl JsonIndex {
             .collect();
 
         matched_ids
-            .par_sort_unstable_by_key(|&node_id| self.nodes[node_id as usize].preorder_index);
+            // node_id == DFS preorder index (invariante del parser streaming)
+            .par_sort_unstable();
         matched_ids.truncate(max_results);
         matched_ids
     }
@@ -1048,11 +1081,8 @@ impl JsonIndex {
         };
         let prefix_lower = segment_prefix.to_lowercase();
 
-        let mut suggestions: Vec<&str> = self
-            .keys
-            .strings
-            .iter()
-            .map(|s| s.as_ref())
+        let mut suggestions: Vec<&str> = (0..self.keys.len() as u32)
+            .map(|id| self.keys.get(id))
             .filter(|candidate| {
                 if segment_prefix.is_empty() {
                     true
@@ -1484,18 +1514,14 @@ mod tests {
     }
 
     #[test]
-    fn preorder_index_matches_file_order() {
+    fn node_id_is_preorder_index() {
+        // Il parser streaming alloca in DFS preorder: node_id coincide con l'ordine di visita.
         let index = idx(r#"{"a":{"x":1},"b":2}"#);
         let a_id = index.get_children_slice(index.root)[0];
         let b_id = index.get_children_slice(index.root)[1];
         let x_id = index.get_children_slice(a_id)[0];
-
-        assert!(
-            index.nodes[a_id as usize].preorder_index < index.nodes[x_id as usize].preorder_index
-        );
-        assert!(
-            index.nodes[x_id as usize].preorder_index < index.nodes[b_id as usize].preorder_index
-        );
+        // root < a < x < b in DFS preorder
+        assert!(a_id < x_id && x_id < b_id);
     }
 
     // ── node values ───────────────────────────────────────────────────────────
@@ -1549,15 +1575,10 @@ mod tests {
     fn string_pool_deduplicates_keys() {
         let index = idx(r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#);
         // "name" deve essere internato una volta sola
-        assert_eq!(
-            index
-                .keys
-                .strings
-                .iter()
-                .filter(|s| s.as_ref() == "name")
-                .count(),
-            1
-        );
+        let name_count = (0..index.keys.len() as u32)
+            .filter(|&id| index.keys.get(id) == "name")
+            .count();
+        assert_eq!(name_count, 1);
     }
 
     #[test]

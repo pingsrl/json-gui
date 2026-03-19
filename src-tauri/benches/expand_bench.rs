@@ -1,18 +1,18 @@
-/// Benchmark delle operazioni critiche di JsonGUI.
+/// Benchmarks for the critical operations of JsonGUI.
 ///
-/// Esegui con:
+/// Run with:
 ///   cd src-tauri && cargo bench
 ///   cargo bench -- --output-format verbose
 ///
-/// Report HTML in: src-tauri/target/criterion/
+/// HTML reports in: src-tauri/target/criterion/
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use json_gui_lib::json_index::{JsonIndex, NodeValue};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 
-// ── Generatori di JSON sintetico ──────────────────────────────────────────────
+// ── Synthetic JSON generators ─────────────────────────────────────────────────
 
-/// Array di N oggetti piatti: [{"id":0,"name":"item0","value":42}, ...]
+/// Array of N flat objects: [{"id":0,"name":"item0","value":42}, ...]
 fn flat_array_json(n: usize) -> String {
     let mut s = String::with_capacity(n * 50);
     s.push('[');
@@ -32,7 +32,7 @@ fn flat_array_json(n: usize) -> String {
     s
 }
 
-/// Array di N oggetti con array annidato:
+/// Array of N objects with a nested array:
 /// [{"id":0,"tags":["a","b","c"],"meta":{"x":1,"y":2}}, ...]
 fn nested_array_json(n: usize) -> String {
     let mut s = String::with_capacity(n * 100);
@@ -54,10 +54,10 @@ fn nested_array_json(n: usize) -> String {
     s
 }
 
-// ── Simulazione della logica di expand_all ────────────────────────────────────
+// ── Simulation of expand_all logic ───────────────────────────────────────────
 
-/// Riproduce il BFS di expand_all in comandi::expand_all senza IPC.
-/// Misura: quanto tempo richiede la sola costruzione dei NodeDto.
+/// Reproduces the expand_all BFS without IPC.
+/// Measures: time required solely to build the NodeDto objects.
 fn bfs_collect_all_dtos(index: &JsonIndex) -> Vec<(u32, Vec<NodeDtoSimple>)> {
     let mut result = Vec::new();
     let mut queue = VecDeque::new();
@@ -81,7 +81,7 @@ fn bfs_collect_all_dtos(index: &JsonIndex) -> Vec<(u32, Vec<NodeDtoSimple>)> {
     result
 }
 
-/// DTO minimalista che replica la struttura di produzione.
+/// Minimal DTO that mirrors the production structure.
 #[derive(Debug)]
 struct NodeDtoSimple {
     id: u32,
@@ -126,12 +126,12 @@ fn node_to_dto_simple(index: &JsonIndex, id: u32) -> NodeDtoSimple {
     }
 }
 
-// ── Serde JSON serialization cost ────────────────────────────────────────────
+// ── Serde JSON serialization cost ─────────────────────────────────────────────
 
-/// Simula il costo di serializzare get_expanded_slice nel formato compatto a tuple.
-/// Ogni row: [id, parent_id, key_idx, type_byte, preview, children_count, depth]
+/// Simulates the cost of serializing get_expanded_slice in the compact tuple format.
+/// Each row: [id, parent_id, key_idx, type_byte, preview, children_count, depth]
 fn serialize_compact_slice(nodes: &[(u32, &NodeDtoSimple)]) -> String {
-    // Pool locale di chiavi (simula quello di produzione)
+    // Local key pool (mirrors the production one)
     let mut key_pool: Vec<&str> = Vec::new();
     let mut key_pool_keys: Vec<Option<&str>> = Vec::new();
 
@@ -166,7 +166,7 @@ fn serialize_compact_slice(nodes: &[(u32, &NodeDtoSimple)]) -> String {
     }
     rows.push(']');
 
-    // Serializza il pool di chiavi
+    // Serialize the key pool
     let mut pool_json = String::from("[");
     for (i, k) in key_pool.iter().enumerate() {
         if i > 0 { pool_json.push(','); }
@@ -233,9 +233,9 @@ fn bench_bfs_dto(c: &mut Criterion) {
 
 fn bench_serialization(c: &mut Criterion) {
     let mut group = c.benchmark_group("ipc_serialization");
-    // Simula get_expanded_slice con il formato compatto a tuple.
-    // Appiattisce tutte le coppie (parent_id, Vec<NodeDtoSimple>) in una
-    // slice flat che corrisponde a quello che fa get_expanded_slice.
+    // Simulates get_expanded_slice with the compact tuple format.
+    // Flattens all (parent_id, Vec<NodeDtoSimple>) pairs into a flat
+    // slice matching what get_expanded_slice produces.
     let index = JsonIndex::from_str(&flat_array_json(10_000)).unwrap();
     let all = bfs_collect_all_dtos(&index);
     let flat: Vec<(u32, NodeDtoSimple)> = all.into_iter()
@@ -268,11 +268,11 @@ fn bench_build_raw(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Benchmark su file reale ───────────────────────────────────────────────────
+// ── Benchmark on a real file ──────────────────────────────────────────────────
 
-/// Legge KEY=value da un file .env (solo la variabile richiesta, no dipendenze extra).
+/// Reads KEY=value from a .env file (only the requested variable, no extra dependencies).
 fn read_dotenv(key: &str) -> Option<String> {
-    // Cerca in .bench.env nella directory del workspace (due livelli su rispetto a benches/)
+    // Look for .bench.env in the workspace root (two levels up from benches/)
     let candidates = ["../.bench.env", ".bench.env"];
     for candidate in candidates {
         let Ok(content) = std::fs::read_to_string(candidate) else {
@@ -293,36 +293,36 @@ fn read_dotenv(key: &str) -> Option<String> {
     None
 }
 
-/// Misura il BFS su un file JSON reale.
-/// Cerca BENCH_JSON_PATH in: variabile d'ambiente, poi .bench.env nella root del progetto.
+/// Measures BFS traversal on a real JSON file.
+/// Looks for BENCH_JSON_PATH in: environment variable, then .bench.env in the project root.
 fn bench_real_file(c: &mut Criterion) {
     let path = std::env::var("BENCH_JSON_PATH")
         .ok()
         .or_else(|| read_dotenv("BENCH_JSON_PATH"));
     let Some(path) = path else {
         eprintln!(
-            "[bench_real_file] Imposta BENCH_JSON_PATH in .bench.env o come variabile d'ambiente"
+            "[bench_real_file] Set BENCH_JSON_PATH in .bench.env or as an environment variable"
         );
         return;
     };
 
     if !std::path::Path::new(&path).exists() {
-        eprintln!("[bench_real_file] File non trovato: {path}");
+        eprintln!("[bench_real_file] File not found: {path}");
         return;
     }
 
-    eprintln!("[bench_real_file] Caricamento {path} ...");
+    eprintln!("[bench_real_file] Loading {path} ...");
     let index = JsonIndex::from_file(&path).expect("parse failed");
     let node_count = index.nodes.len();
-    eprintln!("[bench_real_file] {node_count} nodi caricati");
+    eprintln!("[bench_real_file] {node_count} nodes loaded");
 
     let mut group = c.benchmark_group("real_file");
-    // File molto grande: bastano poche iterazioni
+    // Very large file: a few iterations are enough
     group.sample_size(10);
     group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(node_count as u64));
 
-    // 1. Solo BFS (conteggio nodi) — isola overhead di attraversamento
+    // 1. BFS only (node count) — isolates traversal overhead
     group.bench_function("bfs_traverse_only", |b| {
         b.iter(|| {
             let mut count = 0u64;
@@ -344,7 +344,7 @@ fn bench_real_file(c: &mut Criterion) {
         });
     });
 
-    // 2. BFS + costruzione NodeDto — simula il lavoro reale di expand_all
+    // 2. BFS + NodeDto build — simulates the real work of expand_all
     group.bench_function("bfs_dto_build", |b| {
         b.iter(|| bfs_collect_all_dtos(black_box(&index)));
     });

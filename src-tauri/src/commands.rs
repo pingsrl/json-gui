@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tauri::{Emitter, Manager, State, WindowEvent};
 
-/// Wrapper attorno a un `Read` che emette una callback ogni volta che la percentuale avanza.
+/// Wrapper around a `Read` that fires a callback each time the progress percentage advances.
 struct ProgressReader<R: Read, F: Fn(u8)> {
     inner: R,
     bytes_read: u64,
@@ -49,18 +49,18 @@ impl<R: Read, F: Fn(u8)> Read for ProgressReader<R, F> {
 }
 
 pub struct AppState {
-    /// Mappa label-finestra → indice JSON per questa finestra.
-    /// RwLock esterno protegge la mappa; RwLock interno protegge l'indice per finestra,
-    /// permettendo letture concorrenti (search, get_children, …) sulla stessa finestra.
+    /// Map window-label → JSON index for that window.
+    /// The outer RwLock protects the map; the inner RwLock protects the per-window index,
+    /// allowing concurrent reads (search, get_children, …) on the same window.
     pub windows: RwLock<HashMap<String, Arc<RwLock<Option<JsonIndex>>>>>,
     pub initial_path: std::sync::Mutex<Option<String>>,
-    /// JSON grezzo pre-caricato per una finestra aperta via "Apri in nuova finestra".
-    /// Chiave = label finestra; consumato una sola volta da get_pending_content.
+    /// Raw JSON pre-loaded for a window opened via "Open in new window".
+    /// Key = window label; consumed exactly once by get_pending_content.
     pub pending_content: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl AppState {
-    /// Restituisce (o crea) l'Arc<RwLock<Option<JsonIndex>>> per la finestra indicata.
+    /// Returns (or creates) the Arc<RwLock<Option<JsonIndex>>> for the given window.
     pub fn window_index(&self, label: &str) -> Arc<RwLock<Option<JsonIndex>>> {
         {
             let read = self.windows.read().unwrap();
@@ -76,7 +76,7 @@ impl AppState {
         )
     }
 
-    /// Rimuove l'indice associato a una finestra (chiamato alla sua distruzione).
+    /// Removes the index associated with a window (called on window destruction).
     pub fn remove_window(&self, label: &str) {
         self.windows.write().unwrap().remove(label);
         self.pending_content.lock().unwrap().remove(label);
@@ -109,8 +109,8 @@ pub struct SearchResult {
     pub key: Option<String>,
     pub value_preview: String,
     pub kind: &'static str,
-    /// Arc<str> invece di String: tutti i risultati dello stesso search_objects
-    /// condividono la stessa stringa via reference-counting (O(1) clone).
+    /// Arc<str> instead of String: all results from the same search_objects call
+    /// share the same string via reference-counting (O(1) clone).
     pub match_preview: Option<Arc<str>>,
 }
 
@@ -162,7 +162,7 @@ pub struct ExpandToResult {
 }
 
 
-/// Tronca una stringa UTF-8 in modo sicuro al massimo `max_chars` caratteri.
+/// Safely truncates a UTF-8 string to at most `max_chars` characters.
 fn truncate_str(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((idx, _)) => &s[..idx],
@@ -170,7 +170,7 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
     }
 }
 
-/// Tipo del nodo come byte per il formato compatto IPC (get_expanded_slice).
+/// Node type as a byte for the compact IPC format (get_expanded_slice).
 /// 0=object, 1=array, 2=string, 3=number, 4=boolean, 5=null
 fn node_type_byte(value: &NodeValue) -> u8 {
     match value {
@@ -183,8 +183,8 @@ fn node_type_byte(value: &NodeValue) -> u8 {
     }
 }
 
-/// Preview testuale del valore di un nodo, riutilizzata da node_to_dto e dal
-/// formato compatto di get_expanded_slice.
+/// Text preview of a node's value, shared by node_to_dto and the compact
+/// format of get_expanded_slice.
 fn node_value_preview(value: &NodeValue, children_len: usize, val_strings: &InternedStrings, nums_pool: &[f64]) -> Cow<'static, str> {
     match value {
         NodeValue::Object => {
@@ -252,7 +252,7 @@ pub async fn open_file(
         let file_size = std::fs::metadata(&path_clone).map(|m| m.len()).unwrap_or(0);
 
         let index = if file_size > STREAMING_THRESHOLD {
-            // File >200MB: streaming con progress events solo alla finestra chiamante
+            // File >200MB: stream with progress events sent only to the calling window
             let file = std::fs::File::open(&path_clone).map_err(|e| e.to_string())?;
             let reader = ProgressReader::new(BufReader::new(file), file_size, move |pct| {
                 window_clone.emit("parse-progress", pct).ok();
@@ -300,10 +300,10 @@ pub async fn get_children(
     Ok(children)
 }
 
-/// Espande ricorsivamente il sotto-albero radicato in `node_id`.
-/// Restituisce una lista di coppie (parent_id, figli) per ogni nodo con figli
-/// nel sotto-albero. Limitato a `max_nodes` nodi totali (default 50_000) per
-/// evitare IPC eccessivi su sotto-alberi enormi.
+/// Recursively expands the subtree rooted at `node_id`.
+/// Returns a list of (parent_id, children) pairs for every node that has children
+/// in the subtree. Capped at `max_nodes` total nodes (default 50_000) to
+/// avoid excessive IPC on very large subtrees.
 #[tauri::command]
 pub async fn expand_subtree(
     node_id: u32,
@@ -394,7 +394,7 @@ pub async fn search(
             };
             SearchResult {
                 node_id: id,
-                file_order: node.preorder_index,
+                file_order: id,
                 path,
                 key: if node.key == u32::MAX { None } else { Some(index.keys.get(node.key).to_string()) },
                 value_preview,
@@ -481,7 +481,7 @@ pub async fn search_objects(
         .map(|id| {
             let node = &index.nodes[id as usize];
             let children_len = node.children_len as usize;
-            // Inline value_preview per oggetti: evita di costruire NodeDto completo
+            // Inline value_preview for objects: avoids building a full NodeDto
             let value_preview = if children_len == 0 {
                 "{}".to_string()
             } else {
@@ -489,7 +489,7 @@ pub async fn search_objects(
             };
             SearchResult {
                 node_id: id,
-                file_order: node.preorder_index,
+                file_order: id,
                 path: index.get_path(id),
                 key: if node.key == u32::MAX { None } else { Some(index.keys.get(node.key).to_string()) },
                 value_preview,
@@ -514,9 +514,9 @@ pub async fn suggest_property_paths(
     Ok(index.suggest_property_paths(&prefix, limit))
 }
 
-/// Restituisce per ogni antenato di node_id (da root a parent) la coppia (id, figli),
-/// piu' il path del nodo target, così il frontend può espandere l'intero path
-/// e ottenere il path in un singolo IPC call.
+/// For each ancestor of node_id (from root to direct parent) returns the pair (id, children),
+/// plus the path of the target node, so the frontend can expand the full path
+/// and retrieve it in a single IPC call.
 #[tauri::command]
 pub async fn expand_to(
     node_id: u32,
@@ -536,7 +536,7 @@ pub async fn expand_to(
         chain.push(parent_id);
         current = parent_id;
     }
-    chain.reverse(); // da root verso il parent diretto
+    chain.reverse(); // from root toward the direct parent
 
     let expansions: Vec<(u32, Vec<NodeDto>)> = chain
         .into_iter()
@@ -555,15 +555,15 @@ pub async fn expand_to(
     Ok(ExpandToResult { expansions, path })
 }
 
-/// Formato compatto per get_expanded_slice: tuple invece di oggetti JSON con nomi
-/// di campo ripetuti. Ogni row è [id, parent_id, key_idx, type, preview, n_children, depth]
-/// con key_idx come indice nel pool locale di chiavi deduplicate (-1 = nessuna chiave).
-/// Risparmio tipico: ~70% vs ExpandedSliceResult con NodeDto a campi nominati.
+/// Compact format for get_expanded_slice: tuples instead of JSON objects with repeated
+/// field names. Each row is [id, parent_id, key_idx, type, preview, n_children, depth]
+/// where key_idx is an index into the local deduplicated key pool (-1 = no key).
+/// Typical saving: ~70% vs ExpandedSliceResult with named-field NodeDto objects.
 #[derive(Serialize)]
 pub struct CompactExpandedSliceResult {
     pub offset: usize,
     pub total_count: usize,
-    /// Pool locale di chiavi uniche per questo slice; indexato da key_idx nelle row.
+    /// Local pool of unique keys for this slice; indexed by key_idx in the rows.
     pub key_pool: Vec<String>,
     /// [id, parent_id (-1=root), key_idx (-1=none), type_byte, preview, children_count, depth]
     pub rows: Vec<(u32, i32, i32, u8, String, u32, u32)>,
@@ -581,8 +581,8 @@ pub async fn get_expanded_slice(
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let slice = index.get_expanded_slice(offset, limit);
 
-    // Pool locale di chiavi per questo slice: evita di ripetere la stessa stringa
-    // per ogni nodo che condivide il nome di campo (es. "id", "name", …).
+    // Local key pool for this slice: avoids repeating the same string
+    // for every node that shares a field name (e.g. "id", "name", …).
     let mut key_pool: Vec<String> = Vec::new();
     let mut key_pool_ids: Vec<u32> = Vec::new(); // parallel: key_pool_ids[i] = string-pool id
 
@@ -595,7 +595,7 @@ pub async fn get_expanded_slice(
             -1
         } else {
             let kid = node.key;
-            // ricerca lineare sul pool locale (solitamente < 200 entry → cache-friendly)
+            // linear search on the local pool (usually < 200 entries → cache-friendly)
             match key_pool_ids.iter().position(|&k| k == kid) {
                 Some(pos) => pos as i32,
                 None => {
@@ -639,9 +639,9 @@ pub async fn get_raw(
     Ok(index.build_raw(node_id))
 }
 
-/// Apre il sotto-albero di `node_id` in una nuova finestra come JSON indipendente.
-/// Il JSON grezzo viene salvato in `pending_content` per il label della nuova finestra;
-/// la nuova finestra lo legge tramite `get_pending_content` all'avvio.
+/// Opens the subtree of `node_id` in a new window as an independent JSON document.
+/// The raw JSON is stored in `pending_content` under the new window's label;
+/// the new window reads it via `get_pending_content` on startup.
 #[tauri::command]
 pub async fn open_in_new_window(
     node_id: u32,
@@ -681,7 +681,7 @@ pub async fn open_in_new_window(
     .build()
     .map_err(|e| e.to_string())?;
 
-    // Cleanup all'uscita
+    // Cleanup on window close
     let app_clone = app.clone();
     let lbl = label.clone();
     new_window.on_window_event(move |event| {
@@ -693,8 +693,8 @@ pub async fn open_in_new_window(
     Ok(())
 }
 
-/// Restituisce (e consuma) il JSON pre-caricato per questa finestra, se presente.
-/// Usato da finestre aperte tramite "Apri in nuova finestra" per caricare il subtree.
+/// Returns (and consumes) the pre-loaded JSON for this window, if any.
+/// Used by windows opened via "Open in new window" to load the subtree.
 #[tauri::command]
 pub fn get_pending_content(
     webview_window: tauri::WebviewWindow,
