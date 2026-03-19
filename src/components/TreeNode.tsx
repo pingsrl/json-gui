@@ -30,10 +30,20 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
   const isSelected = selectedNodeId === node.id;
   const isFocused = focusedNodeId === node.id;
 
-  const handleClick = () => {
-    selectNode(node);
+  const handleSelect = () => {
+    void selectNode(node);
+  };
+
+  const handleToggle = (e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    if (!hasChildren) return;
+    void toggleNode(node.id);
+  };
+
+  const handleDoubleClick = () => {
+    handleSelect();
     if (hasChildren) {
-      toggleNode(node.id);
+      void toggleNode(node.id);
     }
   };
 
@@ -62,12 +72,25 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
             : "hover:bg-gray-100 dark:hover:bg-gray-700"
       }`}
       style={{ paddingLeft: `${depth * 16 + 8}px` }}
-      onClick={handleClick}
+      onClick={handleSelect}
+      onDoubleClick={handleDoubleClick}
       onContextMenu={handleContextMenu}
       title={node.value_preview}
       data-node-id={node.id}
     >
-      <span className="w-4 text-gray-400 dark:text-gray-500 flex-shrink-0 flex items-center justify-center">
+      <button
+        type="button"
+        aria-label={
+          hasChildren
+            ? isExpanded
+              ? "Collapse node"
+              : "Expand node"
+            : "Leaf node"
+        }
+        className="w-4 text-gray-400 dark:text-gray-500 flex-shrink-0 flex items-center justify-center disabled:cursor-default"
+        disabled={!hasChildren}
+        onClick={handleToggle}
+      >
         {hasChildren ? (
           isExpanded ? (
             <ChevronDown size={12} />
@@ -75,7 +98,7 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
             <ChevronRight size={12} />
           )
         ) : null}
-      </span>
+      </button>
       {node.key !== null && (
         <span className="text-gray-700 dark:text-gray-300 flex-shrink-0">
           {node.key}:&nbsp;

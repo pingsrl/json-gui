@@ -21,6 +21,7 @@ sonic-rs = "0.5"
 rayon = "1"
 regex = "1"
 memmap2 = "0.9"
+memchr = "2"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["sync", "time"] }
 tauri-plugin-dialog = "2"

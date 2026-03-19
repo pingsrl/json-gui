@@ -1865,6 +1865,7 @@ name = "json-gui"
 version = "1.0.0"
 dependencies = [
  "criterion",
+ "memchr",
  "memmap2",
  "rayon",
  "regex",
