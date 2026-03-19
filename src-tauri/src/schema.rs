@@ -66,7 +66,7 @@ fn merge_object_array(index: &JsonIndex, ids: &[u32]) -> Schema {
     let total = ids.len();
     let mut fields: BTreeMap<String, (Vec<Schema>, usize)> = BTreeMap::new();
     for &oid in ids {
-        for &cid in index.get_children_slice(oid).iter() {
+        for cid in index.children_iter(oid) {
             let key = index.nodes[cid as usize].key()
                 .map_or_else(String::new, |k| index.keys.get(k).to_string());
             let e = fields.entry(key).or_default();
