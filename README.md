@@ -202,6 +202,7 @@ It generates a deterministic JSON dataset of about 64 MiB, then measures:
 - `search_objects` with a nested property path filter
 - `expand_all` via the same BFS helper used by the Rust benchmarks
 - structural memory metrics from the built index (`heap_bytes_estimate`, bytes per node, bytes per input byte)
+- component-level memory breakdown (`nodes`, `parent_index`, `container_meta`, `keys`, `value_strings`, `numbers`)
 
 Each run publishes:
 

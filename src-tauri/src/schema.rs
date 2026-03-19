@@ -229,8 +229,7 @@ fn collect_schema(
 }
 
 fn build_named_types(index: &JsonIndex) -> (Vec<NamedObj>, TypeRef) {
-    let root_node = &index.nodes[index.root as usize];
-    let root_children_len = root_node.children_len as usize;
+    let root_children_len = index.children_len(index.root) as usize;
     let root_sample: Vec<u32> = index.children_iter(index.root).take(SAMPLE_LIMIT).collect();
     let schema = match root_children_len {
         0 => Schema::Any,

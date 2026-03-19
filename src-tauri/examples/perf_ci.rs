@@ -1,4 +1,6 @@
-use json_gui_lib::json_index::{JsonIndex, Node, ObjectSearchFilter, ObjectSearchOperator};
+use json_gui_lib::json_index::{
+    HeapBytesBreakdown, JsonIndex, Node, ObjectSearchFilter, ObjectSearchOperator,
+};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::env;
@@ -72,6 +74,12 @@ struct MemoryInfo {
     bytes_per_node: f64,
     bytes_per_input_byte: f64,
     node_size_bytes: usize,
+    nodes_bytes_estimate: usize,
+    parent_index_bytes_estimate: usize,
+    container_meta_bytes_estimate: usize,
+    keys_bytes_estimate: usize,
+    value_strings_bytes_estimate: usize,
+    numbers_bytes_estimate: usize,
 }
 
 #[derive(Serialize)]
@@ -377,6 +385,14 @@ fn main() -> Result<(), String> {
     })?;
 
     let (expand_metric, descendants) = timed(config.iterations, || Ok(bfs_expand_all(&index)))?;
+    let HeapBytesBreakdown {
+        nodes: nodes_bytes_estimate,
+        parent_index: parent_index_bytes_estimate,
+        container_meta: container_meta_bytes_estimate,
+        keys: keys_bytes_estimate,
+        val_strings: value_strings_bytes_estimate,
+        nums_pool: numbers_bytes_estimate,
+    } = index.heap_bytes_breakdown();
     let index_heap_bytes_estimate = index.heap_bytes_estimate();
     let bytes_per_node = if node_count == 0 {
         0.0
@@ -434,6 +450,12 @@ fn main() -> Result<(), String> {
             bytes_per_node,
             bytes_per_input_byte,
             node_size_bytes: std::mem::size_of::<Node>(),
+            nodes_bytes_estimate,
+            parent_index_bytes_estimate,
+            container_meta_bytes_estimate,
+            keys_bytes_estimate,
+            value_strings_bytes_estimate,
+            numbers_bytes_estimate,
         },
     };
 

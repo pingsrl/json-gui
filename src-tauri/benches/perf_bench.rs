@@ -226,14 +226,14 @@ fn bench_expand_all(c: &mut Criterion) {
     group.finish();
 }
 
-/// Memory: Node size must not exceed 24 bytes.
+/// Memory: Node size must stay at or below 8 bytes.
 /// Run as a zero-time assertion bench so it shows up in the report.
 fn bench_memory_layout(c: &mut Criterion) {
     let node_size = size_of::<Node>();
     eprintln!("[perf_bench] size_of::<Node>() = {} bytes", node_size);
     assert!(
-        node_size <= 24,
-        "Node size regressed: {} bytes (max 24). \
+        node_size <= 8,
+        "Node size regressed: {} bytes (max 8). \
          Restore compact layout to avoid memory blowup.",
         node_size
     );

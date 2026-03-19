@@ -15,8 +15,7 @@ use std::rc::Rc;
 
 pub struct InternedStrings {
     pub data: Vec<u8>,     // bytes of all unique strings, concatenated
-    pub offsets: Vec<u32>, // start of each string in data
-    pub lens: Vec<u32>,    // byte length of each string
+    pub offsets: Vec<u32>, // start of each string in data + final end sentinel
     index: Vec<u32>,       // open-addressing hash table: slot → (id+1), 0=empty
     index_mask: u32,       // capacity - 1 (capacity is a power of 2)
 }
@@ -27,7 +26,7 @@ impl InternedStrings {
     }
 
     /// Pre-allocates internal buffers to avoid doublings during parsing.
-    /// `n_strings`: estimated number of unique strings (for offsets/lens/index).
+    /// `n_strings`: estimated number of unique strings (for offsets/index).
     /// `data_bytes`: estimated total bytes of unique strings (for data).
     pub fn with_capacity(n_strings: usize, data_bytes: usize) -> Self {
         // The hash table must have power-of-2 capacity ≥ n_strings / 0.75
@@ -39,8 +38,11 @@ impl InternedStrings {
         };
         Self {
             data: Vec::with_capacity(data_bytes),
-            offsets: Vec::with_capacity(n_strings),
-            lens: Vec::with_capacity(n_strings),
+            offsets: {
+                let mut offsets = Vec::with_capacity(n_strings + 1);
+                offsets.push(0);
+                offsets
+            },
             index: vec![0u32; hash_cap],
             index_mask: (hash_cap - 1) as u32,
         }
@@ -58,7 +60,7 @@ impl InternedStrings {
 
     pub fn intern(&mut self, s: &str) -> u32 {
         // Grow the index if load > 75%
-        if (self.offsets.len() + 1) * 4 > self.index.len() * 3 {
+        if (self.len() + 1) * 4 > self.index.len() * 3 {
             self.grow_index();
         }
         let bytes = s.as_bytes();
@@ -68,18 +70,17 @@ impl InternedStrings {
             let entry = self.index[slot as usize];
             if entry == 0 {
                 // Empty slot: insert new string
-                let id = self.offsets.len() as u32;
-                self.offsets.push(self.data.len() as u32);
-                self.lens.push(bytes.len() as u32);
+                let id = self.len() as u32;
                 self.data.extend_from_slice(bytes);
+                self.offsets.push(self.data.len() as u32);
                 self.index[slot as usize] = id + 1;
                 return id;
             }
             // Check if the already-stored string matches
             let eid = (entry - 1) as usize;
             let start = self.offsets[eid] as usize;
-            let len = self.lens[eid] as usize;
-            if &self.data[start..start + len] == bytes {
+            let end = self.offsets[eid + 1] as usize;
+            if &self.data[start..end] == bytes {
                 return eid as u32;
             }
             // Collision: linear probing
@@ -91,10 +92,10 @@ impl InternedStrings {
         let new_cap = (self.index.len() * 2).max(16);
         let new_mask = (new_cap - 1) as u32;
         let mut new_index = vec![0u32; new_cap];
-        for id in 0..self.offsets.len() {
+        for id in 0..self.len() {
             let start = self.offsets[id] as usize;
-            let len = self.lens[id] as usize;
-            let hash = Self::fnv1a(&self.data[start..start + len]);
+            let end = self.offsets[id + 1] as usize;
+            let hash = Self::fnv1a(&self.data[start..end]);
             let mut slot = hash & new_mask;
             while new_index[slot as usize] != 0 {
                 slot = (slot + 1) & new_mask;
@@ -108,25 +109,31 @@ impl InternedStrings {
     #[inline]
     pub fn get(&self, id: u32) -> &str {
         let start = self.offsets[id as usize] as usize;
-        let len = self.lens[id as usize] as usize;
+        let end = self.offsets[id as usize + 1] as usize;
         // SAFETY: only valid UTF-8 strings inserted via intern(&str)
-        unsafe { std::str::from_utf8_unchecked(&self.data[start..start + len]) }
+        unsafe { std::str::from_utf8_unchecked(&self.data[start..end]) }
     }
 
     pub fn len(&self) -> usize {
-        self.offsets.len()
+        self.offsets.len().saturating_sub(1)
     }
 
     pub fn heap_bytes_estimate(&self) -> usize {
         self.data.capacity()
             + self.offsets.capacity() * std::mem::size_of::<u32>()
-            + self.lens.capacity() * std::mem::size_of::<u32>()
             + self.index.capacity() * std::mem::size_of::<u32>()
+    }
+
+    /// Releases the hash table used only for interning lookups during parsing.
+    /// `get(id)` continues to work; `id_of()` stops returning matches.
+    pub fn release_lookup_index(&mut self) {
+        self.index = Vec::new();
+        self.index_mask = 0;
     }
 
     /// Looks up the id of an already-interned string without inserting it. O(1) amortized.
     pub fn id_of(&self, s: &str) -> Option<u32> {
-        if self.offsets.is_empty() {
+        if self.offsets.is_empty() || self.index.is_empty() {
             return None;
         }
         let bytes = s.as_bytes();
@@ -139,8 +146,8 @@ impl InternedStrings {
             }
             let eid = (entry - 1) as usize;
             let start = self.offsets[eid] as usize;
-            let len = self.lens[eid] as usize;
-            if &self.data[start..start + len] == bytes {
+            let end = self.offsets[eid + 1] as usize;
+            if &self.data[start..end] == bytes {
                 return Some(eid as u32);
             }
             slot = (slot + 1) & self.index_mask;
@@ -148,14 +155,19 @@ impl InternedStrings {
     }
 }
 
-// ---- Node (16 bytes, 4×u32, no padding) ----
+// ---- Node (8 bytes, 2×u32, no padding) ----
 //
 // ktype  bits[31:29] = NodeKind (0..5)
 // ktype  bits[28:0]  = key data:
 //                      - string key id       if bit 28 = 0
 //                      - array index         if bit 28 = 1
 //                      - NO_KEY sentinel     if all 29 bits = 1
-// value_data: Str→val_strings id, Num→nums_pool idx, Bool→0/1, others→0
+// value_data:
+//   - Object/Array → container_meta index
+//   - Str          → val_strings id
+//   - Num          → inline i31 or nums_pool index
+//   - Bool         → 0/1
+//   - Null         → 0
 //
 // Note: the node id (index in the Vec) always coincides with the preorder DFS index,
 // because the streaming parser allocates the parent before its children and children in order.
@@ -163,6 +175,10 @@ impl InternedStrings {
 pub const NO_KEY: u32 = 0x1FFF_FFFF; // sentinel: no key (29 bits all ones)
 const ARRAY_INDEX_FLAG: u32 = 0x1000_0000;
 const KEY_DATA_MASK: u32 = 0x0FFF_FFFF;
+const INLINE_NUM_FLAG: u32 = 0x8000_0000;
+const INLINE_NUM_MASK: u32 = 0x7FFF_FFFF;
+const INLINE_I31_MIN: i64 = -(1 << 30);
+const INLINE_I31_MAX: i64 = (1 << 30) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKey {
@@ -176,16 +192,26 @@ pub enum NodeKind {
     Object = 0,
     Array = 1,
     Str = 2,  // value_data = InternedStrings id in val_strings
-    Num = 3,  // value_data = index into nums_pool
+    Num = 3,  // value_data = inline i31 or nums_pool index
     Bool = 4, // value_data = 0 (false) or 1 (true)
     Null = 5,
+}
+
+impl NodeKind {
+    #[inline]
+    pub fn is_container(self) -> bool {
+        matches!(self, NodeKind::Object | NodeKind::Array)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Node {
     pub ktype: u32,      // bits[31:29]=NodeKind, bits[28:0]=packed NodeKey
-    pub value_data: u32, // Str→str_id, Num→num_idx, Bool→0/1
-    pub parent: u32,     // u32::MAX for root
+    pub value_data: u32, // container meta idx, Str→str_id, Num payload, Bool→0/1
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContainerMeta {
     pub children_len: u32,
     pub subtree_len: u32,
 }
@@ -240,6 +266,34 @@ impl Node {
         };
         ((kind as u32) << 29) | raw
     }
+
+    #[inline]
+    pub fn is_inline_num(&self) -> bool {
+        self.kind() == NodeKind::Num && (self.value_data & INLINE_NUM_FLAG) != 0
+    }
+}
+
+#[inline]
+fn encode_inline_i31(value: i64) -> Option<u32> {
+    if !(INLINE_I31_MIN..=INLINE_I31_MAX).contains(&value) {
+        return None;
+    }
+    Some(INLINE_NUM_FLAG | ((value as i32 as u32) & INLINE_NUM_MASK))
+}
+
+#[inline]
+fn decode_inline_i31(data: u32) -> i32 {
+    ((data & INLINE_NUM_MASK) as i32) << 1 >> 1
+}
+
+#[inline]
+fn subtree_len_from_parts(nodes: &[Node], container_meta: &[ContainerMeta], id: u32) -> u32 {
+    let node = &nodes[id as usize];
+    if node.kind().is_container() {
+        container_meta[node.value_data as usize].subtree_len
+    } else {
+        0
+    }
 }
 
 /// Zero-alloc iterator over the direct children of a node.
@@ -247,6 +301,7 @@ impl Node {
 /// next sibling = cur + 1 + nodes[cur].subtree_len.
 pub struct ChildrenIter<'a> {
     nodes: &'a [Node],
+    container_meta: &'a [ContainerMeta],
     cur: u32,
     remaining: u32,
 }
@@ -259,7 +314,7 @@ impl<'a> Iterator for ChildrenIter<'a> {
             return None;
         }
         let id = self.cur;
-        self.cur += self.nodes[id as usize].subtree_len + 1;
+        self.cur += subtree_len_from_parts(self.nodes, self.container_meta, id) + 1;
         self.remaining -= 1;
         Some(id)
     }
@@ -419,6 +474,10 @@ fn matches_text(
 
 struct StreamCtx {
     nodes: Vec<Node>,
+    parent_deltas: Vec<u16>,
+    parent_overflow_ids: Vec<u32>,
+    parent_overflow_values: Vec<u32>,
+    container_meta: Vec<ContainerMeta>,
     keys: InternedStrings,
     val_strings: InternedStrings,
     nums_pool: Vec<f64>, // f64 pool: NodeKind::Num → nums_pool[value_data]
@@ -432,12 +491,18 @@ impl StreamCtx {
         // JSON keys: few short strings (e.g. field names). Estimate: 1% of nodes, 20 bytes/key.
         let key_n = (node_cap / 100).max(64);
         let key_bytes = key_n * 20;
+        let parent_overflow_cap = (node_cap / 1024).max(16);
+        let container_cap = (node_cap / 4).max(64);
         // String values: ~30% of nodes, deduplicated bytes already passed as str_bytes.
         let val_n = node_cap * 3 / 10;
         // Numbers: ~20% of nodes.
         let num_cap = node_cap / 5;
         Self {
             nodes: Vec::with_capacity(node_cap),
+            parent_deltas: Vec::with_capacity(node_cap),
+            parent_overflow_ids: Vec::with_capacity(parent_overflow_cap),
+            parent_overflow_values: Vec::with_capacity(parent_overflow_cap),
+            container_meta: Vec::with_capacity(container_cap),
             keys: InternedStrings::with_capacity(key_n, key_bytes),
             val_strings: InternedStrings::with_capacity(val_n, str_bytes),
             nums_pool: Vec::with_capacity(num_cap),
@@ -446,15 +511,33 @@ impl StreamCtx {
 
     fn alloc(&mut self, kind: NodeKind, key: Option<NodeKey>, value_data: u32, parent: u32) -> u32 {
         let id = self.nodes.len() as u32;
+        let value_data = if kind.is_container() {
+            let meta_id = self.container_meta.len() as u32;
+            self.container_meta.push(ContainerMeta::default());
+            meta_id
+        } else {
+            value_data
+        };
         self.nodes.push(Node {
             ktype: Node::make_ktype(kind, key),
             value_data,
-            parent,
-            children_len: 0,
-            subtree_len: 0,
         });
+        if parent == u32::MAX {
+            self.parent_deltas.push(0);
+        } else {
+            let delta = id - parent;
+            if delta < u16::MAX as u32 {
+                self.parent_deltas.push(delta as u16);
+            } else {
+                self.parent_deltas.push(u16::MAX);
+                self.parent_overflow_ids.push(id);
+                self.parent_overflow_values.push(parent);
+            }
+        }
         if parent != u32::MAX {
-            self.nodes[parent as usize].children_len += 1;
+            let parent_node = &self.nodes[parent as usize];
+            debug_assert!(parent_node.kind().is_container());
+            self.container_meta[parent_node.value_data as usize].children_len += 1;
         }
         id
     }
@@ -496,21 +579,41 @@ impl<'de> Visitor<'de> for ValVisitor {
     }
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<u32, E> {
         let mut ctx = self.ctx.borrow_mut();
-        let nid = ctx.nums_pool.len() as u32;
-        ctx.nums_pool.push(v as f64);
-        Ok(ctx.alloc(NodeKind::Num, self.key, nid, self.parent))
+        let value_data = match encode_inline_i31(v) {
+            Some(inline) => inline,
+            None => {
+                let nid = ctx.nums_pool.len() as u32;
+                ctx.nums_pool.push(v as f64);
+                nid
+            }
+        };
+        Ok(ctx.alloc(NodeKind::Num, self.key, value_data, self.parent))
     }
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<u32, E> {
         let mut ctx = self.ctx.borrow_mut();
-        let nid = ctx.nums_pool.len() as u32;
-        ctx.nums_pool.push(v as f64);
-        Ok(ctx.alloc(NodeKind::Num, self.key, nid, self.parent))
+        let value_data = if v <= INLINE_I31_MAX as u64 {
+            encode_inline_i31(v as i64).expect("u64 range pre-checked")
+        } else {
+            let nid = ctx.nums_pool.len() as u32;
+            ctx.nums_pool.push(v as f64);
+            nid
+        };
+        Ok(ctx.alloc(NodeKind::Num, self.key, value_data, self.parent))
     }
     fn visit_f64<E: de::Error>(self, v: f64) -> Result<u32, E> {
         let mut ctx = self.ctx.borrow_mut();
-        let nid = ctx.nums_pool.len() as u32;
-        ctx.nums_pool.push(v);
-        Ok(ctx.alloc(NodeKind::Num, self.key, nid, self.parent))
+        let value_data = if v.fract() == 0.0 {
+            encode_inline_i31(v as i64)
+                .filter(|_| v >= INLINE_I31_MIN as f64 && v <= INLINE_I31_MAX as f64)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            let nid = ctx.nums_pool.len() as u32;
+            ctx.nums_pool.push(v);
+            nid
+        });
+        Ok(ctx.alloc(NodeKind::Num, self.key, value_data, self.parent))
     }
     fn visit_str<E: de::Error>(self, v: &str) -> Result<u32, E> {
         let sid = self.ctx.borrow_mut().val_strings.intern(v);
@@ -550,7 +653,8 @@ impl<'de> Visitor<'de> for ValVisitor {
         // Set subtree_len AFTER all children are allocated
         {
             let mut ctx = self.ctx.borrow_mut();
-            ctx.nodes[id as usize].subtree_len = ctx.nodes.len() as u32 - id - 1;
+            let meta_id = ctx.nodes[id as usize].value_data as usize;
+            ctx.container_meta[meta_id].subtree_len = ctx.nodes.len() as u32 - id - 1;
         }
         Ok(id)
     }
@@ -581,23 +685,33 @@ impl<'de> Visitor<'de> for ValVisitor {
         // Set subtree_len AFTER all children are allocated
         {
             let mut ctx = self.ctx.borrow_mut();
-            ctx.nodes[id as usize].subtree_len = ctx.nodes.len() as u32 - id - 1;
+            let meta_id = ctx.nodes[id as usize].value_data as usize;
+            ctx.container_meta[meta_id].subtree_len = ctx.nodes.len() as u32 - id - 1;
         }
         Ok(id)
     }
 }
 
 /// Finalizes the JsonIndex: trivial finish since subtree_len is already set during streaming.
-/// For leaf nodes (Bool, Str, Num, Null) subtree_len remains 0 (set in alloc), which is correct.
+/// Leaf nodes do not allocate container metadata and implicitly have subtree_len=0.
 fn finish_index(ctx: StreamCtx) -> JsonIndex {
     let StreamCtx {
         nodes,
+        parent_deltas,
+        parent_overflow_ids,
+        parent_overflow_values,
+        container_meta,
         keys,
-        val_strings,
+        mut val_strings,
         nums_pool,
     } = ctx;
+    val_strings.release_lookup_index();
     JsonIndex {
         nodes,
+        parent_deltas,
+        parent_overflow_ids,
+        parent_overflow_values,
+        container_meta,
         keys,
         val_strings,
         nums_pool,
@@ -632,10 +746,36 @@ fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(
 
 pub struct JsonIndex {
     pub nodes: Vec<Node>,
+    pub parent_deltas: Vec<u16>,
+    pub parent_overflow_ids: Vec<u32>,
+    pub parent_overflow_values: Vec<u32>,
+    pub container_meta: Vec<ContainerMeta>,
     pub keys: InternedStrings,
     pub val_strings: InternedStrings, // string values: compact zero-alloc pool
     pub nums_pool: Vec<f64>,          // numeric values: NodeKind::Num(idx) → nums_pool[idx]
     pub root: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeapBytesBreakdown {
+    pub nodes: usize,
+    pub parent_index: usize,
+    pub container_meta: usize,
+    pub keys: usize,
+    pub val_strings: usize,
+    pub nums_pool: usize,
+}
+
+impl HeapBytesBreakdown {
+    #[inline]
+    pub fn total(self) -> usize {
+        self.nodes
+            + self.parent_index
+            + self.container_meta
+            + self.keys
+            + self.val_strings
+            + self.nums_pool
+    }
 }
 
 pub struct VisibleSliceRow {
@@ -678,17 +818,83 @@ struct CompiledPathSegment {
 }
 
 impl JsonIndex {
+    #[inline]
+    fn container_meta_for_node(&self, node: &Node) -> Option<&ContainerMeta> {
+        node.kind()
+            .is_container()
+            .then(|| &self.container_meta[node.value_data as usize])
+    }
+
+    #[inline]
+    fn children_len_for_node(&self, node: &Node) -> u32 {
+        self.container_meta_for_node(node)
+            .map_or(0, |meta| meta.children_len)
+    }
+
+    #[inline]
+    fn subtree_len_for_node(&self, node: &Node) -> u32 {
+        self.container_meta_for_node(node)
+            .map_or(0, |meta| meta.subtree_len)
+    }
+
+    #[inline]
+    pub fn children_len(&self, id: u32) -> u32 {
+        self.children_len_for_node(&self.nodes[id as usize])
+    }
+
+    #[inline]
+    pub fn subtree_len(&self, id: u32) -> u32 {
+        self.subtree_len_for_node(&self.nodes[id as usize])
+    }
+
+    #[inline]
+    pub fn has_children(&self, id: u32) -> bool {
+        self.children_len(id) != 0
+    }
+
+    #[inline]
+    fn number_as_f64(&self, node: &Node) -> f64 {
+        debug_assert!(node.kind() == NodeKind::Num);
+        if node.is_inline_num() {
+            decode_inline_i31(node.value_data) as f64
+        } else {
+            self.nums_pool[node.value_data as usize]
+        }
+    }
+
+    #[inline]
+    fn format_number<'a, const N: usize>(
+        &self,
+        node: &Node,
+        buf: &'a mut StackString<N>,
+    ) -> &'a str {
+        debug_assert!(node.kind() == NodeKind::Num);
+        if node.is_inline_num() {
+            buf.clear();
+            write!(buf, "{}", decode_inline_i31(node.value_data))
+                .expect("stack buffer too small for i31 formatting");
+            buf.as_str()
+        } else {
+            format_f64_display(buf, self.nums_pool[node.value_data as usize])
+        }
+    }
+
+    pub fn number_to_string(&self, id: u32) -> String {
+        let node = &self.nodes[id as usize];
+        let mut text = StackString::<64>::new();
+        self.format_number(node, &mut text).to_string()
+    }
+
     /// Returns the ids of direct children of `id`, computed from DFS preorder.
     /// First child = id+1; next sibling = prev_child + prev_child.subtree_len + 1.
     #[inline]
     pub fn get_children_slice(&self, id: u32) -> Vec<u32> {
-        let node = &self.nodes[id as usize];
-        let count = node.children_len as usize;
+        let count = self.children_len(id) as usize;
         let mut out = Vec::with_capacity(count);
         let mut cur = id + 1;
         for _ in 0..count {
             out.push(cur);
-            cur += self.nodes[cur as usize].subtree_len + 1;
+            cur += self.subtree_len(cur) + 1;
         }
         out
     }
@@ -696,32 +902,53 @@ impl JsonIndex {
     /// Zero-alloc iterator over direct children of `id`.
     #[inline]
     pub fn children_iter(&self, id: u32) -> ChildrenIter<'_> {
-        let node = &self.nodes[id as usize];
         ChildrenIter {
             nodes: &self.nodes,
+            container_meta: &self.container_meta,
             cur: id + 1,
-            remaining: node.children_len,
+            remaining: self.children_len(id),
+        }
+    }
+
+    pub fn heap_bytes_breakdown(&self) -> HeapBytesBreakdown {
+        HeapBytesBreakdown {
+            nodes: self.nodes.capacity() * std::mem::size_of::<Node>(),
+            parent_index: self.parent_deltas.capacity() * std::mem::size_of::<u16>()
+                + self.parent_overflow_ids.capacity() * std::mem::size_of::<u32>()
+                + self.parent_overflow_values.capacity() * std::mem::size_of::<u32>(),
+            container_meta: self.container_meta.capacity() * std::mem::size_of::<ContainerMeta>(),
+            keys: self.keys.heap_bytes_estimate(),
+            val_strings: self.val_strings.heap_bytes_estimate(),
+            nums_pool: self.nums_pool.capacity() * std::mem::size_of::<f64>(),
         }
     }
 
     pub fn heap_bytes_estimate(&self) -> usize {
-        self.nodes.capacity() * std::mem::size_of::<Node>()
-            + self.keys.heap_bytes_estimate()
-            + self.val_strings.heap_bytes_estimate()
-            + self.nums_pool.capacity() * std::mem::size_of::<f64>()
+        self.heap_bytes_breakdown().total()
     }
 
-    /// Returns the direct parent of `id`. O(1) field lookup.
+    /// Returns the direct parent of `id`.
+    /// Fast path is O(1) via delta decoding; large parent gaps fall back to sparse overflow lookup.
     pub fn parent_of(&self, id: u32) -> Option<u32> {
-        let p = self.nodes[id as usize].parent;
-        if p == u32::MAX { None } else { Some(p) }
+        let delta = self.parent_deltas[id as usize];
+        if delta == 0 {
+            return None;
+        }
+        if delta != u16::MAX {
+            return Some(id - delta as u32);
+        }
+        let overflow_idx = self
+            .parent_overflow_ids
+            .binary_search(&id)
+            .expect("parent overflow entry missing");
+        Some(self.parent_overflow_values[overflow_idx])
     }
 
     fn scoped_nodes(&self, scope_node_id: Option<u32>) -> (u32, &[Node]) {
         match scope_node_id {
             Some(scope_id) => {
                 let start = scope_id as usize;
-                let len = self.nodes[start].subtree_len as usize + 1;
+                let len = self.subtree_len(scope_id) as usize + 1;
                 (scope_id, &self.nodes[start..start + len])
             }
             None => (0, &self.nodes),
@@ -833,7 +1060,7 @@ impl JsonIndex {
 
     pub fn expanded_visible_count(&self) -> usize {
         // root.subtree_len = total descendants. We show all except root itself.
-        self.nodes[self.root as usize].subtree_len as usize
+        self.subtree_len(self.root) as usize
     }
 
     pub fn get_expanded_slice(&self, offset: usize, limit: usize) -> Vec<VisibleSliceRow> {
@@ -847,12 +1074,12 @@ impl JsonIndex {
             depth: usize,
         }
 
-        let root_node = &self.nodes[self.root as usize];
         let mut stack: Vec<Frame> = Vec::new();
-        if root_node.children_len > 0 {
+        let root_children_len = self.children_len(self.root);
+        if root_children_len > 0 {
             stack.push(Frame {
                 next_child_id: self.root + 1,
-                remaining: root_node.children_len,
+                remaining: root_children_len,
                 depth: 0,
             });
         }
@@ -867,15 +1094,16 @@ impl JsonIndex {
             }
 
             let child_id = frame.next_child_id;
-            let child = &self.nodes[child_id as usize];
             let depth = frame.depth;
+            let child_subtree_len = self.subtree_len(child_id);
+            let child_children_len = self.children_len(child_id);
 
             // Advance frame to next sibling
-            frame.next_child_id = child_id + 1 + child.subtree_len;
+            frame.next_child_id = child_id + 1 + child_subtree_len;
             frame.remaining -= 1;
 
             if skipped < offset {
-                let subtree_size = child.subtree_len as usize + 1; // this node + descendants
+                let subtree_size = child_subtree_len as usize + 1; // this node + descendants
                 if skipped + subtree_size <= offset {
                     // Skip entire subtree in O(1)
                     skipped += subtree_size;
@@ -883,10 +1111,10 @@ impl JsonIndex {
                 }
                 // Enter the subtree to find the offset
                 skipped += 1;
-                if child.children_len > 0 {
+                if child_children_len > 0 {
                     stack.push(Frame {
                         next_child_id: child_id + 1,
-                        remaining: child.children_len,
+                        remaining: child_children_len,
                         depth: depth + 1,
                     });
                 }
@@ -901,10 +1129,10 @@ impl JsonIndex {
                 break 'outer;
             }
 
-            if child.children_len > 0 {
+            if child_children_len > 0 {
                 stack.push(Frame {
                     next_child_id: child_id + 1,
-                    remaining: child.children_len,
+                    remaining: child_children_len,
                     depth: depth + 1,
                 });
             }
@@ -935,7 +1163,7 @@ impl JsonIndex {
             match node.kind() {
                 NodeKind::Object | NodeKind::Array => {
                     let is_object = node.kind() == NodeKind::Object;
-                    let count = node.children_len;
+                    let count = self.children_len(current);
                     if count == 0 {
                         out.push_str(if is_object { "{}" } else { "[]" });
                     } else {
@@ -949,7 +1177,7 @@ impl JsonIndex {
                                 out.push_str("\":");
                             }
                         }
-                        let first_subtree = self.nodes[first as usize].subtree_len;
+                        let first_subtree = self.subtree_len(first);
                         stack.push(Frame {
                             next_child_id: first + 1 + first_subtree,
                             remaining: count - 1,
@@ -965,12 +1193,8 @@ impl JsonIndex {
                     out.push('"');
                 }
                 NodeKind::Num => {
-                    let f = self.nums_pool[node.value_data as usize];
-                    if f.fract() == 0.0 && f.abs() < 1e15 {
-                        let _ = write!(out, "{}", f as i64);
-                    } else {
-                        let _ = write!(out, "{f}");
-                    }
+                    let mut text = StackString::<64>::new();
+                    out.push_str(self.format_number(node, &mut text));
                 }
                 NodeKind::Bool => {
                     out.push_str(if node.value_data != 0 {
@@ -1003,7 +1227,7 @@ impl JsonIndex {
                                     out.push_str("\":");
                                 }
                             }
-                            frame.next_child_id = next + 1 + self.nodes[next as usize].subtree_len;
+                            frame.next_child_id = next + 1 + self.subtree_len(next);
                             frame.remaining -= 1;
                             current = next;
                             break;
@@ -1116,10 +1340,7 @@ impl JsonIndex {
             NodeKind::Str => re.is_match(self.val_strings.get(node.value_data)),
             NodeKind::Num => {
                 let mut text = StackString::<64>::new();
-                re.is_match(format_f64_display(
-                    &mut text,
-                    self.nums_pool[node.value_data as usize],
-                ))
+                re.is_match(self.format_number(node, &mut text))
             }
             NodeKind::Bool => re.is_match(if node.value_data != 0 {
                 "true"
@@ -1149,13 +1370,13 @@ impl JsonIndex {
                 exact_match,
             ),
             NodeKind::Num => {
-                let value = self.nums_pool[node.value_data as usize];
+                let value = self.number_as_f64(node);
                 if exact_match {
                     return exact_number.is_some_and(|expected| value == expected);
                 }
                 let mut text = StackString::<64>::new();
                 matches_text(
-                    format_f64_display(&mut text, value),
+                    self.format_number(node, &mut text),
                     query,
                     query_lower,
                     case_sensitive,

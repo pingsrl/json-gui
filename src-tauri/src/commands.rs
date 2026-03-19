@@ -154,7 +154,7 @@ fn node_key_string(index: &JsonIndex, node_id: u32) -> Option<String> {
 /// format of get_expanded_slice.
 fn node_value_preview(index: &JsonIndex, id: u32) -> Cow<'static, str> {
     let node = &index.nodes[id as usize];
-    let children_len = node.children_len as usize;
+    let children_len = index.children_len(id) as usize;
     match node.kind() {
         NodeKind::Object => {
             if children_len == 0 {
@@ -179,7 +179,7 @@ fn node_value_preview(index: &JsonIndex, id: u32) -> Cow<'static, str> {
                 Cow::Owned(format!("\"{}\"", s))
             }
         }
-        NodeKind::Num => Cow::Owned(index.nums_pool[node.value_data as usize].to_string()),
+        NodeKind::Num => Cow::Owned(index.number_to_string(id)),
         NodeKind::Bool => {
             if node.value_data != 0 {
                 Cow::Borrowed("true")
@@ -193,7 +193,7 @@ fn node_value_preview(index: &JsonIndex, id: u32) -> Cow<'static, str> {
 
 fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
     let node = &index.nodes[id as usize];
-    let children_len = node.children_len as usize;
+    let children_len = index.children_len(id) as usize;
     let value_type: &'static str = match node.kind() {
         NodeKind::Object => "object",
         NodeKind::Array => "array",
@@ -297,7 +297,7 @@ pub async fn expand_subtree(
         total_nodes += children_ids.len();
 
         for &child_id in &children_ids {
-            if total_nodes < limit && index.nodes[child_id as usize].children_len > 0 {
+            if total_nodes < limit && index.has_children(child_id) {
                 queue.push(child_id);
             }
         }
@@ -353,7 +353,7 @@ pub async fn search(
                     "\"{}\"",
                     truncate_str(index.val_strings.get(node.value_data), 60)
                 ),
-                NodeKind::Num => index.nums_pool[node.value_data as usize].to_string(),
+                NodeKind::Num => index.number_to_string(id),
                 NodeKind::Bool => (node.value_data != 0).to_string(),
                 NodeKind::Null => "null".to_string(),
                 NodeKind::Object => "[object]".to_string(),
@@ -446,8 +446,7 @@ pub async fn search_objects(
     let dtos = ids
         .into_iter()
         .map(|id| {
-            let node = &index.nodes[id as usize];
-            let children_len = node.children_len as usize;
+            let children_len = index.children_len(id) as usize;
             // Inline value_preview for objects: avoids building a full NodeDto
             let value_preview = if children_len == 0 {
                 "{}".to_string()
@@ -585,7 +584,7 @@ pub async fn get_expanded_slice(
             key_idx,
             node_type_byte(node.kind()),
             node_value_preview(index, id).into_owned(),
-            node.children_len,
+            index.children_len(id),
             depth as u32,
         ));
     }

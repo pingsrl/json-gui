@@ -65,10 +65,10 @@ fn bfs_collect_all_dtos(index: &JsonIndex) -> Vec<(u32, Vec<NodeDtoSimple>)> {
         queue.push_back(child_id);
     }
     while let Some(node_id) = queue.pop_front() {
-        if index.nodes[node_id as usize].children_len == 0 {
+        if !index.has_children(node_id) {
             continue;
         }
-        let mut children = Vec::with_capacity(index.nodes[node_id as usize].children_len as usize);
+        let mut children = Vec::with_capacity(index.children_len(node_id) as usize);
         for child_id in index.children_iter(node_id) {
             queue.push_back(child_id);
             children.push(node_to_dto_simple(index, child_id));
@@ -90,7 +90,7 @@ struct NodeDtoSimple {
 
 fn node_to_dto_simple(index: &JsonIndex, id: u32) -> NodeDtoSimple {
     let node = &index.nodes[id as usize];
-    let children_len = node.children_len as usize;
+    let children_len = index.children_len(id) as usize;
     let (value_type, value_preview): (&'static str, Cow<'static, str>) = match node.kind() {
         NodeKind::Object => (
             "object",
@@ -120,10 +120,7 @@ fn node_to_dto_simple(index: &JsonIndex, id: u32) -> NodeDtoSimple {
                 },
             )
         }
-        NodeKind::Num => (
-            "number",
-            Cow::Owned(index.nums_pool[node.value_data as usize].to_string()),
-        ),
+        NodeKind::Num => ("number", Cow::Owned(index.number_to_string(id))),
         NodeKind::Bool => (
             "boolean",
             if node.value_data != 0 {

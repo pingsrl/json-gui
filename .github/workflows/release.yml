@@ -184,6 +184,12 @@ jobs:
                   f"| bytes_per_node | {report['memory']['bytes_per_node']:.2f} B |",
                   f"| bytes_per_input_byte | {report['memory']['bytes_per_input_byte']:.3f} |",
                   f"| node_size | {report['memory']['node_size_bytes']} B |",
+                  f"| nodes_heap | {report['memory']['nodes_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
+                  f"| parent_index_heap | {report['memory']['parent_index_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
+                  f"| container_meta_heap | {report['memory']['container_meta_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
+                  f"| keys_heap | {report['memory']['keys_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
+                  f"| value_strings_heap | {report['memory']['value_strings_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
+                  f"| numbers_heap | {report['memory']['numbers_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
               ]
           )
           action_lines.extend(
@@ -197,6 +203,12 @@ jobs:
                   f"| bytes_per_node | {report['memory']['bytes_per_node']:.2f} B |",
                   f"| bytes_per_input_byte | {report['memory']['bytes_per_input_byte']:.3f} |",
                   f"| node_size | {report['memory']['node_size_bytes']} B |",
+                  f"| nodes_heap | {report['memory']['nodes_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
+                  f"| parent_index_heap | {report['memory']['parent_index_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
+                  f"| container_meta_heap | {report['memory']['container_meta_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
+                  f"| keys_heap | {report['memory']['keys_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
+                  f"| value_strings_heap | {report['memory']['value_strings_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
+                  f"| numbers_heap | {report['memory']['numbers_bytes_estimate'] / (1024 * 1024):.2f} MiB |",
               ]
           )
 
