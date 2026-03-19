@@ -407,6 +407,7 @@ jobs:
         run: |
           printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | tr -d '\r' > "$RUNNER_TEMP/tauri-signing.key"
       - name: Build Windows app
+        shell: bash
         run: npm run tauri build
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' && format('{0}/tauri-signing.key', runner.temp) || '' }}
