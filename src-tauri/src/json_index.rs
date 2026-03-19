@@ -303,6 +303,53 @@ fn format_u32_decimal(buf: &mut [u8; 10], mut value: u32) -> &str {
     unsafe { std::str::from_utf8_unchecked(&buf[cursor..]) }
 }
 
+struct StackString<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackString<N> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        // SAFETY: only valid UTF-8 is written via fmt::Write.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) }
+    }
+}
+
+impl<const N: usize> std::fmt::Write for StackString<N> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let end = self.len.checked_add(bytes.len()).ok_or(std::fmt::Error)?;
+        if end > N {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+}
+
+#[inline]
+fn format_f64_display<'a, const N: usize>(buf: &'a mut StackString<N>, value: f64) -> &'a str {
+    buf.clear();
+    write!(buf, "{value}").expect("stack buffer too small for f64 formatting");
+    buf.as_str()
+}
+
 #[inline]
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     let haystack = haystack.as_bytes();
@@ -978,7 +1025,8 @@ impl JsonIndex {
         match key {
             NodeKey::String(id) => out.push_str(self.keys.get(id)),
             NodeKey::ArrayIndex(index) => {
-                let _ = write!(out, "{index}");
+                let mut buf = [0u8; 10];
+                out.push_str(format_u32_decimal(&mut buf, index));
             }
         }
     }
@@ -1067,9 +1115,11 @@ impl JsonIndex {
         match node.kind() {
             NodeKind::Str => re.is_match(self.val_strings.get(node.value_data)),
             NodeKind::Num => {
-                let mut text = String::new();
-                let _ = write!(text, "{}", self.nums_pool[node.value_data as usize]);
-                re.is_match(&text)
+                let mut text = StackString::<64>::new();
+                re.is_match(format_f64_display(
+                    &mut text,
+                    self.nums_pool[node.value_data as usize],
+                ))
             }
             NodeKind::Bool => re.is_match(if node.value_data != 0 {
                 "true"
@@ -1103,9 +1153,14 @@ impl JsonIndex {
                 if exact_match {
                     return exact_number.is_some_and(|expected| value == expected);
                 }
-                let mut text = String::new();
-                let _ = write!(text, "{value}");
-                matches_text(&text, query, query_lower, case_sensitive, false)
+                let mut text = StackString::<64>::new();
+                matches_text(
+                    format_f64_display(&mut text, value),
+                    query,
+                    query_lower,
+                    case_sensitive,
+                    false,
+                )
             }
             NodeKind::Bool => matches_text(
                 if node.value_data != 0 {
@@ -1500,7 +1555,6 @@ impl JsonIndex {
             );
             a_rank.cmp(&b_rank)
         });
-        suggestions.dedup();
 
         suggestions
             .into_iter()

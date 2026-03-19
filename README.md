@@ -198,27 +198,6 @@ Measures `buildVisibleNodes`, Map copy cost, and streaming overhead on synthetic
 npx tsx src/bench/perf.mts
 ```
 
-### Reference results (Apple M-series, synthetic data)
-
-| Operation | Size | Time |
-|---|---|---|
-| Parsing (flat array) | 50k nodes / ~2 MB | 4 ms |
-| Parsing (flat array) | 250k nodes / ~10 MB | ~20 ms |
-| BFS + DTO build | 50k nodes | 2.4 ms |
-| BFS + DTO build | 250k nodes | 12 ms |
-| BFS + DTO build | 400k nodes | 21 ms |
-| Chunk serialization | 1 000 nodes | 0.6 ms |
-| buildVisibleNodes (JS) | 100k nodes | ~2.5 ms |
-| buildVisibleNodes (JS) | 500k nodes | ~20 ms |
-| Map copy (JS) | 100k entries | ~4 ms |
-
-**IPC note**: the bottleneck for `expand_all` on large files is the number of
-`app.emit()` calls, not the Rust BFS itself. `EXPAND_CHUNK_SIZE = 10_000` keeps
-call count to ~100 for a 1M-node file (vs 1 000 with chunk size 1k), reducing
-IPC overhead by 10×.
-
----
-
 ## Architecture
 
 ```
