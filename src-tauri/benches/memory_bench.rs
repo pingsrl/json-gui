@@ -11,7 +11,6 @@
 /// To add a test file just copy it into benches/samples/.
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use json_gui_lib::json_index::JsonIndex;
-use std::mem::size_of;
 use std::path::Path;
 use std::time::Duration;
 
@@ -48,15 +47,7 @@ fn rss_kb() -> u64 {
 
 /// Estimated heap bytes used by the index (excludes allocator overhead).
 fn index_heap_bytes(index: &JsonIndex) -> usize {
-    let nodes = index.nodes.len() * size_of::<json_gui_lib::json_index::Node>();
-    let children = index.children.len() * size_of::<u32>();
-    // InternedStrings for keys: data + offsets + lens (8 bytes per unique string)
-    let keys_strings: usize = index.keys.data.len();
-    let keys_overhead = index.keys.len() * (4 + 4);
-    let val_strings: usize = index.val_strings.data.len();
-    let val_overhead = index.val_strings.len() * (4 + 4); // offsets + lengths
-    let nums = index.nums_pool.len() * size_of::<f64>();
-    nodes + children + keys_strings + keys_overhead + val_strings + val_overhead + nums
+    index.heap_bytes_estimate()
 }
 
 /// Collects all .json files in the samples/ folder relative to src-tauri/.
@@ -115,7 +106,11 @@ fn bench_samples(c: &mut Criterion) {
 
         let rss_delta_mb = rss_after.saturating_sub(rss_before) as f64 / 1024.0;
         let index_mb = index_heap_bytes(&index) as f64 / 1_048_576.0;
-        let ratio = if file_mb > 0.0 { rss_delta_mb / file_mb } else { 0.0 };
+        let ratio = if file_mb > 0.0 {
+            rss_delta_mb / file_mb
+        } else {
+            0.0
+        };
 
         eprintln!(
             "[memory_bench]   Nodes: {}  |  Index est.: {:.1} MB  |  RSS delta: {:.1} MB  |  Ratio: {:.2}x file",

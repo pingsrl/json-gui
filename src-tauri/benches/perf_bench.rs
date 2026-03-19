@@ -26,10 +26,15 @@ fn flat_array(n: usize) -> String {
     let mut s = String::with_capacity(n * 60);
     s.push('[');
     for i in 0..n {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         s.push_str(&format!(
             r#"{{"id":{},"name":"item{}","active":{},"score":{:.1}}}"#,
-            i, i, i % 2 == 0, i as f64 * 1.5
+            i,
+            i,
+            i % 2 == 0,
+            i as f64 * 1.5
         ));
     }
     s.push(']');
@@ -41,10 +46,16 @@ fn nested_array(n: usize) -> String {
     let mut s = String::with_capacity(n * 120);
     s.push('[');
     for i in 0..n {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         s.push_str(&format!(
             r#"{{"id":{},"tags":["t{}","t{}"],"meta":{{"x":{},"y":{}}}}}"#,
-            i, i % 10, i % 20, i * 2, i * 3
+            i,
+            i % 10,
+            i % 20,
+            i * 2,
+            i * 3
         ));
     }
     s.push(']');
@@ -100,7 +111,6 @@ fn bench_load(c: &mut Criterion) {
 /// Parsing + index build via from_file (mmap + sonic-rs).
 /// Writes a temp file, then benchmarks from_file vs from_str for the same data.
 fn bench_load_from_file(c: &mut Criterion) {
-    use std::io::Write;
     let mut group = c.benchmark_group("load_from_file");
     group.warm_up_time(Duration::from_secs(1));
 
@@ -144,15 +154,15 @@ fn bench_search(c: &mut Criterion) {
             |b, idx| {
                 b.iter(|| {
                     black_box(idx.search(
-                        black_box(r"\d+"),   // pattern
-                        "values",            // target
-                        false,               // case_sensitive
-                        true,                // regex
-                        false,               // whole_word
-                        500,                 // max_results
-                        None,                // scope_path
-                        false,               // search_objects
-                        false,               // search_arrays
+                        black_box(r"\d+"), // pattern
+                        "values",          // target
+                        false,             // case_sensitive
+                        true,              // regex
+                        false,             // whole_word
+                        500,               // max_results
+                        None,              // scope_path
+                        false,             // search_objects
+                        false,             // search_arrays
                     ))
                 })
             },
@@ -258,10 +268,14 @@ fn bench_get_path(c: &mut Criterion) {
 
 fn read_dotenv(key: &str) -> Option<String> {
     for candidate in &["../.bench.env", ".bench.env"] {
-        let Ok(content) = std::fs::read_to_string(candidate) else { continue; };
+        let Ok(content) = std::fs::read_to_string(candidate) else {
+            continue;
+        };
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with('#') || line.is_empty() { continue; }
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
             if let Some(rest) = line.strip_prefix(key) {
                 if let Some(val) = rest.strip_prefix('=') {
                     return Some(val.trim().to_string());
@@ -302,7 +316,9 @@ fn bench_real_file(c: &mut Criterion) {
     group.throughput(Throughput::Elements(index.nodes.len() as u64));
     group.bench_function("search_regex", |b| {
         b.iter(|| {
-            black_box(index.search(r"\d+", "values", false, true, false, 1000, None, false, false))
+            black_box(index.search(
+                r"\d+", "values", false, true, false, 1000, None, false, false,
+            ))
         })
     });
     group.bench_function("expand_all_bfs", |b| {

@@ -6,7 +6,7 @@
 ///
 /// HTML reports in: src-tauri/target/criterion/
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use json_gui_lib::json_index::{JsonIndex, NodeKind};
+use json_gui_lib::json_index::{JsonIndex, NodeKey, NodeKind};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 
@@ -61,20 +61,17 @@ fn nested_array_json(n: usize) -> String {
 fn bfs_collect_all_dtos(index: &JsonIndex) -> Vec<(u32, Vec<NodeDtoSimple>)> {
     let mut result = Vec::new();
     let mut queue = VecDeque::new();
-    for child_id in index.get_children_slice(index.root) {
+    for child_id in index.children_iter(index.root) {
         queue.push_back(child_id);
     }
     while let Some(node_id) = queue.pop_front() {
-        let children_slice = index.get_children_slice(node_id);
-        if children_slice.is_empty() {
+        if index.nodes[node_id as usize].children_len == 0 {
             continue;
         }
-        let children: Vec<NodeDtoSimple> = children_slice
-            .iter()
-            .map(|&id| node_to_dto_simple(index, id))
-            .collect();
-        for child_id in &children_slice {
-            queue.push_back(*child_id);
+        let mut children = Vec::with_capacity(index.nodes[node_id as usize].children_len as usize);
+        for child_id in index.children_iter(node_id) {
+            queue.push_back(child_id);
+            children.push(node_to_dto_simple(index, child_id));
         }
         result.push((node_id, children));
     }
@@ -97,34 +94,53 @@ fn node_to_dto_simple(index: &JsonIndex, id: u32) -> NodeDtoSimple {
     let (value_type, value_preview): (&'static str, Cow<'static, str>) = match node.kind() {
         NodeKind::Object => (
             "object",
-            if children_len == 0 { Cow::Borrowed("{}") } else { Cow::Owned(format!("{{{} keys}}", children_len)) },
+            if children_len == 0 {
+                Cow::Borrowed("{}")
+            } else {
+                Cow::Owned(format!("{{{} keys}}", children_len))
+            },
         ),
         NodeKind::Array => (
             "array",
-            if children_len == 0 { Cow::Borrowed("[]") } else { Cow::Owned(format!("[{} items]", children_len)) },
+            if children_len == 0 {
+                Cow::Borrowed("[]")
+            } else {
+                Cow::Owned(format!("[{} items]", children_len))
+            },
         ),
         NodeKind::Str => {
             let s = index.val_strings.get(node.value_data);
+            let truncated = s.char_indices().nth(80).map(|(i, _)| &s[..i]).unwrap_or(s);
             (
                 "string",
-                if s.chars().count() > 80 {
-                    let end = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
-                    Cow::Owned(format!("\"{}…\"", &s[..end]))
+                if truncated.len() < s.len() {
+                    Cow::Owned(format!("\"{}…\"", truncated))
                 } else {
                     Cow::Owned(format!("\"{}\"", s))
                 },
             )
         }
-        NodeKind::Num => ("number", Cow::Owned(index.nums_pool[node.value_data as usize].to_string())),
+        NodeKind::Num => (
+            "number",
+            Cow::Owned(index.nums_pool[node.value_data as usize].to_string()),
+        ),
         NodeKind::Bool => (
             "boolean",
-            if node.value_data != 0 { Cow::Borrowed("true") } else { Cow::Borrowed("false") },
+            if node.value_data != 0 {
+                Cow::Borrowed("true")
+            } else {
+                Cow::Borrowed("false")
+            },
         ),
         NodeKind::Null => ("null", Cow::Borrowed("null")),
     };
     NodeDtoSimple {
         id,
-        key: node.key().map(|kid| index.keys.get(kid).to_string()),
+        key: match node.key() {
+            Some(NodeKey::String(kid)) => Some(index.keys.get(kid).to_string()),
+            Some(NodeKey::ArrayIndex(idx)) => Some(idx.to_string()),
+            None => None,
+        },
         value_type,
         value_preview,
         children_count: children_len,
@@ -143,24 +159,28 @@ fn serialize_compact_slice(nodes: &[(u32, &NodeDtoSimple)]) -> String {
     let mut rows = String::with_capacity(nodes.len() * 40);
     rows.push('[');
     for (i, (parent_id, dto)) in nodes.iter().enumerate() {
-        if i > 0 { rows.push(','); }
+        if i > 0 {
+            rows.push(',');
+        }
         let key_idx: i32 = match dto.key.as_deref() {
             None => -1,
-            Some(k) => {
-                match key_pool_keys.iter().position(|&kk| kk == Some(k)) {
-                    Some(pos) => pos as i32,
-                    None => {
-                        let pos = key_pool.len() as i32;
-                        key_pool.push(k);
-                        key_pool_keys.push(Some(k));
-                        pos
-                    }
+            Some(k) => match key_pool_keys.iter().position(|&kk| kk == Some(k)) {
+                Some(pos) => pos as i32,
+                None => {
+                    let pos = key_pool.len() as i32;
+                    key_pool.push(k);
+                    key_pool_keys.push(Some(k));
+                    pos
                 }
-            }
+            },
         };
         let type_byte: u8 = match dto.value_type {
-            "object" => 0, "array" => 1, "string" => 2,
-            "number" => 3, "boolean" => 4, _ => 5,
+            "object" => 0,
+            "array" => 1,
+            "string" => 2,
+            "number" => 3,
+            "boolean" => 4,
+            _ => 5,
         };
         let preview = dto.value_preview.replace('"', "\\\"");
         rows.push_str(&format!(
@@ -174,14 +194,19 @@ fn serialize_compact_slice(nodes: &[(u32, &NodeDtoSimple)]) -> String {
     // Serialize the key pool
     let mut pool_json = String::from("[");
     for (i, k) in key_pool.iter().enumerate() {
-        if i > 0 { pool_json.push(','); }
+        if i > 0 {
+            pool_json.push(',');
+        }
         pool_json.push('"');
         pool_json.push_str(k);
         pool_json.push('"');
     }
     pool_json.push(']');
 
-    format!(r#"{{"offset":0,"total_count":50000,"key_pool":{},"rows":{}}}"#, pool_json, rows)
+    format!(
+        r#"{{"offset":0,"total_count":50000,"key_pool":{},"rows":{}}}"#,
+        pool_json, rows
+    )
 }
 
 // ── Criterion groups ──────────────────────────────────────────────────────────
@@ -243,12 +268,15 @@ fn bench_serialization(c: &mut Criterion) {
     // slice matching what get_expanded_slice produces.
     let index = JsonIndex::from_str(&flat_array_json(10_000)).unwrap();
     let all = bfs_collect_all_dtos(&index);
-    let flat: Vec<(u32, NodeDtoSimple)> = all.into_iter()
+    let flat: Vec<(u32, NodeDtoSimple)> = all
+        .into_iter()
         .flat_map(|(parent_id, children)| children.into_iter().map(move |dto| (parent_id, dto)))
         .collect();
     for &slice_size in &[100usize, 200, 500, 1000] {
         let slice: Vec<(u32, &NodeDtoSimple)> = flat[..slice_size.min(flat.len())]
-            .iter().map(|(p, d)| (*p, d)).collect();
+            .iter()
+            .map(|(p, d)| (*p, d))
+            .collect();
         group.throughput(Throughput::Elements(slice.len() as u64));
         group.bench_with_input(
             BenchmarkId::new("compact_slice", slice_size),

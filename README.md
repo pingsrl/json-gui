@@ -233,24 +233,6 @@ Backend (Rust)
   FileLoader (sonic-rs SIMD parser)
 ```
 
-### Key technical choices
-
-**sonic-rs** — Replaces `serde_json` for the initial JSON parsing phase.
-Uses SIMD instructions (NEON on Apple Silicon, AVX2 on x86_64) for significantly
-faster deserialization of large files. Produces a standard `serde_json::Value`
-so the rest of the tree-building code is unchanged.
-
-**Arena allocation** — The entire JSON tree is stored as a flat `Vec<Node>`
-where each node holds integer indices to its children. This avoids recursive
-heap allocations and keeps the data cache-friendly. Navigation is O(1) by index.
-
-**Lazy loading** — The frontend only requests children for nodes the user expands
-via the `get_children` IPC command. Root children are returned with `open_file`.
-This keeps initial load fast regardless of file size.
-
-**Rayon** — The `search` function uses `par_iter()` to scan all nodes in parallel,
-distributing work across all CPU cores automatically.
-
 ---
 
 ## License

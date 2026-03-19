@@ -1,52 +1,13 @@
 use crate::json_index::{
-    JsonIndex, NodeKind, ObjectSearchFilter as IndexObjectSearchFilter, ObjectSearchOperator,
-    VisibleSliceRow,
+    JsonIndex, NodeKey, NodeKind, ObjectSearchFilter as IndexObjectSearchFilter,
+    ObjectSearchOperator, VisibleSliceRow,
 };
 use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::io::{BufReader, Read};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tauri::{Emitter, Manager, State, WindowEvent};
-
-/// Wrapper around a `Read` that fires a callback each time the progress percentage advances.
-struct ProgressReader<R: Read, F: Fn(u8)> {
-    inner: R,
-    bytes_read: u64,
-    total_bytes: u64,
-    last_percent: u8,
-    progress_cb: F,
-}
-
-impl<R: Read, F: Fn(u8)> ProgressReader<R, F> {
-    fn new(inner: R, total_bytes: u64, progress_cb: F) -> Self {
-        Self {
-            inner,
-            bytes_read: 0,
-            total_bytes,
-            last_percent: 0,
-            progress_cb,
-        }
-    }
-}
-
-impl<R: Read, F: Fn(u8)> Read for ProgressReader<R, F> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.bytes_read += n as u64;
-        let percent = if self.total_bytes > 0 {
-            ((self.bytes_read * 100) / self.total_bytes).min(100) as u8
-        } else {
-            0
-        };
-        if percent != self.last_percent {
-            (self.progress_cb)(percent);
-            self.last_percent = percent;
-        }
-        Ok(n)
-    }
-}
 
 pub struct AppState {
     /// Map window-label → JSON index for that window.
@@ -161,7 +122,6 @@ pub struct ExpandToResult {
     pub path: String,
 }
 
-
 /// Safely truncates a UTF-8 string to at most `max_chars` characters.
 fn truncate_str(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
@@ -175,11 +135,18 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
 fn node_type_byte(kind: NodeKind) -> u8 {
     match kind {
         NodeKind::Object => 0,
-        NodeKind::Array  => 1,
-        NodeKind::Str    => 2,
-        NodeKind::Num    => 3,
-        NodeKind::Bool   => 4,
-        NodeKind::Null   => 5,
+        NodeKind::Array => 1,
+        NodeKind::Str => 2,
+        NodeKind::Num => 3,
+        NodeKind::Bool => 4,
+        NodeKind::Null => 5,
+    }
+}
+
+fn node_key_string(index: &JsonIndex, node_id: u32) -> Option<String> {
+    match index.nodes[node_id as usize].key()? {
+        NodeKey::String(kid) => Some(index.keys.get(kid).to_string()),
+        NodeKey::ArrayIndex(idx) => Some(idx.to_string()),
     }
 }
 
@@ -205,15 +172,20 @@ fn node_value_preview(index: &JsonIndex, id: u32) -> Cow<'static, str> {
         }
         NodeKind::Str => {
             let s = index.val_strings.get(node.value_data);
-            if s.chars().count() > 80 {
-                Cow::Owned(format!("\"{}…\"", truncate_str(s, 80)))
+            let truncated = truncate_str(s, 80);
+            if truncated.len() < s.len() {
+                Cow::Owned(format!("\"{}…\"", truncated))
             } else {
                 Cow::Owned(format!("\"{}\"", s))
             }
         }
         NodeKind::Num => Cow::Owned(index.nums_pool[node.value_data as usize].to_string()),
         NodeKind::Bool => {
-            if node.value_data != 0 { Cow::Borrowed("true") } else { Cow::Borrowed("false") }
+            if node.value_data != 0 {
+                Cow::Borrowed("true")
+            } else {
+                Cow::Borrowed("false")
+            }
         }
         NodeKind::Null => Cow::Borrowed("null"),
     }
@@ -224,23 +196,23 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
     let children_len = node.children_len as usize;
     let value_type: &'static str = match node.kind() {
         NodeKind::Object => "object",
-        NodeKind::Array  => "array",
-        NodeKind::Str    => "string",
-        NodeKind::Num    => "number",
-        NodeKind::Bool   => "boolean",
-        NodeKind::Null   => "null",
+        NodeKind::Array => "array",
+        NodeKind::Str => "string",
+        NodeKind::Num => "number",
+        NodeKind::Bool => "boolean",
+        NodeKind::Null => "null",
     };
     NodeDto {
         id,
         parent_id: index.parent_of(id),
-        key: node.key().map(|kid| index.keys.get(kid).to_string()),
+        key: node_key_string(index, id),
         value_type,
         value_preview: node_value_preview(index, id),
         children_count: children_len,
     }
 }
 
-const STREAMING_THRESHOLD: u64 = 200 * 1024 * 1024; // 200 MB
+const PROGRESS_EVENT_THRESHOLD: u64 = 200 * 1024 * 1024; // 200 MB
 
 #[tauri::command]
 pub async fn open_file(
@@ -248,34 +220,24 @@ pub async fn open_file(
     state: State<'_, AppState>,
     webview_window: tauri::WebviewWindow,
 ) -> Result<FileInfo, String> {
-    let path_clone = path.clone();
-    let window_clone = webview_window.clone();
+    let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as usize;
+    if size_bytes as u64 > PROGRESS_EVENT_THRESHOLD {
+        let _ = webview_window.emit("parse-progress", 0u8);
+    }
 
-    let (index, size_bytes) = tauri::async_runtime::spawn_blocking(move || {
-        let file_size = std::fs::metadata(&path_clone).map(|m| m.len()).unwrap_or(0);
+    let index = tauri::async_runtime::spawn_blocking(move || JsonIndex::from_file(&path))
+        .await
+        .map_err(|e| e.to_string())??;
 
-        let index = if file_size > STREAMING_THRESHOLD {
-            // File >200MB: stream with progress events sent only to the calling window
-            let file = std::fs::File::open(&path_clone).map_err(|e| e.to_string())?;
-            let reader = ProgressReader::new(BufReader::new(file), file_size, move |pct| {
-                window_clone.emit("parse-progress", pct).ok();
-            });
-            JsonIndex::from_reader(reader)
-        } else {
-            JsonIndex::from_file(&path_clone)
-        };
-
-        index.map(|idx| (idx, file_size as usize))
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    if size_bytes as u64 > PROGRESS_EVENT_THRESHOLD {
+        let _ = webview_window.emit("parse-progress", 100u8);
+    }
 
     let node_count = index.nodes.len();
     let root_node = node_to_dto(&index, index.root);
     let root_children: Vec<NodeDto> = index
-        .get_children_slice(index.root)
-        .iter()
-        .map(|&id| node_to_dto(&index, id))
+        .children_iter(index.root)
+        .map(|id| node_to_dto(&index, id))
         .collect();
     *state.window_index(webview_window.label()).write().unwrap() = Some(index);
     Ok(FileInfo {
@@ -296,9 +258,8 @@ pub async fn get_children(
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
     let children: Vec<NodeDto> = index
-        .get_children_slice(node_id)
-        .iter()
-        .map(|&id| node_to_dto(index, id))
+        .children_iter(node_id)
+        .map(|id| node_to_dto(index, id))
         .collect();
     Ok(children)
 }
@@ -385,10 +346,13 @@ pub async fn search(
     );
     let dtos: Vec<SearchResult> = results
         .into_iter()
-        .map(|(id, path)| {
+        .map(|id| {
             let node = &index.nodes[id as usize];
             let value_preview = match node.kind() {
-                NodeKind::Str => format!("\"{}\"", truncate_str(index.val_strings.get(node.value_data), 60)),
+                NodeKind::Str => format!(
+                    "\"{}\"",
+                    truncate_str(index.val_strings.get(node.value_data), 60)
+                ),
                 NodeKind::Num => index.nums_pool[node.value_data as usize].to_string(),
                 NodeKind::Bool => (node.value_data != 0).to_string(),
                 NodeKind::Null => "null".to_string(),
@@ -398,8 +362,8 @@ pub async fn search(
             SearchResult {
                 node_id: id,
                 file_order: id,
-                path,
-                key: node.key().map(|kid| index.keys.get(kid).to_string()),
+                path: index.get_path(id),
+                key: node_key_string(index, id),
                 value_preview,
                 kind: "node",
                 match_preview: None,
@@ -494,7 +458,7 @@ pub async fn search_objects(
                 node_id: id,
                 file_order: id,
                 path: index.get_path(id),
-                key: node.key().map(|kid| index.keys.get(kid).to_string()),
+                key: node_key_string(index, id),
                 value_preview,
                 kind: "object",
                 match_preview: Some(Arc::clone(&match_preview)),
@@ -535,7 +499,10 @@ pub async fn expand_to(
     loop {
         match index.parent_of(current) {
             None => break,
-            Some(p) => { chain.push(p); current = p; }
+            Some(p) => {
+                chain.push(p);
+                current = p;
+            }
         }
     }
     chain.reverse(); // from root toward the direct parent
@@ -544,9 +511,8 @@ pub async fn expand_to(
         .into_iter()
         .map(|ancestor_id| {
             let children = index
-                .get_children_slice(ancestor_id)
-                .iter()
-                .map(|&child_id| node_to_dto(index, child_id))
+                .children_iter(ancestor_id)
+                .map(|child_id| node_to_dto(index, child_id))
                 .collect();
             (ancestor_id, children)
         })
@@ -586,7 +552,7 @@ pub async fn get_expanded_slice(
     // Local key pool for this slice: avoids repeating the same string
     // for every node that shares a field name (e.g. "id", "name", …).
     let mut key_pool: Vec<String> = Vec::new();
-    let mut key_pool_ids: Vec<u32> = Vec::new(); // parallel: key_pool_ids[i] = string-pool id
+    let mut key_pool_ids: Vec<NodeKey> = Vec::new();
 
     let mut rows = Vec::with_capacity(slice.len());
     for VisibleSliceRow { id, depth } in slice {
@@ -594,14 +560,14 @@ pub async fn get_expanded_slice(
 
         let key_idx: i32 = match node.key() {
             None => -1,
-            Some(kid) => {
+            Some(key) => {
                 // linear search on the local pool (usually < 200 entries → cache-friendly)
-                match key_pool_ids.iter().position(|&k| k == kid) {
+                match key_pool_ids.iter().position(|&k| k == key) {
                     Some(pos) => pos as i32,
                     None => {
                         let pos = key_pool.len() as i32;
-                        key_pool.push(index.keys.get(kid).to_string());
-                        key_pool_ids.push(kid);
+                        key_pool.push(node_key_string(index, id).unwrap_or_default());
+                        key_pool_ids.push(key);
                         pos
                     }
                 }
@@ -631,7 +597,6 @@ pub async fn get_expanded_slice(
         rows,
     })
 }
-
 
 #[tauri::command]
 pub async fn get_raw(
@@ -676,16 +641,13 @@ pub async fn open_in_new_window(
         .unwrap()
         .insert(label.clone(), raw);
 
-    let new_window = tauri::WebviewWindowBuilder::new(
-        &app,
-        &label,
-        tauri::WebviewUrl::App("index.html".into()),
-    )
-    .title("JsonGUI")
-    .inner_size(1200.0, 800.0)
-    .min_inner_size(600.0, 400.0)
-    .build()
-    .map_err(|e| e.to_string())?;
+    let new_window =
+        tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
+            .title("JsonGUI")
+            .inner_size(1200.0, 800.0)
+            .min_inner_size(600.0, 400.0)
+            .build()
+            .map_err(|e| e.to_string())?;
 
     // Cleanup on window close
     let app_clone = app.clone();
@@ -753,9 +715,8 @@ pub async fn open_from_string(
     let node_count = index.nodes.len();
     let root_node = node_to_dto(&index, index.root);
     let root_children: Vec<NodeDto> = index
-        .get_children_slice(index.root)
-        .iter()
-        .map(|&id| node_to_dto(&index, id))
+        .children_iter(index.root)
+        .map(|id| node_to_dto(&index, id))
         .collect();
     *state.window_index(webview_window.label()).write().unwrap() = Some(index);
     Ok(FileInfo {
@@ -784,5 +745,9 @@ pub async fn take_screenshot(
         .args(["-x", "-t", "jpg", "-R", &rect, &path])
         .status()
         .map_err(|e| e.to_string())?;
-    if status.success() { Ok(()) } else { Err("screencapture failed".into()) }
+    if status.success() {
+        Ok(())
+    } else {
+        Err("screencapture failed".into())
+    }
 }

@@ -140,7 +140,13 @@ pub fn run() {
 
             // ── Native menu ──────────────────────────────────────────────────
             let open_i = MenuItem::with_id(app, "open", "Apri...", true, Some("CmdOrCtrl+O"))?;
-            let new_window_i = MenuItem::with_id(app, "new-window", "Nuova finestra", true, Some("CmdOrCtrl+N"))?;
+            let new_window_i = MenuItem::with_id(
+                app,
+                "new-window",
+                "Nuova finestra",
+                true,
+                Some("CmdOrCtrl+N"),
+            )?;
             let close_window_i = PredefinedMenuItem::close_window(app, None)?;
             let recent_i = MenuItem::with_id(app, "recent", "Recenti…", true, None::<&str>)?;
             let reload_i = MenuItem::with_id(app, "reload", "Ricarica", true, Some("CmdOrCtrl+R"))?;
@@ -272,7 +278,9 @@ pub fn run() {
                 let main_label = main_window.label().to_string();
                 main_window.on_window_event(move |event| {
                     if let WindowEvent::Destroyed = event {
-                        app_handle_for_destroy.state::<AppState>().remove_window(&main_label);
+                        app_handle_for_destroy
+                            .state::<AppState>()
+                            .remove_window(&main_label);
                     }
                 });
             }

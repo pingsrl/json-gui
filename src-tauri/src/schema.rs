@@ -21,25 +21,24 @@ const SAMPLE_LIMIT: usize = 50;
 fn infer_node(index: &JsonIndex, id: u32) -> Schema {
     let node = &index.nodes[id as usize];
     match node.kind() {
-        NodeKind::Str  => Schema::Str,
-        NodeKind::Num  => Schema::Num,
+        NodeKind::Str => Schema::Str,
+        NodeKind::Num => Schema::Num,
         NodeKind::Bool => Schema::Bool,
         NodeKind::Null => Schema::Null,
         NodeKind::Array => {
-            let ch = index.get_children_slice(id);
-            let n = ch.len().min(SAMPLE_LIMIT);
-            if n == 0 {
+            let sample: Vec<u32> = index.children_iter(id).take(SAMPLE_LIMIT).collect();
+            if sample.is_empty() {
                 Schema::Arr(Box::new(Schema::Any))
             } else {
-                Schema::Arr(Box::new(merge_elements(index, &ch[..n])))
+                Schema::Arr(Box::new(merge_elements(index, &sample)))
             }
         }
         NodeKind::Object => {
-            let ch = index.get_children_slice(id);
-            let fields = ch
-                .iter()
-                .map(|&cid| {
-                    let key = index.nodes[cid as usize].key()
+            let fields = index
+                .children_iter(id)
+                .map(|cid| {
+                    let key = index.nodes[cid as usize]
+                        .string_key_id()
                         .map_or_else(String::new, |k| index.keys.get(k).to_string());
                     (key, infer_node(index, cid), false)
                 })
@@ -67,7 +66,8 @@ fn merge_object_array(index: &JsonIndex, ids: &[u32]) -> Schema {
     let mut fields: BTreeMap<String, (Vec<Schema>, usize)> = BTreeMap::new();
     for &oid in ids {
         for cid in index.children_iter(oid) {
-            let key = index.nodes[cid as usize].key()
+            let key = index.nodes[cid as usize]
+                .string_key_id()
                 .map_or_else(String::new, |k| index.keys.get(k).to_string());
             let e = fields.entry(key).or_default();
             e.0.push(infer_node(index, cid));
@@ -229,14 +229,13 @@ fn collect_schema(
 }
 
 fn build_named_types(index: &JsonIndex) -> (Vec<NamedObj>, TypeRef) {
-    let root_ch = index.get_children_slice(index.root);
-    let schema = match root_ch.len() {
+    let root_node = &index.nodes[index.root as usize];
+    let root_children_len = root_node.children_len as usize;
+    let root_sample: Vec<u32> = index.children_iter(index.root).take(SAMPLE_LIMIT).collect();
+    let schema = match root_children_len {
         0 => Schema::Any,
-        1 => infer_node(index, root_ch[0]),
-        _ => Schema::Arr(Box::new(merge_elements(
-            index,
-            &root_ch[..root_ch.len().min(SAMPLE_LIMIT)],
-        ))),
+        1 => infer_node(index, root_sample[0]),
+        _ => Schema::Arr(Box::new(merge_elements(index, &root_sample))),
     };
     let mut out = vec![];
     let mut namer = Namer::new();
@@ -602,7 +601,10 @@ fn typeref_to_json_schema(tr: &TypeRef) -> String {
         TypeRef::Null => r#"{"type":"null"}"#.to_string(),
         TypeRef::Any => "{}".to_string(),
         TypeRef::Arr(inner) => {
-            format!(r#"{{"type":"array","items":{}}}"#, typeref_to_json_schema(inner))
+            format!(
+                r#"{{"type":"array","items":{}}}"#,
+                typeref_to_json_schema(inner)
+            )
         }
         TypeRef::Ref(name) => format!("{{\"$ref\":\"#/$defs/{}\"}}", name),
     }

@@ -1,8 +1,9 @@
 use rayon::prelude::*;
 use regex::Regex;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::rc::Rc;
 
@@ -13,11 +14,11 @@ use std::rc::Rc;
 // Memory for N unique strings, T total bytes: T + 13N bytes.
 
 pub struct InternedStrings {
-    pub data: Vec<u8>,    // bytes of all unique strings, concatenated
+    pub data: Vec<u8>,     // bytes of all unique strings, concatenated
     pub offsets: Vec<u32>, // start of each string in data
-    pub lens: Vec<u32>,   // byte length of each string
-    index: Vec<u32>,      // open-addressing hash table: slot → (id+1), 0=empty
-    index_mask: u32,      // capacity - 1 (capacity is a power of 2)
+    pub lens: Vec<u32>,    // byte length of each string
+    index: Vec<u32>,       // open-addressing hash table: slot → (id+1), 0=empty
+    index_mask: u32,       // capacity - 1 (capacity is a power of 2)
 }
 
 impl InternedStrings {
@@ -116,6 +117,13 @@ impl InternedStrings {
         self.offsets.len()
     }
 
+    pub fn heap_bytes_estimate(&self) -> usize {
+        self.data.capacity()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
+            + self.lens.capacity() * std::mem::size_of::<u32>()
+            + self.index.capacity() * std::mem::size_of::<u32>()
+    }
+
     /// Looks up the id of an already-interned string without inserting it. O(1) amortized.
     pub fn id_of(&self, s: &str) -> Option<u32> {
         if self.offsets.is_empty() {
@@ -143,30 +151,41 @@ impl InternedStrings {
 // ---- Node (16 bytes, 4×u32, no padding) ----
 //
 // ktype  bits[31:29] = NodeKind (0..5)
-// ktype  bits[28:0]  = key_id, or NO_KEY (0x1FFF_FFFF) if no key
+// ktype  bits[28:0]  = key data:
+//                      - string key id       if bit 28 = 0
+//                      - array index         if bit 28 = 1
+//                      - NO_KEY sentinel     if all 29 bits = 1
 // value_data: Str→val_strings id, Num→nums_pool idx, Bool→0/1, others→0
 //
 // Note: the node id (index in the Vec) always coincides with the preorder DFS index,
 // because the streaming parser allocates the parent before its children and children in order.
 
 pub const NO_KEY: u32 = 0x1FFF_FFFF; // sentinel: no key (29 bits all ones)
+const ARRAY_INDEX_FLAG: u32 = 0x1000_0000;
+const KEY_DATA_MASK: u32 = 0x0FFF_FFFF;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKey {
+    String(u32),
+    ArrayIndex(u32),
+}
 
 /// Node kind packed into the top 3 bits of `ktype`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     Object = 0,
-    Array  = 1,
-    Str    = 2, // value_data = InternedStrings id in val_strings
-    Num    = 3, // value_data = index into nums_pool
-    Bool   = 4, // value_data = 0 (false) or 1 (true)
-    Null   = 5,
+    Array = 1,
+    Str = 2,  // value_data = InternedStrings id in val_strings
+    Num = 3,  // value_data = index into nums_pool
+    Bool = 4, // value_data = 0 (false) or 1 (true)
+    Null = 5,
 }
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    pub ktype: u32,        // bits[31:29]=NodeKind, bits[28:0]=key_id
-    pub value_data: u32,   // Str→str_id, Num→num_idx, Bool→0/1
-    pub parent: u32,       // u32::MAX for root
+    pub ktype: u32,      // bits[31:29]=NodeKind, bits[28:0]=packed NodeKey
+    pub value_data: u32, // Str→str_id, Num→num_idx, Bool→0/1
+    pub parent: u32,     // u32::MAX for root
     pub children_len: u32,
     pub subtree_len: u32,
 }
@@ -184,15 +203,42 @@ impl Node {
         }
     }
     #[inline]
-    pub fn key(&self) -> Option<u32> {
-        let k = self.ktype & NO_KEY;
-        if k == NO_KEY { None } else { Some(k) }
+    pub fn key(&self) -> Option<NodeKey> {
+        let raw = self.ktype & NO_KEY;
+        match raw {
+            NO_KEY => None,
+            _ if (raw & ARRAY_INDEX_FLAG) != 0 => Some(NodeKey::ArrayIndex(raw & KEY_DATA_MASK)),
+            _ => Some(NodeKey::String(raw)),
+        }
     }
     #[inline]
-    pub fn make_ktype(kind: NodeKind, key: Option<u32>) -> u32 {
-        let k = key.unwrap_or(NO_KEY);
-        debug_assert!(k <= NO_KEY);
-        ((kind as u32) << 29) | k
+    pub fn string_key_id(&self) -> Option<u32> {
+        match self.key() {
+            Some(NodeKey::String(id)) => Some(id),
+            _ => None,
+        }
+    }
+    #[inline]
+    pub fn array_index(&self) -> Option<u32> {
+        match self.key() {
+            Some(NodeKey::ArrayIndex(index)) => Some(index),
+            _ => None,
+        }
+    }
+    #[inline]
+    pub fn make_ktype(kind: NodeKind, key: Option<NodeKey>) -> u32 {
+        let raw = match key {
+            None => NO_KEY,
+            Some(NodeKey::String(id)) => {
+                debug_assert!(id < ARRAY_INDEX_FLAG);
+                id
+            }
+            Some(NodeKey::ArrayIndex(index)) => {
+                debug_assert!(index < KEY_DATA_MASK);
+                ARRAY_INDEX_FLAG | index
+            }
+        };
+        ((kind as u32) << 29) | raw
     }
 }
 
@@ -209,7 +255,9 @@ impl<'a> Iterator for ChildrenIter<'a> {
     type Item = u32;
     #[inline]
     fn next(&mut self) -> Option<u32> {
-        if self.remaining == 0 { return None; }
+        if self.remaining == 0 {
+            return None;
+        }
         let id = self.cur;
         self.cur += self.nodes[id as usize].subtree_len + 1;
         self.remaining -= 1;
@@ -224,6 +272,99 @@ impl<'a> Iterator for ChildrenIter<'a> {
 
 impl<'a> ExactSizeIterator for ChildrenIter<'a> {}
 
+#[inline]
+fn decimal_len_u32(value: u32) -> usize {
+    match value {
+        0..=9 => 1,
+        10..=99 => 2,
+        100..=999 => 3,
+        1_000..=9_999 => 4,
+        10_000..=99_999 => 5,
+        100_000..=999_999 => 6,
+        1_000_000..=9_999_999 => 7,
+        10_000_000..=99_999_999 => 8,
+        100_000_000..=999_999_999 => 9,
+        _ => 10,
+    }
+}
+
+#[inline]
+fn format_u32_decimal(buf: &mut [u8; 10], mut value: u32) -> &str {
+    let mut cursor = buf.len();
+    loop {
+        cursor -= 1;
+        buf[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    // SAFETY: the buffer only contains ASCII decimal digits.
+    unsafe { std::str::from_utf8_unchecked(&buf[cursor..]) }
+}
+
+#[inline]
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+#[inline]
+fn starts_with_case_insensitive(candidate: &str, prefix: &str, prefix_lower: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    if candidate.starts_with(prefix) {
+        return true;
+    }
+    if candidate.is_ascii() && prefix.is_ascii() {
+        candidate
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    } else {
+        candidate.to_lowercase().starts_with(prefix_lower)
+    }
+}
+
+#[inline]
+fn matches_text(
+    haystack: &str,
+    query: &str,
+    query_lower: &str,
+    case_sensitive: bool,
+    exact_match: bool,
+) -> bool {
+    if case_sensitive {
+        if exact_match {
+            haystack == query
+        } else {
+            haystack.contains(query)
+        }
+    } else if haystack.is_ascii() && query.is_ascii() {
+        if exact_match {
+            haystack.eq_ignore_ascii_case(query)
+        } else {
+            contains_ascii_case_insensitive(haystack, query)
+        }
+    } else {
+        let haystack_lower = haystack.to_lowercase();
+        if exact_match {
+            haystack_lower == query_lower
+        } else {
+            haystack_lower.contains(query_lower)
+        }
+    }
+}
+
 // ---- Streaming parser: zero intermediate allocations ----
 //
 // Final Nodes are allocated DIRECTLY during DFS streaming.
@@ -233,7 +374,7 @@ struct StreamCtx {
     nodes: Vec<Node>,
     keys: InternedStrings,
     val_strings: InternedStrings,
-    nums_pool: Vec<f64>,     // f64 pool: NodeKind::Num → nums_pool[value_data]
+    nums_pool: Vec<f64>, // f64 pool: NodeKind::Num → nums_pool[value_data]
 }
 
 impl StreamCtx {
@@ -261,7 +402,7 @@ impl StreamCtx {
         }
     }
 
-    fn alloc(&mut self, kind: NodeKind, key: Option<u32>, value_data: u32, parent: u32) -> u32 {
+    fn alloc(&mut self, kind: NodeKind, key: Option<NodeKey>, value_data: u32, parent: u32) -> u32 {
         let id = self.nodes.len() as u32;
         self.nodes.push(Node {
             ktype: Node::make_ktype(kind, key),
@@ -280,20 +421,24 @@ impl StreamCtx {
 struct ValSeed {
     ctx: Rc<RefCell<StreamCtx>>,
     parent: u32,
-    key: Option<u32>,
+    key: Option<NodeKey>,
 }
 
 impl<'de> DeserializeSeed<'de> for ValSeed {
     type Value = u32;
     fn deserialize<D: de::Deserializer<'de>>(self, de: D) -> Result<u32, D::Error> {
-        de.deserialize_any(ValVisitor { ctx: self.ctx, parent: self.parent, key: self.key })
+        de.deserialize_any(ValVisitor {
+            ctx: self.ctx,
+            parent: self.parent,
+            key: self.key,
+        })
     }
 }
 
 struct ValVisitor {
     ctx: Rc<RefCell<StreamCtx>>,
     parent: u32,
-    key: Option<u32>,
+    key: Option<NodeKey>,
 }
 
 impl<'de> Visitor<'de> for ValVisitor {
@@ -302,7 +447,10 @@ impl<'de> Visitor<'de> for ValVisitor {
         write!(f, "a JSON value")
     }
     fn visit_bool<E: de::Error>(self, v: bool) -> Result<u32, E> {
-        Ok(self.ctx.borrow_mut().alloc(NodeKind::Bool, self.key, v as u32, self.parent))
+        Ok(self
+            .ctx
+            .borrow_mut()
+            .alloc(NodeKind::Bool, self.key, v as u32, self.parent))
     }
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<u32, E> {
         let mut ctx = self.ctx.borrow_mut();
@@ -324,25 +472,38 @@ impl<'de> Visitor<'de> for ValVisitor {
     }
     fn visit_str<E: de::Error>(self, v: &str) -> Result<u32, E> {
         let sid = self.ctx.borrow_mut().val_strings.intern(v);
-        Ok(self.ctx.borrow_mut().alloc(NodeKind::Str, self.key, sid, self.parent))
+        Ok(self
+            .ctx
+            .borrow_mut()
+            .alloc(NodeKind::Str, self.key, sid, self.parent))
     }
     fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<u32, E> {
         self.visit_str(v)
     }
     fn visit_unit<E: de::Error>(self) -> Result<u32, E> {
-        Ok(self.ctx.borrow_mut().alloc(NodeKind::Null, self.key, 0, self.parent))
+        Ok(self
+            .ctx
+            .borrow_mut()
+            .alloc(NodeKind::Null, self.key, 0, self.parent))
     }
     fn visit_none<E: de::Error>(self) -> Result<u32, E> {
-        Ok(self.ctx.borrow_mut().alloc(NodeKind::Null, self.key, 0, self.parent))
+        Ok(self
+            .ctx
+            .borrow_mut()
+            .alloc(NodeKind::Null, self.key, 0, self.parent))
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<u32, A::Error> {
         let id = {
             let mut ctx = self.ctx.borrow_mut();
             ctx.alloc(NodeKind::Object, self.key, 0, self.parent)
         };
-        while let Some(key_str) = map.next_key::<String>()? {
+        while let Some(key_str) = map.next_key::<Cow<'de, str>>()? {
             let kid = self.ctx.borrow_mut().keys.intern(&key_str);
-            map.next_value_seed(ValSeed { ctx: Rc::clone(&self.ctx), parent: id, key: Some(kid) })?;
+            map.next_value_seed(ValSeed {
+                ctx: Rc::clone(&self.ctx),
+                parent: id,
+                key: Some(NodeKey::String(kid)),
+            })?;
         }
         // Set subtree_len AFTER all children are allocated
         {
@@ -358,9 +519,17 @@ impl<'de> Visitor<'de> for ValVisitor {
         };
         let mut index = 0usize;
         loop {
-            let kid = self.ctx.borrow_mut().keys.intern(&index.to_string());
+            if index >= KEY_DATA_MASK as usize {
+                return Err(de::Error::custom(
+                    "array index exceeds inline storage capacity",
+                ));
+            }
             if seq
-                .next_element_seed(ValSeed { ctx: Rc::clone(&self.ctx), parent: id, key: Some(kid) })?
+                .next_element_seed(ValSeed {
+                    ctx: Rc::clone(&self.ctx),
+                    parent: id,
+                    key: Some(NodeKey::ArrayIndex(index as u32)),
+                })?
                 .is_none()
             {
                 break;
@@ -379,18 +548,42 @@ impl<'de> Visitor<'de> for ValVisitor {
 /// Finalizes the JsonIndex: trivial finish since subtree_len is already set during streaming.
 /// For leaf nodes (Bool, Str, Num, Null) subtree_len remains 0 (set in alloc), which is correct.
 fn finish_index(ctx: StreamCtx) -> JsonIndex {
-    let StreamCtx { nodes, keys, val_strings, nums_pool } = ctx;
-    JsonIndex { nodes, keys, val_strings, nums_pool, root: 0 }
+    let StreamCtx {
+        nodes,
+        keys,
+        val_strings,
+        nums_pool,
+    } = ctx;
+    JsonIndex {
+        nodes,
+        keys,
+        val_strings,
+        nums_pool,
+        root: 0,
+    }
 }
 
 fn parse_streaming<'de, D: de::Deserializer<'de>>(de: D) -> Result<JsonIndex, D::Error> {
     parse_streaming_with_cap(de, 0, 0)
 }
 
-fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(de: D, node_cap: usize, str_bytes: usize) -> Result<JsonIndex, D::Error> {
+fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(
+    de: D,
+    node_cap: usize,
+    str_bytes: usize,
+) -> Result<JsonIndex, D::Error> {
     let ctx = Rc::new(RefCell::new(StreamCtx::with_capacity(node_cap, str_bytes)));
-    de.deserialize_any(ValVisitor { ctx: Rc::clone(&ctx), parent: u32::MAX, key: None })?;
-    Ok(finish_index(Rc::try_unwrap(ctx).ok().expect("ctx: more than one Rc reference").into_inner()))
+    de.deserialize_any(ValVisitor {
+        ctx: Rc::clone(&ctx),
+        parent: u32::MAX,
+        key: None,
+    })?;
+    Ok(finish_index(
+        Rc::try_unwrap(ctx)
+            .ok()
+            .expect("ctx: more than one Rc reference")
+            .into_inner(),
+    ))
 }
 
 // ---- JsonIndex ----
@@ -431,6 +624,7 @@ struct CompiledObjectSearchFilter {
     path_segments: Vec<CompiledPathSegment>,
     operator: ObjectSearchOperator,
     value_cmp: Option<String>,
+    value_num: Option<f64>,
     regex: Option<Regex>,
 }
 
@@ -438,6 +632,7 @@ struct CompiledPathSegment {
     raw: String,
     lower: String,
     exact_id: Option<u32>,
+    array_index: Option<u32>,
 }
 
 impl JsonIndex {
@@ -473,10 +668,79 @@ impl JsonIndex {
         }
     }
 
+    pub fn heap_bytes_estimate(&self) -> usize {
+        self.nodes.capacity() * std::mem::size_of::<Node>()
+            + self.keys.heap_bytes_estimate()
+            + self.val_strings.heap_bytes_estimate()
+            + self.nums_pool.capacity() * std::mem::size_of::<f64>()
+    }
+
     /// Returns the direct parent of `id`. O(1) field lookup.
     pub fn parent_of(&self, id: u32) -> Option<u32> {
         let p = self.nodes[id as usize].parent;
         if p == u32::MAX { None } else { Some(p) }
+    }
+
+    fn scoped_nodes(&self, scope_node_id: Option<u32>) -> (u32, &[Node]) {
+        match scope_node_id {
+            Some(scope_id) => {
+                let start = scope_id as usize;
+                let len = self.nodes[start].subtree_len as usize + 1;
+                (scope_id, &self.nodes[start..start + len])
+            }
+            None => (0, &self.nodes),
+        }
+    }
+
+    fn collect_matching_ids<F>(
+        &self,
+        start_id: u32,
+        nodes: &[Node],
+        max_results: usize,
+        matches: F,
+    ) -> Vec<u32>
+    where
+        F: Fn(u32, &Node) -> bool + Sync,
+    {
+        const CHUNK_SIZE: usize = 4096;
+
+        if max_results == 0 || nodes.is_empty() {
+            return Vec::new();
+        }
+
+        let chunk_matches: Vec<Vec<u32>> = nodes
+            .par_chunks(CHUNK_SIZE)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let chunk_start = start_id + (chunk_idx * CHUNK_SIZE) as u32;
+                let mut local = Vec::with_capacity(max_results.min(chunk.len()).min(32));
+                for (offset, node) in chunk.iter().enumerate() {
+                    let node_id = chunk_start + offset as u32;
+                    if matches(node_id, node) {
+                        local.push(node_id);
+                        if local.len() == max_results {
+                            break;
+                        }
+                    }
+                }
+                local
+            })
+            .collect();
+
+        let mut ids = Vec::with_capacity(max_results.min(nodes.len()));
+        for mut local in chunk_matches {
+            let remaining = max_results - ids.len();
+            if remaining == 0 {
+                break;
+            }
+            if local.len() <= remaining {
+                ids.append(&mut local);
+            } else {
+                ids.extend(local.into_iter().take(remaining));
+                break;
+            }
+        }
+        ids
     }
 
     pub fn from_str(json: &str) -> Result<Self, String> {
@@ -509,7 +773,7 @@ impl JsonIndex {
         }
 
         // Conservative capacity hints so the internal Vecs grow at most once.
-        let node_cap  = (file_size / 50).min(200_000_000) as usize;
+        let node_cap = (file_size / 50).min(200_000_000) as usize;
         let str_bytes = (file_size / 10).min(500_000_000) as usize;
 
         // Map the file read-only. Safety: we only read, and the file is not
@@ -517,8 +781,8 @@ impl JsonIndex {
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
 
         let mut de = sonic_rs::Deserializer::from_slice(&mmap[..]);
-        let result = parse_streaming_with_cap(&mut de, node_cap, str_bytes)
-            .map_err(|e| e.to_string());
+        let result =
+            parse_streaming_with_cap(&mut de, node_cap, str_bytes).map_err(|e| e.to_string());
 
         // mmap is dropped here: virtual address space released, no persistent overhead.
         drop(mmap);
@@ -537,7 +801,9 @@ impl JsonIndex {
     }
 
     pub fn get_expanded_slice(&self, offset: usize, limit: usize) -> Vec<VisibleSliceRow> {
-        if limit == 0 { return Vec::new(); }
+        if limit == 0 {
+            return Vec::new();
+        }
 
         struct Frame {
             next_child_id: u32,
@@ -591,7 +857,10 @@ impl JsonIndex {
                 continue;
             }
 
-            rows.push(VisibleSliceRow { id: child_id, depth });
+            rows.push(VisibleSliceRow {
+                id: child_id,
+                depth,
+            });
             if rows.len() >= limit {
                 break 'outer;
             }
@@ -614,8 +883,8 @@ impl JsonIndex {
         // Each frame tracks iteration state over a container's children,
         // eliminating the per-node Vec<u32> allocation of the old approach.
         struct Frame {
-            next_child_id: u32,  // DFS id of the next child to emit
-            remaining: u32,      // children still to emit
+            next_child_id: u32, // DFS id of the next child to emit
+            remaining: u32,     // children still to emit
             is_object: bool,
         }
 
@@ -638,7 +907,7 @@ impl JsonIndex {
                         let first = current + 1;
                         // Emit key of first child if object
                         if is_object {
-                            if let Some(kid) = self.nodes[first as usize].key() {
+                            if let Some(kid) = self.nodes[first as usize].string_key_id() {
                                 out.push('"');
                                 json_escape_into(&mut out, self.keys.get(kid));
                                 out.push_str("\":");
@@ -662,13 +931,17 @@ impl JsonIndex {
                 NodeKind::Num => {
                     let f = self.nums_pool[node.value_data as usize];
                     if f.fract() == 0.0 && f.abs() < 1e15 {
-                        out.push_str(&(f as i64).to_string());
+                        let _ = write!(out, "{}", f as i64);
                     } else {
-                        out.push_str(&f.to_string());
+                        let _ = write!(out, "{f}");
                     }
                 }
                 NodeKind::Bool => {
-                    out.push_str(if node.value_data != 0 { "true" } else { "false" });
+                    out.push_str(if node.value_data != 0 {
+                        "true"
+                    } else {
+                        "false"
+                    });
                 }
                 NodeKind::Null => {
                     out.push_str("null");
@@ -688,7 +961,7 @@ impl JsonIndex {
                             out.push(',');
                             let next = frame.next_child_id;
                             if frame.is_object {
-                                if let Some(kid) = self.nodes[next as usize].key() {
+                                if let Some(kid) = self.nodes[next as usize].string_key_id() {
                                     out.push('"');
                                     json_escape_into(&mut out, self.keys.get(kid));
                                     out.push_str("\":");
@@ -705,14 +978,36 @@ impl JsonIndex {
         }
     }
 
+    fn path_segment_len(&self, key: NodeKey) -> usize {
+        match key {
+            NodeKey::String(id) => self.keys.get(id).len(),
+            NodeKey::ArrayIndex(index) => decimal_len_u32(index),
+        }
+    }
+
+    fn push_path_segment(&self, out: &mut String, key: NodeKey) {
+        match key {
+            NodeKey::String(id) => out.push_str(self.keys.get(id)),
+            NodeKey::ArrayIndex(index) => {
+                let _ = write!(out, "{index}");
+            }
+        }
+    }
+
+    fn node_key_as_str<'a>(&'a self, node: &'a Node, buf: &'a mut [u8; 10]) -> Option<&'a str> {
+        match node.key()? {
+            NodeKey::String(id) => Some(self.keys.get(id)),
+            NodeKey::ArrayIndex(index) => Some(format_u32_decimal(buf, index)),
+        }
+    }
+
     pub fn get_path(&self, node_id: u32) -> String {
-        // Accumulate key IDs without cloning strings
-        let mut key_ids: Vec<u32> = Vec::with_capacity(16);
+        let mut key_ids: Vec<NodeKey> = Vec::with_capacity(16);
         let mut current = node_id;
         loop {
             let node = &self.nodes[current as usize];
-            if let Some(kid) = node.key() {
-                key_ids.push(kid);
+            if let Some(key) = node.key() {
+                key_ids.push(key);
             }
             match self.parent_of(current) {
                 None => break,
@@ -723,17 +1018,119 @@ impl JsonIndex {
         if key_ids.is_empty() {
             "$".to_string()
         } else {
-            // Pre-allocate: "$." + sum of lengths + separators
-            let total_len: usize = key_ids.iter().map(|&k| self.keys.get(k).len()).sum::<usize>()
-                + key_ids.len() // separators "."
-                + 2; // "$."
+            let total_len: usize = key_ids
+                .iter()
+                .map(|&key| self.path_segment_len(key))
+                .sum::<usize>()
+                + key_ids.len()
+                + 2;
             let mut out = String::with_capacity(total_len);
             out.push('$');
-            for kid in key_ids {
+            for key in key_ids {
                 out.push('.');
-                out.push_str(self.keys.get(kid));
+                self.push_path_segment(&mut out, key);
             }
             out
+        }
+    }
+
+    fn key_matches_regex(&self, node: &Node, re: &Regex) -> bool {
+        let mut key_buf = [0u8; 10];
+        self.node_key_as_str(node, &mut key_buf)
+            .is_some_and(|key| re.is_match(key))
+    }
+
+    fn key_matches_query(
+        &self,
+        node: &Node,
+        query: &str,
+        query_lower: &str,
+        case_sensitive: bool,
+        exact_match: bool,
+        exact_array_index: Option<u32>,
+    ) -> bool {
+        match node.key() {
+            Some(NodeKey::String(id)) => matches_text(
+                self.keys.get(id),
+                query,
+                query_lower,
+                case_sensitive,
+                exact_match,
+            ),
+            Some(NodeKey::ArrayIndex(index)) => {
+                if exact_match {
+                    return exact_array_index == Some(index);
+                }
+                let mut key_buf = [0u8; 10];
+                matches_text(
+                    format_u32_decimal(&mut key_buf, index),
+                    query,
+                    query_lower,
+                    case_sensitive,
+                    false,
+                )
+            }
+            None => false,
+        }
+    }
+
+    fn value_matches_regex(&self, node: &Node, re: &Regex) -> bool {
+        match node.kind() {
+            NodeKind::Str => re.is_match(self.val_strings.get(node.value_data)),
+            NodeKind::Num => {
+                let mut text = String::new();
+                let _ = write!(text, "{}", self.nums_pool[node.value_data as usize]);
+                re.is_match(&text)
+            }
+            NodeKind::Bool => re.is_match(if node.value_data != 0 {
+                "true"
+            } else {
+                "false"
+            }),
+            NodeKind::Null => re.is_match("null"),
+            NodeKind::Object | NodeKind::Array => false,
+        }
+    }
+
+    fn value_matches_query(
+        &self,
+        node: &Node,
+        query: &str,
+        query_lower: &str,
+        case_sensitive: bool,
+        exact_match: bool,
+        exact_number: Option<f64>,
+    ) -> bool {
+        match node.kind() {
+            NodeKind::Str => matches_text(
+                self.val_strings.get(node.value_data),
+                query,
+                query_lower,
+                case_sensitive,
+                exact_match,
+            ),
+            NodeKind::Num => {
+                let value = self.nums_pool[node.value_data as usize];
+                if exact_match {
+                    return exact_number.is_some_and(|expected| value == expected);
+                }
+                let mut text = String::new();
+                let _ = write!(text, "{value}");
+                matches_text(&text, query, query_lower, case_sensitive, false)
+            }
+            NodeKind::Bool => matches_text(
+                if node.value_data != 0 {
+                    "true"
+                } else {
+                    "false"
+                },
+                query,
+                query_lower,
+                case_sensitive,
+                exact_match,
+            ),
+            NodeKind::Null => matches_text("null", query, query_lower, case_sensitive, exact_match),
+            NodeKind::Object | NodeKind::Array => false,
         }
     }
 
@@ -748,7 +1145,7 @@ impl JsonIndex {
         path: Option<&str>,
         multiline: bool,
         dot_all: bool,
-    ) -> Vec<(u32, String)> {
+    ) -> Vec<u32> {
         let scope_node_id = match path.map(str::trim).filter(|path| !path.is_empty()) {
             Some(path) => match self.resolve_path(path) {
                 Some(node_id) => Some(node_id),
@@ -757,14 +1154,21 @@ impl JsonIndex {
             None => None,
         };
 
-        let want_keys   = target == "keys"   || target == "both";
+        let want_keys = target == "keys" || target == "both";
         let want_values = target == "values" || target == "both";
+        let (start_id, scoped_nodes) = self.scoped_nodes(scope_node_id);
 
-        let results: Vec<(u32, String)> = if use_regex {
+        if use_regex {
             let mut flags = String::new();
-            if !case_sensitive { flags.push('i'); }
-            if multiline { flags.push('m'); }
-            if dot_all { flags.push('s'); }
+            if !case_sensitive {
+                flags.push('i');
+            }
+            if multiline {
+                flags.push('m');
+            }
+            if dot_all {
+                flags.push('s');
+            }
             let pattern = if flags.is_empty() {
                 query.to_string()
             } else {
@@ -774,127 +1178,77 @@ impl JsonIndex {
                 Ok(r) => r,
                 Err(_) => return vec![],
             };
-            self.nodes
-                .par_iter()
-                .enumerate()
-                .filter_map(|(idx, node)| {
-                    let node_id = idx as u32;
-
-                    // Early skip: key-only search on nodes without a key.
-                    if want_keys && !want_values && node.key().is_none() { return None; }
-
-                    if let Some(scope_id) = scope_node_id {
-                        if !self.is_descendant_or_self(node_id, scope_id) { return None; }
-                    }
-
-                    let matches_key = want_keys
-                        && node.key().map(|kid| re.is_match(self.keys.get(kid))).unwrap_or(false);
-
-                    let matches_value = want_values && match node.kind() {
-                        NodeKind::Str  => re.is_match(self.val_strings.get(node.value_data)),
-                        NodeKind::Num  => re.is_match(&self.nums_pool[node.value_data as usize].to_string()),
-                        // Use static strings for bool to avoid allocation.
-                        NodeKind::Bool => re.is_match(if node.value_data != 0 { "true" } else { "false" }),
-                        _ => false,
-                    };
-
-                    if matches_key || matches_value {
-                        Some((node_id, self.get_path(node_id)))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+            self.collect_matching_ids(start_id, scoped_nodes, max_results, |_, node| {
+                if want_keys && !want_values && node.key().is_none() {
+                    return false;
+                }
+                let matches_key = want_keys && self.key_matches_regex(node, &re);
+                let matches_value = want_values && self.value_matches_regex(node, &re);
+                matches_key || matches_value
+            })
         } else {
-            // For case-insensitive search we lower-case the query once.
-            let query_lower = if case_sensitive { query.to_string() } else { query.to_lowercase() };
+            let query_lower = if case_sensitive {
+                String::new()
+            } else {
+                query.to_lowercase()
+            };
+            let exact_number = if exact_match {
+                query.parse::<f64>().ok()
+            } else {
+                None
+            };
+            let exact_array_index = if exact_match {
+                query.parse::<u32>().ok()
+            } else {
+                None
+            };
 
-            // Fast path: case-sensitive exact key match → O(1) key-pool lookup.
-            // Avoids scanning all nodes: only the subset with that specific key ID.
             if want_keys && !want_values && exact_match && case_sensitive {
-                return match self.keys.id_of(query) {
-                    None => vec![],
-                    Some(target_kid) => {
-                        let mut res: Vec<(u32, String)> = self.nodes
-                            .par_iter()
-                            .enumerate()
-                            .filter_map(|(idx, node)| {
-                                if node.key() != Some(target_kid) { return None; }
-                                let node_id = idx as u32;
-                                if let Some(scope_id) = scope_node_id {
-                                    if !self.is_descendant_or_self(node_id, scope_id) { return None; }
-                                }
-                                Some((node_id, self.get_path(node_id)))
-                            })
-                            .collect();
-                        res.sort_unstable_by_key(|(id, _)| *id);
-                        res.truncate(max_results);
-                        res
-                    }
-                };
+                let target_string_key = self.keys.id_of(query);
+                return self.collect_matching_ids(
+                    start_id,
+                    scoped_nodes,
+                    max_results,
+                    |_, node| match node.key() {
+                        Some(NodeKey::String(id)) => target_string_key == Some(id),
+                        Some(NodeKey::ArrayIndex(index)) => exact_array_index == Some(index),
+                        None => false,
+                    },
+                );
             }
 
-            self.nodes
-                .par_iter()
-                .enumerate()
-                .filter_map(|(idx, node)| {
-                    let node_id = idx as u32;
+            self.collect_matching_ids(start_id, scoped_nodes, max_results, |_, node| {
+                if want_keys && !want_values && node.key().is_none() {
+                    return false;
+                }
+                if want_values
+                    && !want_keys
+                    && matches!(node.kind(), NodeKind::Object | NodeKind::Array)
+                {
+                    return false;
+                }
 
-                    // Early skip: key-only search on nodes without a key.
-                    if want_keys && !want_values && node.key().is_none() { return None; }
-                    // Early skip: value-only search on container nodes.
-                    if want_values && !want_keys && matches!(node.kind(), NodeKind::Object | NodeKind::Array) {
-                        return None;
-                    }
-
-                    if let Some(scope_id) = scope_node_id {
-                        if !self.is_descendant_or_self(node_id, scope_id) { return None; }
-                    }
-
-                    let matches_key = want_keys && node.key().map(|kid| {
-                        let k = self.keys.get(kid);
-                        if case_sensitive {
-                            if exact_match { k == query } else { k.contains(query) }
-                        } else {
-                            // Allocation only for case-insensitive key comparison.
-                            let k_lower = k.to_lowercase();
-                            if exact_match { k_lower == query_lower } else { k_lower.contains(&query_lower) }
-                        }
-                    }).unwrap_or(false);
-
-                    let matches_value = want_values && match node.kind() {
-                        NodeKind::Str => {
-                            let s = self.val_strings.get(node.value_data);
-                            if case_sensitive {
-                                // Zero-alloc: compare &str directly.
-                                if exact_match { s == query } else { s.contains(query) }
-                            } else {
-                                let s_lower = s.to_lowercase();
-                                if exact_match { s_lower == query_lower } else { s_lower.contains(&query_lower) }
-                            }
-                        }
-                        NodeKind::Num => {
-                            let s = self.nums_pool[node.value_data as usize].to_string();
-                            if exact_match { s == query_lower } else { s.contains(&query_lower) }
-                        }
-                        NodeKind::Bool => {
-                            // Use static strings to avoid allocation.
-                            let s = if node.value_data != 0 { "true" } else { "false" };
-                            if exact_match { s == query_lower } else { s.contains(&query_lower) }
-                        }
-                        _ => false,
-                    };
-
-                    if matches_key || matches_value {
-                        Some((node_id, self.get_path(node_id)))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
-        results.into_iter().take(max_results).collect()
+                let matches_key = want_keys
+                    && self.key_matches_query(
+                        node,
+                        query,
+                        &query_lower,
+                        case_sensitive,
+                        exact_match,
+                        exact_array_index,
+                    );
+                let matches_value = want_values
+                    && self.value_matches_query(
+                        node,
+                        query,
+                        &query_lower,
+                        case_sensitive,
+                        exact_match,
+                        exact_number,
+                    );
+                matches_key || matches_value
+            })
+        }
     }
 
     pub fn resolve_path(&self, path: &str) -> Option<u32> {
@@ -912,23 +1266,24 @@ impl JsonIndex {
 
         let mut current = self.root;
         for segment in normalized.split('.').filter(|segment| !segment.is_empty()) {
-            current = self
-                .get_children(current)
-                .into_iter()
-                .find(|&child_id| {
-                    let node = &self.nodes[child_id as usize];
-                    node.key().map_or(false, |kid| self.keys.get(kid) == segment)
-                })?;
+            let parent = &self.nodes[current as usize];
+            current = match parent.kind() {
+                NodeKind::Array => {
+                    let wanted_index = segment.parse::<u32>().ok()?;
+                    self.children_iter(current).find(|&child_id| {
+                        self.nodes[child_id as usize].array_index() == Some(wanted_index)
+                    })?
+                }
+                NodeKind::Object => self.children_iter(current).find(|&child_id| {
+                    self.nodes[child_id as usize]
+                        .string_key_id()
+                        .is_some_and(|kid| self.keys.get(kid) == segment)
+                })?,
+                _ => return None,
+            };
         }
 
         Some(current)
-    }
-
-    fn is_descendant_or_self(&self, node_id: u32, ancestor_id: u32) -> bool {
-        // In DFS preorder layout, node_id is a descendant of ancestor_id iff
-        // ancestor_id <= node_id <= ancestor_id + ancestor_subtree_len
-        let anc = &self.nodes[ancestor_id as usize];
-        node_id >= ancestor_id && node_id <= ancestor_id + anc.subtree_len
     }
 
     fn compile_object_search_filters(
@@ -947,13 +1302,15 @@ impl JsonIndex {
             let mut path_segments = Vec::new();
             for segment in path.split('.').filter(|segment| !segment.is_empty()) {
                 let exact_id = self.keys.id_of(segment);
-                if key_case_sensitive && exact_id.is_none() {
+                let array_index = segment.parse::<u32>().ok();
+                if key_case_sensitive && exact_id.is_none() && array_index.is_none() {
                     return None;
                 }
                 path_segments.push(CompiledPathSegment {
                     raw: segment.to_string(),
                     lower: segment.to_lowercase(),
                     exact_id,
+                    array_index,
                 });
             }
             if path_segments.is_empty() {
@@ -973,6 +1330,11 @@ impl JsonIndex {
                     })
                 }
             };
+            let value_num = if filter.operator == ObjectSearchOperator::Equals {
+                value.as_deref().and_then(|raw| raw.parse::<f64>().ok())
+            } else {
+                None
+            };
             let regex = match filter.operator {
                 ObjectSearchOperator::Regex => {
                     let pattern = value.as_ref()?;
@@ -980,8 +1342,12 @@ impl JsonIndex {
                     if filter.regex_case_insensitive || !value_case_sensitive {
                         flags.push('i');
                     }
-                    if filter.regex_multiline { flags.push('m'); }
-                    if filter.regex_dot_all { flags.push('s'); }
+                    if filter.regex_multiline {
+                        flags.push('m');
+                    }
+                    if filter.regex_dot_all {
+                        flags.push('s');
+                    }
                     let pattern = if flags.is_empty() {
                         pattern.clone()
                     } else {
@@ -996,6 +1362,7 @@ impl JsonIndex {
                 path_segments,
                 operator: filter.operator.clone(),
                 value_cmp,
+                value_num,
                 regex,
             });
         }
@@ -1010,35 +1377,28 @@ impl JsonIndex {
     ) -> Option<u32> {
         let mut current = start_node_id;
         for segment in path_segments {
-            current = self
-                .get_children(current)
-                .into_iter()
-                .find(|&child_id| {
-                    let node = &self.nodes[child_id as usize];
-                    let child_key_id = match node.key() {
-                        Some(k) => k,
-                        None => return false,
+            let parent = &self.nodes[current as usize];
+            current = match parent.kind() {
+                NodeKind::Array => {
+                    let wanted_index = segment.array_index?;
+                    self.children_iter(current).find(|&child_id| {
+                        self.nodes[child_id as usize].array_index() == Some(wanted_index)
+                    })?
+                }
+                NodeKind::Object => self.children_iter(current).find(|&child_id| {
+                    let Some(child_key_id) = self.nodes[child_id as usize].string_key_id() else {
+                        return false;
                     };
                     if key_case_sensitive {
                         return Some(child_key_id) == segment.exact_id;
                     }
                     let child_key = self.keys.get(child_key_id);
-                    child_key.eq_ignore_ascii_case(&segment.raw)
-                        || child_key.to_lowercase() == segment.lower
-                })?;
+                    matches_text(child_key, &segment.raw, &segment.lower, false, true)
+                })?,
+                _ => return None,
+            };
         }
         Some(current)
-    }
-
-    fn scalar_value_for_filter(&self, node_id: u32) -> Option<String> {
-        let node = &self.nodes[node_id as usize];
-        match node.kind() {
-            NodeKind::Str => Some(self.val_strings.get(node.value_data).to_string()),
-            NodeKind::Num => Some(self.nums_pool[node.value_data as usize].to_string()),
-            NodeKind::Bool => Some((node.value_data != 0).to_string()),
-            NodeKind::Null => Some("null".to_string()),
-            NodeKind::Object | NodeKind::Array => None,
-        }
     }
 
     fn object_filter_matches(
@@ -1053,29 +1413,25 @@ impl JsonIndex {
         else {
             return false;
         };
+        let node = &self.nodes[target_id as usize];
 
         match filter.operator {
             ObjectSearchOperator::Exists => true,
-            ObjectSearchOperator::Regex => self
-                .scalar_value_for_filter(target_id)
-                .and_then(|value| filter.regex.as_ref().map(|regex| regex.is_match(&value)))
-                .unwrap_or(false),
-            ObjectSearchOperator::Contains | ObjectSearchOperator::Equals => self
-                .scalar_value_for_filter(target_id)
-                .map(|value| {
-                    let value_cmp = if value_case_sensitive {
-                        value
-                    } else {
-                        value.to_lowercase()
-                    };
-                    let needle = filter.value_cmp.as_deref().unwrap_or_default();
-                    if filter.operator == ObjectSearchOperator::Equals {
-                        value_cmp == needle
-                    } else {
-                        value_cmp.contains(needle)
-                    }
-                })
-                .unwrap_or(false),
+            ObjectSearchOperator::Regex => filter
+                .regex
+                .as_ref()
+                .is_some_and(|regex| self.value_matches_regex(node, regex)),
+            ObjectSearchOperator::Contains | ObjectSearchOperator::Equals => {
+                let needle = filter.value_cmp.as_deref().unwrap_or_default();
+                self.value_matches_query(
+                    node,
+                    needle,
+                    needle,
+                    value_case_sensitive,
+                    filter.operator == ObjectSearchOperator::Equals,
+                    filter.value_num,
+                )
+            }
         }
     }
 
@@ -1104,41 +1460,19 @@ impl JsonIndex {
         else {
             return vec![];
         };
+        let (start_id, scoped_nodes) = self.scoped_nodes(scope_node_id);
 
-        let mut matched_ids: Vec<u32> = self
-            .nodes
-            .par_iter()
-            .enumerate()
-            .filter_map(|(idx, node)| {
-                let node_id = idx as u32;
-                if node.kind() != NodeKind::Object {
-                    return None;
-                }
-                if let Some(scope_id) = scope_node_id {
-                    if !self.is_descendant_or_self(node_id, scope_id) {
-                        return None;
-                    }
-                }
-                if compiled_filters.iter().all(|filter| {
+        self.collect_matching_ids(start_id, scoped_nodes, max_results, |node_id, node| {
+            node.kind() == NodeKind::Object
+                && compiled_filters.iter().all(|filter| {
                     self.object_filter_matches(
                         node_id,
                         filter,
                         key_case_sensitive,
                         value_case_sensitive,
                     )
-                }) {
-                    Some(node_id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        matched_ids
-            // node_id == DFS preorder index (invariante del parser streaming)
-            .par_sort_unstable();
-        matched_ids.truncate(max_results);
-        matched_ids
+                })
+        })
     }
 
     pub fn suggest_property_paths(&self, prefix: &str, limit: usize) -> Vec<String> {
@@ -1156,13 +1490,7 @@ impl JsonIndex {
         let mut suggestions: Vec<&str> = (0..self.keys.len() as u32)
             .map(|id| self.keys.get(id))
             .filter(|candidate| {
-                if segment_prefix.is_empty() {
-                    true
-                } else if candidate.starts_with(segment_prefix) {
-                    true
-                } else {
-                    candidate.to_lowercase().starts_with(&prefix_lower)
-                }
+                starts_with_case_insensitive(candidate, segment_prefix, &prefix_lower)
             })
             .collect();
 
@@ -1219,6 +1547,35 @@ mod tests {
 
     fn idx(json: &str) -> JsonIndex {
         JsonIndex::from_str(json).expect("parse failed")
+    }
+
+    fn search_paths(
+        index: &JsonIndex,
+        query: &str,
+        target: &str,
+        case_sensitive: bool,
+        use_regex: bool,
+        exact_match: bool,
+        max_results: usize,
+        path: Option<&str>,
+        multiline: bool,
+        dot_all: bool,
+    ) -> Vec<String> {
+        index
+            .search(
+                query,
+                target,
+                case_sensitive,
+                use_regex,
+                exact_match,
+                max_results,
+                path,
+                multiline,
+                dot_all,
+            )
+            .into_iter()
+            .map(|id| index.get_path(id))
+            .collect()
     }
 
     // ── BFS correctness ───────────────────────────────────────────────────────
@@ -1352,30 +1709,38 @@ mod tests {
     #[test]
     fn search_by_value() {
         let index = idx(r#"{"name":"Alice","city":"Rome"}"#);
-        let results = index.search("Alice", "values", false, false, false, 10, None, false, false);
+        let results = search_paths(
+            &index, "Alice", "values", false, false, false, 10, None, false, false,
+        );
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, "$.name");
+        assert_eq!(results[0], "$.name");
     }
 
     #[test]
     fn search_by_key() {
         let index = idx(r#"{"username":"bob","email":"b@b.com"}"#);
-        let results = index.search("email", "keys", false, false, false, 10, None, false, false);
+        let results = search_paths(
+            &index, "email", "keys", false, false, false, 10, None, false, false,
+        );
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, "$.email");
+        assert_eq!(results[0], "$.email");
     }
 
     #[test]
     fn search_case_insensitive() {
         let index = idx(r#"{"msg":"Hello World"}"#);
-        let results = index.search("hello", "values", false, false, false, 10, None, false, false);
+        let results = index.search(
+            "hello", "values", false, false, false, 10, None, false, false,
+        );
         assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn search_case_sensitive_no_match() {
         let index = idx(r#"{"msg":"Hello World"}"#);
-        let results = index.search("hello", "values", true, false, false, 10, None, false, false);
+        let results = index.search(
+            "hello", "values", true, false, false, 10, None, false, false,
+        );
         assert_eq!(results.len(), 0);
     }
 
@@ -1416,19 +1781,34 @@ mod tests {
     #[test]
     fn search_exact_match() {
         let index = idx(r#"{"a":"hello world","b":"hello","c":"say hello"}"#);
-        let exact = index.search("hello", "values", false, false, true, 10, None, false, false);
+        let exact = search_paths(
+            &index, "hello", "values", false, false, true, 10, None, false, false,
+        );
         assert_eq!(exact.len(), 1);
-        assert_eq!(exact[0].1, "$.b");
-        let partial = index.search("hello", "values", false, false, false, 10, None, false, false);
+        assert_eq!(exact[0], "$.b");
+        let partial = index.search(
+            "hello", "values", false, false, false, 10, None, false, false,
+        );
         assert_eq!(partial.len(), 3);
     }
 
     #[test]
     fn search_limited_to_path() {
         let index = idx(r#"{"users":[{"name":"Alice"},{"name":"Bob"}],"meta":{"name":"Catalog"}}"#);
-        let results = index.search("name", "keys", false, false, false, 10, Some("$.users.0"), false, false);
+        let results = search_paths(
+            &index,
+            "name",
+            "keys",
+            false,
+            false,
+            false,
+            10,
+            Some("$.users.0"),
+            false,
+            false,
+        );
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, "$.users.0.name");
+        assert_eq!(results[0], "$.users.0.name");
     }
 
     #[test]
@@ -1579,6 +1959,27 @@ mod tests {
     }
 
     #[test]
+    fn search_objects_supports_array_segments_in_paths() {
+        let index = idx(
+            r#"{"items":[{"content":{"mainImage":[{"url":"https://a.example"}]}},{"content":{"mainImage":[{"url":"https://b.example"}]}}]}"#,
+        );
+        let results = index.search_objects(
+            &[ObjectSearchFilter {
+                path: "content.mainImage.0.url".to_string(),
+                operator: ObjectSearchOperator::Contains,
+                value: Some("b.example".to_string()),
+                ..Default::default()
+            }],
+            true,
+            false,
+            10,
+            None,
+        );
+        let paths: Vec<String> = results.into_iter().map(|id| index.get_path(id)).collect();
+        assert_eq!(paths, vec!["$.items.1"]);
+    }
+
+    #[test]
     fn suggest_property_paths_returns_initial_suggestions_on_empty_prefix() {
         let index = idx(r#"{"content":{"mainImage":{"url":"x"}},"marketing_lingua":"it"}"#);
         let suggestions = index.suggest_property_paths("", 5);
@@ -1614,7 +2015,7 @@ mod tests {
         let keys: Vec<&str> = children
             .iter()
             .map(|&id| {
-                let k = index.nodes[id as usize].key().unwrap();
+                let k = index.nodes[id as usize].string_key_id().unwrap();
                 index.keys.get(k)
             })
             .collect();
@@ -1652,6 +2053,18 @@ mod tests {
             .filter(|&id| index.keys.get(id) == "name")
             .count();
         assert_eq!(name_count, 1);
+    }
+
+    #[test]
+    fn array_indexes_are_not_interned_as_keys() {
+        let index = idx(r#"["a","b","c"]"#);
+        assert!(index.keys.id_of("0").is_none());
+        assert!(index.keys.id_of("1").is_none());
+        assert!(index.keys.id_of("2").is_none());
+        assert_eq!(
+            index.get_path(index.get_children_slice(index.root)[1]),
+            "$.1"
+        );
     }
 
     #[test]
