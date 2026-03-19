@@ -9,10 +9,20 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 const LARGE_FILE_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
+const VERY_LARGE_FILE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 const NODE_CAP_DIVISOR_DEFAULT: u64 = 50;
-const NODE_CAP_DIVISOR_LARGE_FILE: u64 = 46;
+const NODE_CAP_DIVISOR_LARGE_FILE: u64 = 55;
+const NODE_CAP_DIVISOR_VERY_LARGE_FILE: u64 = 80;
 const STRING_BYTES_DIVISOR_DEFAULT: u64 = 10;
-const STRING_BYTES_DIVISOR_LARGE_FILE: u64 = 8;
+const STRING_BYTES_DIVISOR_LARGE_FILE: u64 = 20;
+const STRING_BYTES_DIVISOR_VERY_LARGE_FILE: u64 = 40;
+/// For files > VERY_LARGE_FILE_THRESHOLD_BYTES, string values longer than this
+/// are stored truncated in val_strings.  This caps memory used by long strings
+/// (descriptions, URLs, base64 blobs) while keeping the UI display correct
+/// (previews are already limited to 80 chars).  The raw export of truncated
+/// nodes will be shortened.
+const VERY_LARGE_FILE_STR_MAX_BYTES: usize = 256;
+
 
 // ---- InternedStrings ----
 // Compact pool for string values: a single Vec<u8> for bytes + open-addressing
@@ -205,24 +215,28 @@ impl InternedStrings {
 }
 
 fn capacity_hints(file_size: u64) -> (usize, usize) {
-    let (node_divisor, string_divisor) = if file_size >= LARGE_FILE_THRESHOLD_BYTES {
+    let (node_divisor, string_divisor) = if file_size >= VERY_LARGE_FILE_THRESHOLD_BYTES {
+        (
+            NODE_CAP_DIVISOR_VERY_LARGE_FILE,
+            STRING_BYTES_DIVISOR_VERY_LARGE_FILE,
+        )
+    } else if file_size >= LARGE_FILE_THRESHOLD_BYTES {
         (NODE_CAP_DIVISOR_LARGE_FILE, STRING_BYTES_DIVISOR_LARGE_FILE)
     } else {
         (NODE_CAP_DIVISOR_DEFAULT, STRING_BYTES_DIVISOR_DEFAULT)
     };
-    let node_cap = (file_size / node_divisor).min(250_000_000) as usize;
-    let str_bytes = (file_size / string_divisor).min(750_000_000) as usize;
+    // For very large files, cap node_cap conservatively – we prefer one
+    // Vec doubling over pre-allocating hundreds of MB that may never be used.
+    let node_cap = (file_size / node_divisor).min(80_000_000) as usize;
+    let str_bytes = (file_size / string_divisor).min(200_000_000) as usize;
     (node_cap.max(1024), str_bytes.max(4096))
 }
 
 fn shrink_vec_if_wasteful<T>(vec: &mut Vec<T>) {
-    let len = vec.len();
-    if len == 0 {
+    // Shrink to exact length: the small overhead of a potential future
+    // reallocation is far cheaper than holding unused capacity in a large file.
+    if vec.capacity() > vec.len() {
         vec.shrink_to_fit();
-        return;
-    }
-    if vec.capacity() > len + len / 4 {
-        vec.shrink_to(len + len / 16);
     }
 }
 
@@ -539,7 +553,8 @@ fn matches_text(
 
 struct StreamCtx {
     nodes: Vec<Node>,
-    parent_deltas: Vec<u16>,
+    /// Parent distance packed as u8.  u8::MAX (255) = overflow → see parent_overflow_*.
+    parent_deltas: Vec<u8>,
     parent_overflow_ids: Vec<u32>,
     parent_overflow_values: Vec<u32>,
     container_subtrees: Vec<u32>,
@@ -547,6 +562,9 @@ struct StreamCtx {
     keys: InternedStrings,
     val_strings: InternedStrings,
     nums_pool: Vec<f64>, // f64 pool: NodeKind::Num → nums_pool[value_data]
+    /// Maximum bytes to store per string value (0 = unlimited).
+    /// Set to VERY_LARGE_FILE_STR_MAX_BYTES for files over the threshold.
+    str_max_bytes: usize,
 }
 
 impl StreamCtx {
@@ -557,7 +575,7 @@ impl StreamCtx {
         // JSON keys: few short strings (e.g. field names). Estimate: 1% of nodes, 20 bytes/key.
         let key_n = (node_cap / 100).max(64);
         let key_bytes = key_n * 20;
-        let parent_overflow_cap = (node_cap / 1024).max(16);
+        let parent_overflow_cap = (node_cap / 256).max(16);
         let container_cap = (node_cap / 4).max(64);
         // String values: ~30% of nodes, deduplicated bytes already passed as str_bytes.
         let val_n = node_cap * 3 / 10;
@@ -573,6 +591,7 @@ impl StreamCtx {
             keys: InternedStrings::with_capacity(key_n, key_bytes),
             val_strings: InternedStrings::with_capacity(val_n, str_bytes),
             nums_pool: Vec::with_capacity(num_cap),
+            str_max_bytes: 0,
         }
     }
 
@@ -594,10 +613,10 @@ impl StreamCtx {
             self.parent_deltas.push(0);
         } else {
             let delta = id - parent;
-            if delta < u16::MAX as u32 {
-                self.parent_deltas.push(delta as u16);
+            if delta < u8::MAX as u32 {
+                self.parent_deltas.push(delta as u8);
             } else {
-                self.parent_deltas.push(u16::MAX);
+                self.parent_deltas.push(u8::MAX);
                 self.parent_overflow_ids.push(id);
                 self.parent_overflow_values.push(parent);
             }
@@ -710,11 +729,24 @@ impl<'de> Visitor<'de> for ValVisitor {
     }
     fn visit_str<E: de::Error>(self, v: &str) -> Result<u32, E> {
         Ok(self.ctx.with_mut(|ctx| {
-            let sid = ctx.val_strings.intern(v);
+            let s = if ctx.str_max_bytes > 0 && v.len() > ctx.str_max_bytes {
+                // Truncate at a valid UTF-8 boundary to cap memory usage.
+                let mut end = ctx.str_max_bytes;
+                while !v.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &v[..end]
+            } else {
+                v
+            };
+            let sid = ctx.val_strings.intern(s);
             ctx.alloc(NodeKind::Str, self.key, sid, self.parent)
         }))
     }
     fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<u32, E> {
+        // sonic-rs provides borrowed slices for escape-free strings; we use the
+        // bytes directly for hash/comparison without an extra copy, then intern
+        // them (copy only if new) into the compact val_strings pool.
         self.visit_str(v)
     }
     fn visit_unit<E: de::Error>(self) -> Result<u32, E> {
@@ -791,15 +823,18 @@ fn finish_index(ctx: StreamCtx) -> JsonIndex {
         keys: mut keys_pool,
         mut val_strings,
         mut nums_pool,
+        str_max_bytes: _,
     } = ctx;
 
-    // Shrink all Vecs to actual size, releasing over-allocated capacity.
+    // Shrink all Vecs to exact length, releasing over-allocated capacity.
     shrink_vec_if_wasteful(&mut nodes);
     shrink_vec_if_wasteful(&mut parent_deltas);
     shrink_vec_if_wasteful(&mut parent_overflow_ids);
     shrink_vec_if_wasteful(&mut parent_overflow_values);
     shrink_vec_if_wasteful(&mut nums_pool);
 
+    // Release the value-strings hash table – only needed during parsing.
+    // Keep keys_pool.index: it is used by search (keys.id_of fast-path).
     val_strings.release_lookup_index();
     shrink_vec_if_wasteful(&mut val_strings.data);
     shrink_vec_if_wasteful(&mut val_strings.offsets);
@@ -824,15 +859,17 @@ fn finish_index(ctx: StreamCtx) -> JsonIndex {
 }
 
 fn parse_streaming<'de, D: de::Deserializer<'de>>(de: D) -> Result<JsonIndex, D::Error> {
-    parse_streaming_with_cap(de, 0, 0)
+    parse_streaming_with_cap(de, 0, 0, 0)
 }
 
 fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(
     de: D,
     node_cap: usize,
     str_bytes: usize,
+    str_max_bytes: usize,
 ) -> Result<JsonIndex, D::Error> {
     let mut ctx = StreamCtx::with_capacity(node_cap, str_bytes);
+    ctx.str_max_bytes = str_max_bytes;
     let ctx_ptr = StreamCtxPtr::new(&mut ctx);
     let ctx_ptr: StreamCtxPtr<'static> = unsafe { std::mem::transmute(ctx_ptr) };
     de.deserialize_any(ValVisitor {
@@ -847,13 +884,14 @@ fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(
 
 pub struct JsonIndex {
     pub nodes: Vec<Node>,
-    pub parent_deltas: Vec<u16>,
+    /// Parent distance packed as u8 (255 = overflow → parent_overflow_*).
+    pub parent_deltas: Vec<u8>,
     pub parent_overflow_ids: Vec<u32>,
     pub parent_overflow_values: Vec<u32>,
     pub container_subtrees: Vec<u32>, // subtree_len per container (same index as container_meta)
     pub container_children: Vec<u16>, // children_len per container (capped at 65535)
     pub keys: InternedStrings,
-    pub val_strings: InternedStrings, // string values: compact zero-alloc pool
+    pub val_strings: InternedStrings, // compact interned string-value pool
     pub nums_pool: Vec<f64>,          // numeric values: NodeKind::Num(idx) → nums_pool[idx]
     pub root: u32,
 }
@@ -1014,7 +1052,7 @@ impl JsonIndex {
     pub fn heap_bytes_breakdown(&self) -> HeapBytesBreakdown {
         HeapBytesBreakdown {
             nodes: self.nodes.capacity() * std::mem::size_of::<Node>(),
-            parent_index: self.parent_deltas.capacity() * std::mem::size_of::<u16>()
+            parent_index: self.parent_deltas.capacity() * std::mem::size_of::<u8>()
                 + self.parent_overflow_ids.capacity() * std::mem::size_of::<u32>()
                 + self.parent_overflow_values.capacity() * std::mem::size_of::<u32>(),
             container_meta: self.container_subtrees.capacity() * std::mem::size_of::<u32>()
@@ -1036,7 +1074,7 @@ impl JsonIndex {
         if delta == 0 {
             return None;
         }
-        if delta != u16::MAX {
+        if delta != u8::MAX {
             return Some(id - delta as u32);
         }
         let overflow_idx = self
@@ -1044,6 +1082,13 @@ impl JsonIndex {
             .binary_search(&id)
             .expect("parent overflow entry missing");
         Some(self.parent_overflow_values[overflow_idx])
+    }
+
+    /// Returns the interned string value for a `NodeKind::Str` node.
+    #[inline]
+    pub fn str_val_of_node<'a>(&'a self, node: &Node) -> &'a str {
+        debug_assert_eq!(node.kind(), NodeKind::Str);
+        self.val_strings.get(node.value_data)
     }
 
     fn scoped_nodes(&self, scope_node_id: Option<u32>) -> (u32, &[Node]) {
@@ -1137,19 +1182,25 @@ impl JsonIndex {
             return Err("file is empty".to_string());
         }
 
-        // Conservative capacity hints so the internal Vecs grow at most once.
         let (node_cap, str_bytes) = capacity_hints(file_size);
 
-        // Map the file read-only. Safety: we only read, and the file is not
-        // modified during this call.
+        // Map the file read-only for SIMD-accelerated parsing.
+        // SAFETY: we only read; the file must not be modified while mapped.
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
         let _ = mmap.advise(memmap2::Advice::Sequential);
 
+        let str_max = if file_size >= VERY_LARGE_FILE_THRESHOLD_BYTES {
+            VERY_LARGE_FILE_STR_MAX_BYTES
+        } else {
+            0
+        };
         let mut de = sonic_rs::Deserializer::from_slice(&mmap[..]);
-        let result =
-            parse_streaming_with_cap(&mut de, node_cap, str_bytes).map_err(|e| e.to_string());
+        let result = parse_streaming_with_cap(&mut de, node_cap, str_bytes, str_max)
+            .map_err(|e| e.to_string());
 
-        // mmap is dropped here: virtual address space released, no persistent overhead.
+        // Drop the mmap immediately: releases the 1 GB of virtual address space
+        // and the pages brought into RAM by the sequential scan.  All string
+        // values have been interned into the compact val_strings pool.
         drop(mmap);
         result
     }
@@ -1291,7 +1342,7 @@ impl JsonIndex {
                 }
                 NodeKind::Str => {
                     out.push('"');
-                    json_escape_into(&mut out, self.val_strings.get(node.value_data));
+                    json_escape_into(&mut out, self.str_val_of_node(node));
                     out.push('"');
                 }
                 NodeKind::Num => {
@@ -1439,7 +1490,7 @@ impl JsonIndex {
 
     fn value_matches_regex(&self, node: &Node, re: &Regex) -> bool {
         match node.kind() {
-            NodeKind::Str => re.is_match(self.val_strings.get(node.value_data)),
+            NodeKind::Str => re.is_match(self.str_val_of_node(node)),
             NodeKind::Num => {
                 let mut text = StackString::<64>::new();
                 re.is_match(self.format_number(node, &mut text))
@@ -1465,7 +1516,7 @@ impl JsonIndex {
     ) -> bool {
         match node.kind() {
             NodeKind::Str => matches_text(
-                self.val_strings.get(node.value_data),
+                self.str_val_of_node(node),
                 query,
                 query_lower,
                 case_sensitive,
@@ -1616,7 +1667,7 @@ impl JsonIndex {
                         want_values
                             && match node.kind() {
                                 NodeKind::Str => finder
-                                    .find(self.val_strings.get(node.value_data).as_bytes())
+                                    .find(self.str_val_of_node(node).as_bytes())
                                     .is_some(),
                                 NodeKind::Num => {
                                     let mut text = StackString::<64>::new();

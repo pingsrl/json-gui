@@ -594,9 +594,22 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
 
       resetTreeCaches();
 
+      // Cache root node so loadMoreChildren can look it up by id.
+      nodeMapCache.set(info.root_node.id, info.root_node);
       for (const n of info.root_children) {
         nodeMapCache.set(n.id, n);
       }
+
+      // When the root has more children than what the backend returned (paged),
+      // seed the children cache and add a load-more sentinel exactly as done
+      // for expanded non-root nodes with many children.
+      const rootChildren =
+        info.root_node.children_count > LARGE_NODE_PAGE_SIZE
+          ? (() => {
+              cacheSet(info.root_node.id, info.root_children);
+              return decoratePagedChildren(info.root_node, info.root_children, 0);
+            })()
+          : info.root_children;
 
       const prev = get().recentFiles.filter((f) => f !== path);
       const recentFiles = [path, ...prev].slice(0, MAX_RECENT);
@@ -607,7 +620,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
         nodeCount: info.node_count,
         sizeBytes: info.size_bytes,
         rootNode: info.root_node,
-        rootChildren: info.root_children,
+        rootChildren,
         expandedNodes,
         selectedNodeId: null,
         selectedNode: null,
@@ -638,16 +651,25 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
 
       resetTreeCaches();
 
+      nodeMapCache.set(info.root_node.id, info.root_node);
       for (const n of info.root_children) {
         nodeMapCache.set(n.id, n);
       }
+
+      const rootChildren =
+        info.root_node.children_count > LARGE_NODE_PAGE_SIZE
+          ? (() => {
+              cacheSet(info.root_node.id, info.root_children);
+              return decoratePagedChildren(info.root_node, info.root_children, 0);
+            })()
+          : info.root_children;
 
       set({
         filePath: "(incollato)",
         nodeCount: info.node_count,
         sizeBytes: info.size_bytes,
         rootNode: info.root_node,
-        rootChildren: info.root_children,
+        rootChildren,
         expandedNodes,
         selectedNodeId: null,
         selectedNode: null,
@@ -751,8 +773,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
 
   loadMoreChildren: async (parentId: number, offset: number) => {
     const startedAtMs = performance.now();
-    const { rootChildren } = get();
-    const parentNode = getKnownNode(parentId, rootChildren);
+    const { rootChildren, rootNode } = get();
+    const isRoot = rootNode !== null && parentId === rootNode.id;
+    const parentNode = isRoot ? rootNode : getKnownNode(parentId, rootChildren);
     if (!parentNode || parentNode.children_count <= LARGE_NODE_PAGE_SIZE) {
       return;
     }
@@ -772,21 +795,32 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     }
     registerChildren(parentId, page);
 
-    set((state) => {
-      if (!state.expandedNodes.has(parentId)) {
-        return state;
-      }
-      const next = new Map(state.expandedNodes);
-      next.set(parentId, nextChildren);
-      const selectedNodeSiblings =
-        state.selectedNodeId !== null
-          ? findSiblings(state.selectedNodeId, state.rootChildren, next)
-          : null;
-      return {
-        expandedNodes: next,
-        selectedNodeSiblings
-      };
-    });
+    if (isRoot) {
+      // Root children live in rootChildren state, not in expandedNodes.
+      set((state) => ({
+        rootChildren: nextChildren,
+        selectedNodeSiblings:
+          state.selectedNodeId !== null
+            ? findSiblings(state.selectedNodeId, nextChildren, state.expandedNodes)
+            : null
+      }));
+    } else {
+      set((state) => {
+        if (!state.expandedNodes.has(parentId)) {
+          return state;
+        }
+        const next = new Map(state.expandedNodes);
+        next.set(parentId, nextChildren);
+        const selectedNodeSiblings =
+          state.selectedNodeId !== null
+            ? findSiblings(state.selectedNodeId, state.rootChildren, next)
+            : null;
+        return {
+          expandedNodes: next,
+          selectedNodeSiblings
+        };
+      });
+    }
     await finishOperationMeasurement("node-expansion-page", startedAtMs, set, get);
   },
 

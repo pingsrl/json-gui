@@ -223,7 +223,7 @@ fn node_value_preview(index: &JsonIndex, id: u32) -> Cow<'static, str> {
             }
         }
         NodeKind::Str => {
-            let s = index.val_strings.get(node.value_data);
+            let s = index.str_val_of_node(node);
             let truncated = truncate_str(s, 80);
             if truncated.len() < s.len() {
                 Cow::Owned(format!("\"{}…\"", truncated))
@@ -288,8 +288,11 @@ pub async fn open_file(
 
     let node_count = index.nodes.len();
     let root_node = node_to_dto(&index, index.root);
+    // Cap to the same page size the frontend uses for large nodes so that
+    // we never serialize / transmit millions of NodeDtos in one shot.
     let root_children: Vec<NodeDto> = index
         .children_iter(index.root)
+        .take(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)
         .map(|id| node_to_dto(&index, id))
         .collect();
     *state.window_index(webview_window.label()).write().unwrap() = Some(index);
@@ -526,7 +529,7 @@ pub async fn search(
             let value_preview = match node.kind() {
                 NodeKind::Str => format!(
                     "\"{}\"",
-                    truncate_str(index.val_strings.get(node.value_data), 60)
+                    truncate_str(index.str_val_of_node(node), 60)
                 ),
                 NodeKind::Num => index.number_to_string(id),
                 NodeKind::Bool => (node.value_data != 0).to_string(),
@@ -890,6 +893,7 @@ pub async fn open_from_string(
     let root_node = node_to_dto(&index, index.root);
     let root_children: Vec<NodeDto> = index
         .children_iter(index.root)
+        .take(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)
         .map(|id| node_to_dto(&index, id))
         .collect();
     *state.window_index(webview_window.label()).write().unwrap() = Some(index);
