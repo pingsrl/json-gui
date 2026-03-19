@@ -378,11 +378,6 @@ struct StreamCtx {
 }
 
 impl StreamCtx {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        Self::with_capacity(0, 0)
-    }
-
     /// Pre-allocates the main Vecs to avoid doublings during parsing.
     /// `node_cap`    = estimated nodes (file_size / 50).
     /// `str_bytes`   = estimated unique bytes for val_strings (file_size / 10).
@@ -638,7 +633,8 @@ struct CompiledPathSegment {
 impl JsonIndex {
     /// Returns the ids of direct children of `id`, computed from DFS preorder.
     /// First child = id+1; next sibling = prev_child + prev_child.subtree_len + 1.
-    pub fn get_children(&self, id: u32) -> Vec<u32> {
+    #[inline]
+    pub fn get_children_slice(&self, id: u32) -> Vec<u32> {
         let node = &self.nodes[id as usize];
         let count = node.children_len as usize;
         let mut out = Vec::with_capacity(count);
@@ -648,13 +644,6 @@ impl JsonIndex {
             cur += self.nodes[cur as usize].subtree_len + 1;
         }
         out
-    }
-
-    /// Returns a Vec of direct children ids (same as get_children).
-    /// Name kept for minimal diff in callers.
-    #[inline]
-    pub fn get_children_slice(&self, id: u32) -> Vec<u32> {
-        self.get_children(id)
     }
 
     /// Zero-alloc iterator over direct children of `id`.
