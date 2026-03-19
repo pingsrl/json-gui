@@ -56,6 +56,10 @@ export interface Translations {
   propertiesHeader: string;
   nodes: (n: string) => string;
   size: (s: string) => string;
+  ram: (s: string) => string;
+  cpu: (s: string) => string;
+  lastOperation: string;
+  noOperation: string;
   updateToastAvailable: string;
   updateToastLatest: string;
   updateToastError: string;
@@ -139,6 +143,10 @@ const translations: Record<Lang, Translations> = {
     propertiesHeader: "Properties",
     nodes: (n: string) => `Nodes: ${n}`,
     size: (s: string) => `Size: ${s}`,
+    ram: (s: string) => `RAM: ${s}`,
+    cpu: (s: string) => `CPU: ${s}`,
+    lastOperation: "Last op",
+    noOperation: "No operations yet",
     updateToastAvailable: "Update available! Use the toolbar button.",
     updateToastLatest: "You're already on the latest version.",
     updateToastError: "Unable to check for updates.",
@@ -234,6 +242,10 @@ const translations: Record<Lang, Translations> = {
     propertiesHeader: "Proprietà",
     nodes: (n: string) => `Nodi: ${n}`,
     size: (s: string) => `Dimensione: ${s}`,
+    ram: (s: string) => `RAM: ${s}`,
+    cpu: (s: string) => `CPU: ${s}`,
+    lastOperation: "Ultima op",
+    noOperation: "Nessuna operazione",
     updateToastAvailable:
       "Aggiornamento disponibile! Usa il pulsante in barra.",
     updateToastLatest: "Sei già all'ultima versione.",
@@ -330,6 +342,10 @@ const translations: Record<Lang, Translations> = {
     propertiesHeader: "属性",
     nodes: (n: string) => `节点数: ${n}`,
     size: (s: string) => `大小: ${s}`,
+    ram: (s: string) => `内存: ${s}`,
+    cpu: (s: string) => `CPU: ${s}`,
+    lastOperation: "最近操作",
+    noOperation: "暂无操作",
     updateToastAvailable: "有可用更新！使用工具栏中的按钮。",
     updateToastLatest: "您已是最新版本。",
     updateToastError: "无法检查更新。",

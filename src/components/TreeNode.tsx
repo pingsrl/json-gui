@@ -8,7 +8,8 @@ const TYPE_COLORS: Record<string, string> = {
   boolean: "text-amber-600 dark:text-yellow-400",
   null: "text-gray-400 dark:text-gray-500",
   object: "text-purple-600 dark:text-purple-400",
-  array: "text-orange-600 dark:text-orange-400"
+  array: "text-orange-600 dark:text-orange-400",
+  "load-more": "text-sky-600 dark:text-sky-400"
 };
 
 interface Props {
@@ -20,27 +21,43 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
   const {
     expandedNodes,
     toggleNode,
+    loadMoreChildren,
     selectNode,
     selectedNodeId,
     focusedNodeId,
     showContextMenu
   } = useJsonStore();
+  const isLoadMore = node.synthetic_kind === "load-more";
   const hasChildren = node.children_count > 0;
   const isExpanded = expandedNodes.has(node.id);
-  const isSelected = selectedNodeId === node.id;
-  const isFocused = focusedNodeId === node.id;
+  const isSelected = !isLoadMore && selectedNodeId === node.id;
+  const isFocused = !isLoadMore && focusedNodeId === node.id;
 
   const handleSelect = () => {
+    if (isLoadMore) {
+      if (node.parent_node_id !== undefined && node.next_offset !== undefined) {
+        void loadMoreChildren(node.parent_node_id, node.next_offset);
+      }
+      return;
+    }
     void selectNode(node);
   };
 
   const handleToggle = (e?: React.MouseEvent) => {
     e?.stopPropagation();
+    if (isLoadMore) {
+      handleSelect();
+      return;
+    }
     if (!hasChildren) return;
     void toggleNode(node.id);
   };
 
   const handleDoubleClick = () => {
+    if (isLoadMore) {
+      handleSelect();
+      return;
+    }
     handleSelect();
     if (hasChildren) {
       void toggleNode(node.id);
@@ -48,6 +65,7 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
   };
 
   const handleContextMenu = (e: React.MouseEvent) => {
+    if (isLoadMore) return;
     e.preventDefault();
     e.stopPropagation();
     void selectNode(node);
@@ -74,7 +92,7 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
       style={{ paddingLeft: `${depth * 16 + 8}px` }}
       onClick={handleSelect}
       onDoubleClick={handleDoubleClick}
-      onContextMenu={handleContextMenu}
+      onContextMenu={isLoadMore ? undefined : handleContextMenu}
       title={node.value_preview}
       data-node-id={node.id}
     >
@@ -88,7 +106,7 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
             : "Leaf node"
         }
         className="w-4 text-gray-400 dark:text-gray-500 flex-shrink-0 flex items-center justify-center disabled:cursor-default"
-        disabled={!hasChildren}
+        disabled={!hasChildren && !isLoadMore}
         onClick={handleToggle}
       >
         {hasChildren ? (
@@ -109,7 +127,7 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
       >
         {node.value_preview}
       </span>
-      {hasChildren && (
+      {hasChildren && !isLoadMore && (
         <span className="text-gray-400 dark:text-gray-600 text-xs ml-1 flex-shrink-0">
           ({node.children_count})
         </span>

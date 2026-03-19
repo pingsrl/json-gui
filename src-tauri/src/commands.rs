@@ -6,7 +6,8 @@ use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 use tauri::{Emitter, Manager, State, WindowEvent};
 
 pub struct AppState {
@@ -18,6 +19,7 @@ pub struct AppState {
     /// Raw JSON pre-loaded for a window opened via "Open in new window".
     /// Key = window label; consumed exactly once by get_pending_content.
     pub pending_content: std::sync::Mutex<HashMap<String, String>>,
+    pub runtime_monitor: Mutex<RuntimeMonitor>,
 }
 
 impl AppState {
@@ -41,6 +43,50 @@ impl AppState {
     pub fn remove_window(&self, label: &str) {
         self.windows.write().unwrap().remove(label);
         self.pending_content.lock().unwrap().remove(label);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeSample {
+    resident_bytes: u64,
+    total_cpu_ns: u64,
+    captured_at: Instant,
+}
+
+impl RuntimeSample {
+    fn cpu_percent_since(&self, previous: RuntimeSample) -> f32 {
+        let elapsed = self.captured_at.duration_since(previous.captured_at);
+        let elapsed_secs = elapsed.as_secs_f64();
+        if elapsed_secs <= f64::EPSILON {
+            return 0.0;
+        }
+        let cpu_delta_ns = self.total_cpu_ns.saturating_sub(previous.total_cpu_ns) as f64;
+        ((cpu_delta_ns / 1_000_000_000.0) / elapsed_secs * 100.0) as f32
+    }
+}
+
+pub struct RuntimeMonitor {
+    last_sample: Option<RuntimeSample>,
+}
+
+impl RuntimeMonitor {
+    pub fn new() -> Self {
+        Self {
+            last_sample: read_runtime_sample().ok(),
+        }
+    }
+
+    fn snapshot(&mut self) -> Result<RuntimeStats, String> {
+        let sample = read_runtime_sample()?;
+        let cpu_percent = self
+            .last_sample
+            .map(|previous| sample.cpu_percent_since(previous))
+            .unwrap_or(0.0);
+        self.last_sample = Some(sample);
+        Ok(RuntimeStats {
+            resident_bytes: sample.resident_bytes,
+            cpu_percent,
+        })
     }
 }
 
@@ -73,6 +119,12 @@ pub struct SearchResult {
     /// Arc<str> instead of String: all results from the same search_objects call
     /// share the same string via reference-counting (O(1) clone).
     pub match_preview: Option<Arc<str>>,
+}
+
+#[derive(Serialize)]
+pub struct RuntimeStats {
+    pub resident_bytes: u64,
+    pub cpu_percent: f32,
 }
 
 #[derive(Deserialize)]
@@ -213,6 +265,7 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
 }
 
 const PROGRESS_EVENT_THRESHOLD: u64 = 200 * 1024 * 1024; // 200 MB
+const EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT: usize = 1_000;
 
 #[tauri::command]
 pub async fn open_file(
@@ -264,6 +317,120 @@ pub async fn get_children(
     Ok(children)
 }
 
+#[tauri::command]
+pub async fn get_children_page(
+    node_id: u32,
+    offset: usize,
+    limit: usize,
+    state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
+) -> Result<Vec<NodeDto>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
+    let index = guard.as_ref().ok_or("Nessun file aperto")?;
+    let children: Vec<NodeDto> = index
+        .children_iter(node_id)
+        .skip(offset)
+        .take(limit)
+        .map(|id| node_to_dto(index, id))
+        .collect();
+    Ok(children)
+}
+
+#[tauri::command]
+pub fn get_runtime_stats(state: State<'_, AppState>) -> Result<RuntimeStats, String> {
+    state.runtime_monitor.lock().unwrap().snapshot()
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct RusageInfoV4 {
+    ri_uuid: [u8; 16],
+    ri_user_time: u64,
+    ri_system_time: u64,
+    ri_pkg_idle_wkups: u64,
+    ri_interrupt_wkups: u64,
+    ri_pageins: u64,
+    ri_wired_size: u64,
+    ri_resident_size: u64,
+    ri_phys_footprint: u64,
+    ri_proc_start_abstime: u64,
+    ri_proc_exit_abstime: u64,
+    ri_child_user_time: u64,
+    ri_child_system_time: u64,
+    ri_child_pkg_idle_wkups: u64,
+    ri_child_interrupt_wkups: u64,
+    ri_child_pageins: u64,
+    ri_child_elapsed_abstime: u64,
+    ri_diskio_bytesread: u64,
+    ri_diskio_byteswritten: u64,
+    ri_cpu_time_qos_default: u64,
+    ri_cpu_time_qos_maintenance: u64,
+    ri_cpu_time_qos_background: u64,
+    ri_cpu_time_qos_utility: u64,
+    ri_cpu_time_qos_legacy: u64,
+    ri_cpu_time_qos_user_initiated: u64,
+    ri_cpu_time_qos_user_interactive: u64,
+    ri_billed_system_time: u64,
+    ri_serviced_system_time: u64,
+    ri_logical_writes: u64,
+    ri_lifetime_max_phys_footprint: u64,
+    ri_instructions: u64,
+    ri_cycles: u64,
+    ri_billed_energy: u64,
+    ri_serviced_energy: u64,
+    ri_interval_max_phys_footprint: u64,
+    ri_runnable_time: u64,
+}
+
+#[cfg(target_os = "macos")]
+const RUSAGE_INFO_V4: std::ffi::c_int = 4;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_pid_rusage(
+        pid: std::ffi::c_int,
+        flavor: std::ffi::c_int,
+        buffer: *mut core::ffi::c_void,
+    ) -> std::ffi::c_int;
+}
+
+#[cfg(target_os = "macos")]
+fn read_runtime_sample() -> Result<RuntimeSample, String> {
+    let mut usage = std::mem::MaybeUninit::<RusageInfoV4>::zeroed();
+    let result = unsafe {
+        proc_pid_rusage(
+            std::process::id() as std::ffi::c_int,
+            RUSAGE_INFO_V4,
+            usage.as_mut_ptr().cast(),
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "proc_pid_rusage failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let usage = unsafe { usage.assume_init() };
+    Ok(RuntimeSample {
+        resident_bytes: usage.ri_resident_size,
+        total_cpu_ns: usage.ri_user_time.saturating_add(usage.ri_system_time),
+        captured_at: Instant::now(),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_runtime_sample() -> Result<RuntimeSample, String> {
+    Ok(RuntimeSample {
+        resident_bytes: 0,
+        total_cpu_ns: 0,
+        captured_at: Instant::now(),
+    })
+}
+
 /// Recursively expands the subtree rooted at `node_id`.
 /// Returns a list of (parent_id, children) pairs for every node that has children
 /// in the subtree. Capped at `max_nodes` total nodes (default 50_000) to
@@ -294,15 +461,23 @@ pub async fn expand_subtree(
             continue;
         }
 
-        total_nodes += children_ids.len();
+        let remaining_budget = limit.saturating_sub(total_nodes);
+        if remaining_budget == 0 {
+            break;
+        }
+        let visible_children_ids = &children_ids[..children_ids
+            .len()
+            .min(remaining_budget)
+            .min(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)];
+        total_nodes += visible_children_ids.len();
 
-        for &child_id in &children_ids {
+        for &child_id in visible_children_ids {
             if total_nodes < limit && index.has_children(child_id) {
                 queue.push(child_id);
             }
         }
 
-        let children: Vec<NodeDto> = children_ids
+        let children: Vec<NodeDto> = visible_children_ids
             .iter()
             .map(|&id| node_to_dto(index, id))
             .collect();

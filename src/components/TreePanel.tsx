@@ -1,15 +1,23 @@
-import { useRef, useEffect, useMemo, type FC } from "react";
+import { useRef, useEffect, useMemo, useCallback, type FC } from "react";
 import { FolderOpen, ChevronDown } from "lucide-react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { useJsonStore, getParentId } from "../store";
+import {
+  useJsonStore,
+  getParentId,
+  getVisibleSlice,
+  buildVisibleSubtreeSizeMap,
+  countVisibleNodes,
+  findVisibleNodeIndex
+} from "../store";
 import { useI18n } from "../i18n";
 import { TreeNode } from "./TreeNode";
+
+const SLICE_PADDING = 40;
 
 export const TreePanel: FC = () => {
   const {
     rootNode,
     rootChildren,
-    visibleNodes,
     selectedNodeId,
     focusedNodeId,
     expandedNodes,
@@ -20,54 +28,110 @@ export const TreePanel: FC = () => {
   } = useJsonStore();
   const { t } = useI18n();
   const treeRef = useRef<HTMLDivElement>(null);
-  const getVNodeAt = (index: number) => visibleNodes[index] ?? null;
+
+  const subtreeSizeMap = useMemo(
+    () => buildVisibleSubtreeSizeMap(rootChildren, expandedNodes),
+    [rootChildren, expandedNodes]
+  );
+  const visibleCount = useMemo(
+    () => countVisibleNodes(rootChildren, expandedNodes, subtreeSizeMap),
+    [rootChildren, expandedNodes, subtreeSizeMap]
+  );
 
   const rowVirtualizer = useVirtualizer({
-    count: visibleNodes.length,
+    count: visibleCount,
     getScrollElement: () => treeRef.current,
     estimateSize: () => 24,
     overscan: 20
   });
   const virtualItems = rowVirtualizer.getVirtualItems();
 
-  // Indice O(1): nodeId → posizione in visibleNodes; ricalcolato solo su expand/collapse
-  const visibleIndexMap = useMemo(() => {
-    const map = new Map<number, number>();
-    visibleNodes.forEach((vn, i) => map.set(vn.node.id, i));
-    return map;
-  }, [visibleNodes]);
+  const sliceStart = virtualItems.length > 0
+    ? Math.max(virtualItems[0].index - SLICE_PADDING, 0)
+    : 0;
+  const sliceEnd = virtualItems.length > 0
+    ? Math.min(virtualItems[virtualItems.length - 1].index + SLICE_PADDING + 1, visibleCount)
+    : Math.min(visibleCount, SLICE_PADDING * 2);
+  const visibleSlice = useMemo(
+    () =>
+      getVisibleSlice(
+        rootChildren,
+        expandedNodes,
+        sliceStart,
+        sliceEnd - sliceStart,
+        subtreeSizeMap
+      ),
+    [rootChildren, expandedNodes, sliceStart, sliceEnd, subtreeSizeMap]
+  );
+  const focusedIndexRef = useRef<{ nodeId: number | null; index: number }>({
+    nodeId: null,
+    index: -1
+  });
+  const treeStateRef = useRef({ rootChildren, expandedNodes });
+  treeStateRef.current = { rootChildren, expandedNodes };
 
-  // Ref sempre aggiornato: permette all'effect di leggere la mappa corrente
-  // senza dipendere da essa (evita lo scroll-to-selected su ogni expand/collapse)
-  const visibleIndexMapRef = useRef(visibleIndexMap);
-  visibleIndexMapRef.current = visibleIndexMap;
+  const getVNodeAt = useCallback(
+    (index: number) => {
+      if (index < 0 || index >= visibleCount) return null;
+      if (index >= sliceStart && index < sliceEnd) {
+        return visibleSlice[index - sliceStart] ?? null;
+      }
+      return (
+        getVisibleSlice(rootChildren, expandedNodes, index, 1, subtreeSizeMap)[0] ??
+        null
+      );
+    },
+    [
+      expandedNodes,
+      rootChildren,
+      sliceEnd,
+      sliceStart,
+      subtreeSizeMap,
+      visibleCount,
+      visibleSlice
+    ]
+  );
+
+  useEffect(() => {
+    focusedIndexRef.current = {
+      nodeId: focusedNodeId,
+      index:
+        focusedNodeId === null
+          ? -1
+          : findVisibleNodeIndex(rootChildren, expandedNodes, focusedNodeId)
+    };
+  }, [expandedNodes, focusedNodeId, rootChildren]);
 
   // Scroll al nodo selezionato — scatta SOLO quando selectedNodeId cambia
   useEffect(() => {
     if (selectedNodeId === null) return;
-    const idx = visibleIndexMapRef.current.get(selectedNodeId) ?? -1;
+    const { rootChildren, expandedNodes } = treeStateRef.current;
+    const idx = findVisibleNodeIndex(rootChildren, expandedNodes, selectedNodeId);
     if (idx >= 0) rowVirtualizer.scrollToIndex(idx, { align: "center" });
+    focusedIndexRef.current = { nodeId: selectedNodeId, index: idx };
   }, [selectedNodeId, rowVirtualizer]);
 
   // Ref sempre aggiornato con i valori correnti — evita di ri-registrare il listener
   // ad ogni expand/collapse (da N dipendenze a 1)
   const kbStateRef = useRef({
-    visibleIndexMap,
-    visibleNodes,
+    visibleCount,
     expandedNodes,
     toggleNode,
     setFocusedNode,
     rowVirtualizer,
-    focusedNodeId
+    focusedNodeId,
+    getVNodeAt,
+    rootChildren
   });
   kbStateRef.current = {
-    visibleIndexMap,
-    visibleNodes,
+    visibleCount,
     expandedNodes,
     toggleNode,
     setFocusedNode,
     rowVirtualizer,
-    focusedNodeId
+    focusedNodeId,
+    getVNodeAt,
+    rootChildren
   };
 
   // Navigazione tastiera — ri-registrata solo quando cambia rootChildren (apertura file)
@@ -85,34 +149,42 @@ export const TreePanel: FC = () => {
       e.preventDefault();
 
       const {
-        visibleIndexMap,
-        visibleNodes,
+        visibleCount,
         expandedNodes,
         toggleNode,
         setFocusedNode,
         rowVirtualizer,
-        focusedNodeId
+        focusedNodeId,
+        getVNodeAt,
+        rootChildren
       } = kbStateRef.current;
 
-      if (visibleNodes.length === 0) return;
+      if (visibleCount === 0) return;
 
-      const getVNodeAt = (i: number) => visibleNodes[i] ?? null;
-
-      // Lookup O(1) via index map invece di findIndex O(n)
-      const idx = focusedNodeId !== null ? (visibleIndexMap.get(focusedNodeId) ?? -1) : -1;
+      const idx =
+        focusedNodeId !== null
+          ? focusedIndexRef.current.nodeId === focusedNodeId
+            ? focusedIndexRef.current.index
+            : findVisibleNodeIndex(rootChildren, expandedNodes, focusedNodeId)
+          : -1;
+      if (focusedNodeId !== null) {
+        focusedIndexRef.current = { nodeId: focusedNodeId, index: idx };
+      }
 
       if (e.key === "ArrowDown") {
-        const nextIdx = idx < visibleNodes.length - 1 ? idx + 1 : 0;
+        const nextIdx = idx < visibleCount - 1 ? idx + 1 : 0;
         const next = getVNodeAt(nextIdx);
         if (next) {
           setFocusedNode(next.node.id);
+          focusedIndexRef.current = { nodeId: next.node.id, index: nextIdx };
           rowVirtualizer.scrollToIndex(nextIdx, { align: "auto" });
         }
       } else if (e.key === "ArrowUp") {
-        const prevIdx = idx > 0 ? idx - 1 : visibleNodes.length - 1;
+        const prevIdx = idx > 0 ? idx - 1 : visibleCount - 1;
         const prev = getVNodeAt(prevIdx);
         if (prev) {
           setFocusedNode(prev.node.id);
+          focusedIndexRef.current = { nodeId: prev.node.id, index: prevIdx };
           rowVirtualizer.scrollToIndex(prevIdx, { align: "auto" });
         }
       } else if (e.key === "ArrowRight") {
@@ -129,9 +201,11 @@ export const TreePanel: FC = () => {
           const parentId = getParentId(vNode.node.id);
           if (parentId !== undefined) {
             setFocusedNode(parentId);
-            const parentIdx = visibleIndexMap.get(parentId) ?? -1;
-            if (parentIdx >= 0)
+            const parentIdx = findVisibleNodeIndex(rootChildren, expandedNodes, parentId);
+            focusedIndexRef.current = { nodeId: parentId, index: parentIdx };
+            if (parentIdx >= 0) {
               rowVirtualizer.scrollToIndex(parentIdx, { align: "auto" });
+            }
           }
         }
       } else if (e.key === "Enter") {
@@ -195,7 +269,7 @@ export const TreePanel: FC = () => {
             }}
           >
             {virtualItems.map((vItem) => {
-              const vNode = getVNodeAt(vItem.index);
+              const vNode = visibleSlice[vItem.index - sliceStart] ?? null;
               return (
                 <div
                   key={vItem.key}

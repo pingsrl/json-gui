@@ -7,7 +7,15 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { buildVisibleNodes, insertVisibleChildren, sortSearchResults } from './store'
+import {
+  buildVisibleNodes,
+  buildVisibleSubtreeSizeMap,
+  countVisibleNodes,
+  getVisibleSlice,
+  findVisibleNodeIndex,
+  insertVisibleChildren,
+  sortSearchResults,
+} from './store'
 import type { NodeDto, SearchResult, VNode } from './store'
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -174,6 +182,58 @@ describe('insertVisibleChildren', () => {
 
     expect(withGrandchild.map((v) => v.node.id)).toEqual([1, 10, 100])
     expect(withGrandchild.map((v) => v.depth)).toEqual([0, 1, 2])
+  })
+})
+
+describe('visible slice helpers', () => {
+  it('calcola il conteggio visibile senza materializzare tutto l albero', () => {
+    const grandchild = makeNode(100, 'gc')
+    const child = makeNode(10, 'c', 'object', 1)
+    const sibling = makeNode(2, 's')
+    const parent = makeNode(1, 'p', 'object', 1)
+    const expanded = new Map<number, NodeDto[]>([
+      [1, [child]],
+      [10, [grandchild]],
+    ])
+
+    const sizeMap = buildVisibleSubtreeSizeMap([parent, sibling], expanded)
+
+    expect(sizeMap.get(10)).toBe(2)
+    expect(sizeMap.get(1)).toBe(3)
+    expect(countVisibleNodes([parent, sibling], expanded, sizeMap)).toBe(4)
+  })
+
+  it('estrae una slice visibile corretta a meta albero', () => {
+    const grandchild = makeNode(100, 'gc')
+    const child = makeNode(10, 'c', 'object', 1)
+    const sibling = makeNode(2, 's')
+    const parent = makeNode(1, 'p', 'object', 1)
+    const expanded = new Map<number, NodeDto[]>([
+      [1, [child]],
+      [10, [grandchild]],
+    ])
+    const sizeMap = buildVisibleSubtreeSizeMap([parent, sibling], expanded)
+
+    const slice = getVisibleSlice([parent, sibling], expanded, 1, 2, sizeMap)
+
+    expect(slice.map((v) => v.node.id)).toEqual([10, 100])
+    expect(slice.map((v) => v.depth)).toEqual([1, 2])
+  })
+
+  it('trova l indice visibile di un nodo in preorder', () => {
+    const grandchild = makeNode(100, 'gc')
+    const child = makeNode(10, 'c', 'object', 1)
+    const sibling = makeNode(2, 's')
+    const parent = makeNode(1, 'p', 'object', 1)
+    const expanded = new Map<number, NodeDto[]>([
+      [1, [child]],
+      [10, [grandchild]],
+    ])
+
+    expect(findVisibleNodeIndex([parent, sibling], expanded, 1)).toBe(0)
+    expect(findVisibleNodeIndex([parent, sibling], expanded, 10)).toBe(1)
+    expect(findVisibleNodeIndex([parent, sibling], expanded, 100)).toBe(2)
+    expect(findVisibleNodeIndex([parent, sibling], expanded, 2)).toBe(3)
   })
 })
 

@@ -128,6 +128,7 @@ pub fn run() {
             windows: RwLock::new(HashMap::new()),
             initial_path: std::sync::Mutex::new(None),
             pending_content: std::sync::Mutex::new(HashMap::new()),
+            runtime_monitor: std::sync::Mutex::new(commands::RuntimeMonitor::new()),
         })
         .setup(|app| {
             // Windows/Linux: the file is passed as a CLI argument
@@ -290,6 +291,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::get_children,
+            commands::get_children_page,
+            commands::get_runtime_stats,
             commands::expand_subtree,
             commands::get_path,
             commands::search,
