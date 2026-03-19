@@ -32,6 +32,10 @@ tauri-plugin-process = "2"
 name = "expand_bench"
 harness = false
 
+[[bench]]
+name = "memory_bench"
+harness = false
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 

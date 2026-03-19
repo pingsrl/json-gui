@@ -1,15 +1,20 @@
-use memmap2::Mmap;
 use rayon::prelude::*;
+use std::io::BufReader;
 use regex::Regex;
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::fs::File;
+use std::rc::Rc;
+use std::sync::Arc;
 
 // ---- StringPool ----
+// Usa Arc<str> per evitare la duplicazione dei byte tra Vec e HashMap:
+// Vec e HashMap condividono lo stesso heap tramite reference counting.
 
 pub struct StringPool {
-    pub strings: Vec<String>,
-    map: HashMap<String, u32>,
+    pub strings: Vec<Arc<str>>,
+    map: HashMap<Arc<str>, u32>,
 }
 
 impl StringPool {
@@ -25,8 +30,9 @@ impl StringPool {
             return id;
         }
         let id = self.strings.len() as u32;
-        self.strings.push(s.to_string());
-        self.map.insert(s.to_string(), id);
+        let arc: Arc<str> = s.into();
+        self.strings.push(Arc::clone(&arc));
+        self.map.insert(arc, id);
         id
     }
 
@@ -39,14 +45,115 @@ impl StringPool {
     }
 }
 
+// ---- InternedStrings ----
+// Pool compatto per i valori stringa: un unico Vec<u8> per i byte + tabella hash
+// open-addressing su Vec<u32> (4 byte/slot). Zero allocazioni per stringa,
+// zero raddoppio dei byte come in HashMap<String> o HashMap<Arc<str>>.
+// Memory per N stringhe uniche, T byte totali: T + 13N byte.
+
+pub struct InternedStrings {
+    pub data: Vec<u8>,    // byte di tutte le stringhe uniche, concatenati
+    pub offsets: Vec<u32>, // inizio di ogni stringa in data
+    pub lens: Vec<u32>,   // lunghezza in byte di ogni stringa
+    index: Vec<u32>,      // tabella hash open-addressing: slot → (id+1), 0=libero
+    index_mask: u32,      // capacità - 1 (capacità è potenza di 2)
+}
+
+impl InternedStrings {
+    pub fn new() -> Self {
+        let cap = 1024usize;
+        Self {
+            data: Vec::new(),
+            offsets: Vec::new(),
+            lens: Vec::new(),
+            index: vec![0u32; cap],
+            index_mask: (cap - 1) as u32,
+        }
+    }
+
+    #[inline]
+    fn fnv1a(s: &[u8]) -> u32 {
+        let mut h = 2166136261u32;
+        for &b in s {
+            h ^= b as u32;
+            h = h.wrapping_mul(16777619);
+        }
+        h
+    }
+
+    pub fn intern(&mut self, s: &str) -> u32 {
+        // Cresce l'indice se carico > 75%
+        if (self.offsets.len() + 1) * 4 > self.index.len() * 3 {
+            self.grow_index();
+        }
+        let bytes = s.as_bytes();
+        let hash = Self::fnv1a(bytes);
+        let mut slot = hash & self.index_mask;
+        loop {
+            let entry = self.index[slot as usize];
+            if entry == 0 {
+                // Slot libero: inserisce nuova stringa
+                let id = self.offsets.len() as u32;
+                self.offsets.push(self.data.len() as u32);
+                self.lens.push(bytes.len() as u32);
+                self.data.extend_from_slice(bytes);
+                self.index[slot as usize] = id + 1;
+                return id;
+            }
+            // Controlla se la stringa già presente corrisponde
+            let eid = (entry - 1) as usize;
+            let start = self.offsets[eid] as usize;
+            let len = self.lens[eid] as usize;
+            if &self.data[start..start + len] == bytes {
+                return eid as u32;
+            }
+            // Collisione: probing lineare
+            slot = (slot + 1) & self.index_mask;
+        }
+    }
+
+    fn grow_index(&mut self) {
+        let new_cap = (self.index.len() * 2).max(16);
+        let new_mask = (new_cap - 1) as u32;
+        let mut new_index = vec![0u32; new_cap];
+        for id in 0..self.offsets.len() {
+            let start = self.offsets[id] as usize;
+            let len = self.lens[id] as usize;
+            let hash = Self::fnv1a(&self.data[start..start + len]);
+            let mut slot = hash & new_mask;
+            while new_index[slot as usize] != 0 {
+                slot = (slot + 1) & new_mask;
+            }
+            new_index[slot as usize] = (id as u32) + 1;
+        }
+        self.index = new_index;
+        self.index_mask = new_mask;
+    }
+
+    #[inline]
+    pub fn get(&self, id: u32) -> &str {
+        let start = self.offsets[id as usize] as usize;
+        let len = self.lens[id as usize] as usize;
+        // SAFETY: solo stringhe UTF-8 valide inserite via intern(&str)
+        unsafe { std::str::from_utf8_unchecked(&self.data[start..start + len]) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+}
+
 // ---- NodeValue ----
 
+// NodeValue usa u32 per tutti i payload (Str=index in val_strings, Num=index in nums_pool)
+// così il payload max è 4 byte → enum occupa 8 byte invece di 16 (con f64 diretta).
+// Risparmio: 21M nodi × 8 byte = ~168 MB su file da 1GB.
 #[derive(Debug, Clone)]
 pub enum NodeValue {
     Object,
     Array,
-    Str(String),
-    Num(f64),
+    Str(u32),  // index in JsonIndex.val_strings
+    Num(u32),  // index in JsonIndex.nums_pool: Vec<f64>
     Bool(bool),
     Null,
 }
@@ -55,9 +162,9 @@ pub enum NodeValue {
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    pub id: u32,
-    pub parent: Option<u32>,
-    pub key: Option<u32>, // index in keys pool
+    // id rimosso - usa l'indice nel Vec
+    pub parent: u32,          // u32::MAX = nodo root (no parent)
+    pub key: u32,             // u32::MAX = no key
     pub value: NodeValue,
     pub children_start: u32,
     pub children_len: u32,
@@ -65,14 +172,214 @@ pub struct Node {
     pub preorder_index: u32,
 }
 
-// ---- TempNode used during BFS build ----
+// ---- Parser streaming: zero allocazioni intermedie ----
+//
+// I Node finali vengono allocati DIRETTAMENTE durante lo streaming DFS.
+// La linked-list per i figli usa tre Vec<u32> paralleli (first_child, last_child,
+// next_sibling) invece di per-nodo Vec<u32> → zero doppia allocazione durante parsing.
+// finish_index linearizza le linked-list nel flat children_arena e calcola
+// preorder/subtree, poi droppa le tre Vec temporanee.
 
-struct TempNode {
-    id: u32,
-    parent: Option<u32>,
-    key: Option<u32>,
-    value: NodeValue,
-    children: Vec<u32>,
+struct StreamCtx {
+    nodes: Vec<Node>,
+    first_child: Vec<u32>,   // first_child[id] = primo figlio di id, u32::MAX se foglia
+    last_child: Vec<u32>,    // last_child[id]  = ultimo figlio di id, per append O(1)
+    next_sibling: Vec<u32>,  // next_sibling[id] = fratello successivo, u32::MAX se ultimo
+    keys: StringPool,
+    val_strings: InternedStrings,
+    nums_pool: Vec<f64>,     // pool f64: NodeValue::Num(idx) → nums_pool[idx]
+}
+
+impl StreamCtx {
+    fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    /// Pre-alloca i Vec principali per evitare il raddoppio durante il parsing.
+    /// `node_cap` = stima del numero di nodi (es. file_size / 50).
+    fn with_capacity(node_cap: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(node_cap),
+            first_child: Vec::with_capacity(node_cap),
+            last_child: Vec::with_capacity(node_cap),
+            next_sibling: Vec::with_capacity(node_cap),
+            keys: StringPool::new(),
+            val_strings: InternedStrings::new(),
+            nums_pool: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self, value: NodeValue, parent: u32, key: u32) -> u32 {
+        let id = self.nodes.len() as u32;
+        self.nodes.push(Node {
+            parent,
+            key,
+            value,
+            children_start: 0,  // riempito in finish_index
+            children_len: 0,    // incrementato ad ogni figlio
+            subtree_len: 1,     // riempito in finish_index
+            preorder_index: 0,  // riempito in finish_index
+        });
+        self.first_child.push(u32::MAX);
+        self.last_child.push(u32::MAX);
+        self.next_sibling.push(u32::MAX);
+        if parent != u32::MAX {
+            let last = self.last_child[parent as usize];
+            if last == u32::MAX {
+                self.first_child[parent as usize] = id;
+            } else {
+                self.next_sibling[last as usize] = id;
+            }
+            self.last_child[parent as usize] = id;
+            self.nodes[parent as usize].children_len += 1;
+        }
+        id
+    }
+}
+
+struct ValSeed {
+    ctx: Rc<RefCell<StreamCtx>>,
+    parent: u32,
+    key: u32,
+}
+
+impl<'de> DeserializeSeed<'de> for ValSeed {
+    type Value = u32;
+    fn deserialize<D: de::Deserializer<'de>>(self, de: D) -> Result<u32, D::Error> {
+        de.deserialize_any(ValVisitor { ctx: self.ctx, parent: self.parent, key: self.key })
+    }
+}
+
+struct ValVisitor {
+    ctx: Rc<RefCell<StreamCtx>>,
+    parent: u32,
+    key: u32,
+}
+
+impl<'de> Visitor<'de> for ValVisitor {
+    type Value = u32;
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "un valore JSON")
+    }
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<u32, E> {
+        Ok(self.ctx.borrow_mut().alloc(NodeValue::Bool(v), self.parent, self.key))
+    }
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<u32, E> {
+        let mut ctx = self.ctx.borrow_mut();
+        let nid = ctx.nums_pool.len() as u32;
+        ctx.nums_pool.push(v as f64);
+        Ok(ctx.alloc(NodeValue::Num(nid), self.parent, self.key))
+    }
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<u32, E> {
+        let mut ctx = self.ctx.borrow_mut();
+        let nid = ctx.nums_pool.len() as u32;
+        ctx.nums_pool.push(v as f64);
+        Ok(ctx.alloc(NodeValue::Num(nid), self.parent, self.key))
+    }
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<u32, E> {
+        let mut ctx = self.ctx.borrow_mut();
+        let nid = ctx.nums_pool.len() as u32;
+        ctx.nums_pool.push(v);
+        Ok(ctx.alloc(NodeValue::Num(nid), self.parent, self.key))
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<u32, E> {
+        let sid = self.ctx.borrow_mut().val_strings.intern(v);
+        Ok(self.ctx.borrow_mut().alloc(NodeValue::Str(sid), self.parent, self.key))
+    }
+    fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<u32, E> {
+        self.visit_str(v)
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<u32, E> {
+        Ok(self.ctx.borrow_mut().alloc(NodeValue::Null, self.parent, self.key))
+    }
+    fn visit_none<E: de::Error>(self) -> Result<u32, E> {
+        Ok(self.ctx.borrow_mut().alloc(NodeValue::Null, self.parent, self.key))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<u32, A::Error> {
+        let id = self.ctx.borrow_mut().alloc(NodeValue::Object, self.parent, self.key);
+        while let Some(key_str) = map.next_key::<String>()? {
+            let kid = self.ctx.borrow_mut().keys.intern(&key_str);
+            map.next_value_seed(ValSeed { ctx: Rc::clone(&self.ctx), parent: id, key: kid })?;
+        }
+        Ok(id)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<u32, A::Error> {
+        let id = self.ctx.borrow_mut().alloc(NodeValue::Array, self.parent, self.key);
+        let mut index = 0usize;
+        loop {
+            let kid = self.ctx.borrow_mut().keys.intern(&index.to_string());
+            if seq
+                .next_element_seed(ValSeed { ctx: Rc::clone(&self.ctx), parent: id, key: kid })?
+                .is_none()
+            {
+                break;
+            }
+            index += 1;
+        }
+        Ok(id)
+    }
+}
+
+/// Finalizza il JsonIndex: linearizza le linked-list in un flat children_arena,
+/// poi calcola preorder_index e subtree_len. Le tre Vec temporanee vengono droppate
+/// non appena non servono più, minimizzando il picco di RAM.
+fn finish_index(ctx: StreamCtx) -> JsonIndex {
+    let StreamCtx { mut nodes, first_child, last_child: _, next_sibling, keys, val_strings, nums_pool } = ctx;
+
+    let n = nodes.len();
+    let total_children: usize = nodes.iter().map(|nd| nd.children_len as usize).sum();
+    let mut children_arena: Vec<u32> = Vec::with_capacity(total_children);
+
+    // Linearizza le linked-list in children_arena e aggiorna children_start in ogni Node
+    for id in 0..n {
+        let children_start = children_arena.len() as u32;
+        let mut c = first_child[id];
+        while c != u32::MAX {
+            children_arena.push(c);
+            c = next_sibling[c as usize];
+        }
+        nodes[id].children_start = children_start;
+        // children_len già impostato durante alloc()
+    }
+
+    // Droppa subito le tre Vec temporanee (~3 × 84 MB = 252 MB liberati)
+    drop(first_child);
+    drop(next_sibling);
+
+    // Calcola preorder_index (DFS iterativo)
+    let mut next_preorder = 0u32;
+    let mut stack = vec![0u32];
+    while let Some(nid) = stack.pop() {
+        nodes[nid as usize].preorder_index = next_preorder;
+        next_preorder += 1;
+        let nd = &nodes[nid as usize];
+        let (s, e) = (nd.children_start as usize, (nd.children_start + nd.children_len) as usize);
+        for &c in children_arena[s..e].iter().rev() {
+            stack.push(c);
+        }
+    }
+
+    // Calcola subtree_len (bottom-up)
+    for idx in (0..nodes.len()).rev() {
+        let (s, e) = {
+            let nd = &nodes[idx];
+            (nd.children_start as usize, (nd.children_start + nd.children_len) as usize)
+        };
+        let sub: u32 = children_arena[s..e].iter().map(|&c| nodes[c as usize].subtree_len).sum();
+        nodes[idx].subtree_len = 1 + sub;
+    }
+
+    JsonIndex { nodes, children: children_arena, keys, val_strings, nums_pool, root: 0 }
+}
+
+fn parse_streaming<'de, D: de::Deserializer<'de>>(de: D) -> Result<JsonIndex, D::Error> {
+    parse_streaming_with_cap(de, 0)
+}
+
+fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(de: D, node_cap: usize) -> Result<JsonIndex, D::Error> {
+    let ctx = Rc::new(RefCell::new(StreamCtx::with_capacity(node_cap)));
+    de.deserialize_any(ValVisitor { ctx: Rc::clone(&ctx), parent: u32::MAX, key: u32::MAX })?;
+    Ok(finish_index(Rc::try_unwrap(ctx).ok().expect("ctx: more than one Rc reference").into_inner()))
 }
 
 // ---- JsonIndex ----
@@ -81,6 +388,8 @@ pub struct JsonIndex {
     pub nodes: Vec<Node>,
     pub children: Vec<u32>,
     pub keys: StringPool,
+    pub val_strings: InternedStrings, // stringhe dei valori: pool compatto zero-alloc
+    pub nums_pool: Vec<f64>,          // valori numerici: NodeValue::Num(idx) → nums_pool[idx]
     pub root: u32,
 }
 
@@ -130,142 +439,34 @@ impl JsonIndex {
     }
 
     pub fn from_str(json: &str) -> Result<Self, String> {
-        let value: serde_json::Value = sonic_rs::from_str(json).map_err(|e| e.to_string())?;
-        Self::build_index(value)
+        let mut de = serde_json::Deserializer::from_str(json);
+        parse_streaming(&mut de).map_err(|e| e.to_string())
     }
 
-    /// Carica da file, usando memory-map per file >50MB.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, String> {
+        let mut de = serde_json::Deserializer::from_slice(bytes);
+        parse_streaming(&mut de).map_err(|e| e.to_string())
+    }
+
+    /// Carica da file: BufReader da 1MB per parsing streaming a basso consumo RAM.
+    /// Stima il numero di nodi dal file_size (≈ 1 nodo ogni 50 byte) per pre-allocare
+    /// i Vec interni ed evitare il raddoppio della capacità durante il parsing.
     pub fn from_file(path: &str) -> Result<Self, String> {
         let file = File::open(path).map_err(|e| e.to_string())?;
-        let metadata = file.metadata().map_err(|e| e.to_string())?;
-        let size = metadata.len();
-        if size > 50 * 1024 * 1024 {
-            let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
-            let json = std::str::from_utf8(&mmap).map_err(|e| e.to_string())?;
-            Self::from_str(json)
-        } else {
-            let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-            Self::from_str(&content)
-        }
+        let file_size = file.metadata().map_err(|e| e.to_string())?.len();
+        // Stima conservativa: 1 nodo ogni 50 byte. Pone la capacità iniziale senza
+        // sovra-allocare, così il Vec cresce al massimo una volta invece di fare
+        // log2(N) raddoppi da 0 → 32M con un picco di capacità 2× necessario.
+        let node_cap = (file_size / 50).min(200_000_000) as usize;
+        let reader = BufReader::with_capacity(1 << 20, file);
+        let mut de = serde_json::Deserializer::from_reader(reader);
+        parse_streaming_with_cap(&mut de, node_cap).map_err(|e| e.to_string())
     }
 
-    /// Parsing streaming da qualsiasi reader (usato per file >200MB con progress callback).
+    /// Parsing veramente streaming: legge dal disco a chunk senza buffering in RAM.
     pub fn from_reader<R: std::io::Read>(reader: R) -> Result<Self, String> {
-        let value: serde_json::Value =
-            serde_json::from_reader(reader).map_err(|e| e.to_string())?;
-        Self::build_index(value)
-    }
-
-    /// Costruisce l'indice con BFS iterativo (no ricorsione).
-    fn build_index(root_value: serde_json::Value) -> Result<Self, String> {
-        let mut keys = StringPool::new();
-        let mut temp_nodes: Vec<TempNode> = Vec::new();
-
-        // BFS queue: (value, parent, key, pre-assigned id)
-        // L'ID viene assegnato al momento dell'accodamento, non dell'elaborazione,
-        // così tutti i fratelli ricevono ID distinti anche prima di essere processati.
-        let mut next_id: u32 = 0;
-        let mut queue: VecDeque<(serde_json::Value, Option<u32>, Option<u32>, u32)> =
-            VecDeque::new();
-        queue.push_back((root_value, None, None, next_id));
-        next_id += 1;
-
-        while let Some((value, parent, key, id)) = queue.pop_front() {
-            let node_value = match &value {
-                serde_json::Value::Object(_) => NodeValue::Object,
-                serde_json::Value::Array(_) => NodeValue::Array,
-                serde_json::Value::String(s) => NodeValue::Str(s.clone()),
-                serde_json::Value::Number(n) => NodeValue::Num(n.as_f64().unwrap_or(0.0)),
-                serde_json::Value::Bool(b) => NodeValue::Bool(*b),
-                serde_json::Value::Null => NodeValue::Null,
-            };
-
-            temp_nodes.push(TempNode {
-                id,
-                parent,
-                key,
-                value: node_value,
-                children: Vec::new(),
-            });
-
-            match value {
-                serde_json::Value::Object(map) => {
-                    for (k, v) in map {
-                        let kid = keys.intern(&k);
-                        let child_id = next_id;
-                        next_id += 1;
-                        temp_nodes[id as usize].children.push(child_id);
-                        queue.push_back((v, Some(id), Some(kid), child_id));
-                    }
-                }
-                serde_json::Value::Array(arr) => {
-                    for (i, v) in arr.into_iter().enumerate() {
-                        let kid = keys.intern(&i.to_string());
-                        let child_id = next_id;
-                        next_id += 1;
-                        temp_nodes[id as usize].children.push(child_id);
-                        queue.push_back((v, Some(id), Some(kid), child_id));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Flatten temp_nodes into flat children arena
-        let total_children: usize = temp_nodes.iter().map(|n| n.children.len()).sum();
-        let mut children: Vec<u32> = Vec::with_capacity(total_children);
-        let mut nodes: Vec<Node> = Vec::with_capacity(temp_nodes.len());
-
-        for tn in temp_nodes {
-            let children_start = children.len() as u32;
-            let children_len = tn.children.len() as u32;
-            children.extend_from_slice(&tn.children);
-            nodes.push(Node {
-                id: tn.id,
-                parent: tn.parent,
-                key: tn.key,
-                value: tn.value,
-                children_start,
-                children_len,
-                subtree_len: 1,
-                preorder_index: 0,
-            });
-        }
-
-        let mut next_preorder_index = 0u32;
-        let mut stack = vec![0u32];
-        while let Some(node_id) = stack.pop() {
-            nodes[node_id as usize].preorder_index = next_preorder_index;
-            next_preorder_index += 1;
-
-            let node = &nodes[node_id as usize];
-            let start = node.children_start as usize;
-            let end = start + node.children_len as usize;
-            for &child_id in children[start..end].iter().rev() {
-                stack.push(child_id);
-            }
-        }
-
-        for idx in (0..nodes.len()).rev() {
-            let child_ids: Vec<u32> = {
-                let node = &nodes[idx];
-                let start = node.children_start as usize;
-                let end = start + node.children_len as usize;
-                children[start..end].to_vec()
-            };
-            let subtree_len = 1 + child_ids
-                .iter()
-                .map(|&child_id| nodes[child_id as usize].subtree_len)
-                .sum::<u32>();
-            nodes[idx].subtree_len = subtree_len;
-        }
-
-        Ok(JsonIndex {
-            nodes,
-            children,
-            keys,
-            root: 0,
-        })
+        let mut de = serde_json::Deserializer::from_reader(reader);
+        parse_streaming(&mut de).map_err(|e| e.to_string())
     }
 
     pub fn expanded_visible_count(&self) -> usize {
@@ -370,8 +571,8 @@ impl JsonIndex {
                                 for (i, &child_id) in children_slice.iter().enumerate().rev() {
                                     stack.push(Task::Node(child_id));
                                     let child_node = &self.nodes[child_id as usize];
-                                    if let Some(kid) = child_node.key {
-                                        stack.push(Task::Key(kid));
+                                    if child_node.key != u32::MAX {
+                                        stack.push(Task::Key(child_node.key));
                                     }
                                     if i > 0 {
                                         stack.push(Task::Literal(","));
@@ -394,13 +595,13 @@ impl JsonIndex {
                                 out.push('[');
                             }
                         }
-                        NodeValue::Str(s) => {
+                        NodeValue::Str(sid) => {
                             out.push('"');
-                            json_escape_into(&mut out, s);
+                            json_escape_into(&mut out, self.val_strings.get(*sid));
                             out.push('"');
                         }
-                        NodeValue::Num(n) => {
-                            let f = *n;
+                        NodeValue::Num(nid) => {
+                            let f = self.nums_pool[*nid as usize];
                             if f.fract() == 0.0 && f.abs() < 1e15 {
                                 let i = f as i64;
                                 out.push_str(&i.to_string());
@@ -428,13 +629,11 @@ impl JsonIndex {
         let mut current = node_id;
         loop {
             let node = &self.nodes[current as usize];
-            if let Some(kid) = node.key {
-                key_ids.push(kid);
+            if node.key != u32::MAX {
+                key_ids.push(node.key);
             }
-            match node.parent {
-                Some(p) => current = p,
-                None => break,
-            }
+            if node.parent == u32::MAX { break; }
+            current = node.parent;
         }
         key_ids.reverse();
         if key_ids.is_empty() {
@@ -490,27 +689,29 @@ impl JsonIndex {
             };
             self.nodes
                 .par_iter()
-                .filter_map(|node| {
+                .enumerate()
+                .filter_map(|(idx, node)| {
+                    let node_id = idx as u32;
                     if let Some(scope_id) = scope_node_id {
-                        if !self.is_descendant_or_self(node.id, scope_id) {
+                        if !self.is_descendant_or_self(node_id, scope_id) {
                             return None;
                         }
                     }
 
-                    let key_str: Option<&str> = node.key.map(|kid| self.keys.get(kid));
+                    let key_str: Option<&str> = if node.key != u32::MAX { Some(self.keys.get(node.key)) } else { None };
                     let matches_key = (target == "keys" || target == "both")
                         && key_str.map(|k| re.is_match(k)).unwrap_or(false);
 
                     let matches_value = (target == "values" || target == "both")
                         && match &node.value {
-                            NodeValue::Str(s) => re.is_match(s),
-                            NodeValue::Num(n) => re.is_match(&n.to_string()),
+                            NodeValue::Str(sid) => re.is_match(self.val_strings.get(*sid)),
+                            NodeValue::Num(nid) => re.is_match(&self.nums_pool[*nid as usize].to_string()),
                             NodeValue::Bool(b) => re.is_match(&b.to_string()),
                             _ => false,
                         };
 
                     if matches_key || matches_value {
-                        Some((node.id, self.get_path(node.id)))
+                        Some((node_id, self.get_path(node_id)))
                     } else {
                         None
                     }
@@ -525,14 +726,16 @@ impl JsonIndex {
 
             self.nodes
                 .par_iter()
-                .filter_map(|node| {
+                .enumerate()
+                .filter_map(|(idx, node)| {
+                    let node_id = idx as u32;
                     if let Some(scope_id) = scope_node_id {
-                        if !self.is_descendant_or_self(node.id, scope_id) {
+                        if !self.is_descendant_or_self(node_id, scope_id) {
                             return None;
                         }
                     }
 
-                    let key_str: Option<&str> = node.key.map(|kid| self.keys.get(kid));
+                    let key_str: Option<&str> = if node.key != u32::MAX { Some(self.keys.get(node.key)) } else { None };
                     let matches_key = if target == "keys" || target == "both" {
                         key_str
                             .map(|k| {
@@ -554,8 +757,8 @@ impl JsonIndex {
 
                     let matches_value = if target == "values" || target == "both" {
                         let val_str = match &node.value {
-                            NodeValue::Str(s) => Some(s.as_str().to_string()),
-                            NodeValue::Num(n) => Some(n.to_string()),
+                            NodeValue::Str(sid) => Some(self.val_strings.get(*sid).to_string()),
+                            NodeValue::Num(nid) => Some(self.nums_pool[*nid as usize].to_string()),
                             NodeValue::Bool(b) => Some(b.to_string()),
                             _ => None,
                         };
@@ -578,7 +781,7 @@ impl JsonIndex {
                     };
 
                     if matches_key || matches_value {
-                        Some((node.id, self.get_path(node.id)))
+                        Some((node_id, self.get_path(node_id)))
                     } else {
                         None
                     }
@@ -609,10 +812,8 @@ impl JsonIndex {
                 .iter()
                 .copied()
                 .find(|&child_id| {
-                    self.nodes[child_id as usize]
-                        .key
-                        .map(|kid| self.keys.get(kid) == segment)
-                        .unwrap_or(false)
+                    let k = self.nodes[child_id as usize].key;
+                    k != u32::MAX && self.keys.get(k) == segment
                 })?;
         }
 
@@ -620,14 +821,13 @@ impl JsonIndex {
     }
 
     fn is_descendant_or_self(&self, node_id: u32, ancestor_id: u32) -> bool {
-        let mut current = Some(node_id);
-        while let Some(id) = current {
-            if id == ancestor_id {
-                return true;
-            }
-            current = self.nodes[id as usize].parent;
+        let mut current = node_id;
+        loop {
+            if current == ancestor_id { return true; }
+            let p = self.nodes[current as usize].parent;
+            if p == u32::MAX { return false; }
+            current = p;
         }
-        false
     }
 
     fn compile_object_search_filters(
@@ -714,11 +914,10 @@ impl JsonIndex {
                 .iter()
                 .copied()
                 .find(|&child_id| {
-                    let Some(child_key_id) = self.nodes[child_id as usize].key else {
-                        return false;
-                    };
+                    let child_key_id = self.nodes[child_id as usize].key;
+                    if child_key_id == u32::MAX { return false; }
                     if key_case_sensitive {
-                        return Some(child_key_id) == segment.exact_id;
+                        return child_key_id == segment.exact_id.unwrap_or(u32::MAX);
                     }
                     let child_key = self.keys.get(child_key_id);
                     child_key.eq_ignore_ascii_case(&segment.raw)
@@ -730,8 +929,8 @@ impl JsonIndex {
 
     fn scalar_value_for_filter(&self, node_id: u32) -> Option<String> {
         match &self.nodes[node_id as usize].value {
-            NodeValue::Str(s) => Some(s.clone()),
-            NodeValue::Num(n) => Some(n.to_string()),
+            NodeValue::Str(sid) => Some(self.val_strings.get(*sid).to_string()),
+            NodeValue::Num(nid) => Some(self.nums_pool[*nid as usize].to_string()),
             NodeValue::Bool(b) => Some(b.to_string()),
             NodeValue::Null => Some("null".to_string()),
             NodeValue::Object | NodeValue::Array => None,
@@ -805,24 +1004,26 @@ impl JsonIndex {
         let mut matched_ids: Vec<u32> = self
             .nodes
             .par_iter()
-            .filter_map(|node| {
+            .enumerate()
+            .filter_map(|(idx, node)| {
+                let node_id = idx as u32;
                 if !matches!(node.value, NodeValue::Object) {
                     return None;
                 }
                 if let Some(scope_id) = scope_node_id {
-                    if !self.is_descendant_or_self(node.id, scope_id) {
+                    if !self.is_descendant_or_self(node_id, scope_id) {
                         return None;
                     }
                 }
                 if compiled_filters.iter().all(|filter| {
                     self.object_filter_matches(
-                        node.id,
+                        node_id,
                         filter,
                         key_case_sensitive,
                         value_case_sensitive,
                     )
                 }) {
-                    Some(node.id)
+                    Some(node_id)
                 } else {
                     None
                 }
@@ -851,7 +1052,7 @@ impl JsonIndex {
             .keys
             .strings
             .iter()
-            .map(String::as_str)
+            .map(|s| s.as_ref())
             .filter(|candidate| {
                 if segment_prefix.is_empty() {
                     true
@@ -988,8 +1189,8 @@ mod tests {
 
     // ── build_raw (round-trip) ────────────────────────────────────────────────
 
-    fn normalize(s: &str) -> serde_json::Value {
-        serde_json::from_str(s).unwrap()
+    fn normalize(s: &str) -> sonic_rs::Value {
+        sonic_rs::from_str(s).unwrap()
     }
 
     #[test]
@@ -1313,7 +1514,10 @@ mod tests {
         };
         let keys: Vec<&str> = children
             .iter()
-            .map(|&id| index.keys.get(index.nodes[id as usize].key.unwrap()))
+            .map(|&id| {
+                let k = index.nodes[id as usize].key;
+                index.keys.get(k)
+            })
             .collect();
         assert_eq!(
             type_of(children[keys.iter().position(|&k| k == "s").unwrap()]),
@@ -1350,7 +1554,7 @@ mod tests {
                 .keys
                 .strings
                 .iter()
-                .filter(|s| s.as_str() == "name")
+                .filter(|s| s.as_ref() == "name")
                 .count(),
             1
         );

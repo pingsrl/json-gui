@@ -38,10 +38,8 @@ fn infer_node(index: &JsonIndex, id: u32) -> Schema {
             let fields = ch
                 .iter()
                 .map(|&cid| {
-                    let key = index.nodes[cid as usize]
-                        .key
-                        .map(|k| index.keys.get(k).to_string())
-                        .unwrap_or_default();
+                    let k = index.nodes[cid as usize].key;
+                    let key = if k == u32::MAX { String::new() } else { index.keys.get(k).to_string() };
                     (key, infer_node(index, cid), false)
                 })
                 .collect();
@@ -68,10 +66,8 @@ fn merge_object_array(index: &JsonIndex, ids: &[u32]) -> Schema {
     let mut fields: BTreeMap<String, (Vec<Schema>, usize)> = BTreeMap::new();
     for &oid in ids {
         for &cid in index.get_children_slice(oid) {
-            let key = index.nodes[cid as usize]
-                .key
-                .map(|k| index.keys.get(k).to_string())
-                .unwrap_or_default();
+            let k = index.nodes[cid as usize].key;
+            let key = if k == u32::MAX { String::new() } else { index.keys.get(k).to_string() };
             let e = fields.entry(key).or_default();
             e.0.push(infer_node(index, cid));
             e.1 += 1;
@@ -433,7 +429,7 @@ fn format_typeref_rs(tr: &TypeRef, opt: bool) -> String {
         TypeRef::Str => "String".to_string(),
         TypeRef::Num => "f64".to_string(),
         TypeRef::Bool => "bool".to_string(),
-        TypeRef::Null | TypeRef::Any => "serde_json::Value".to_string(),
+        TypeRef::Null | TypeRef::Any => "sonic_rs::Value".to_string(),
         TypeRef::Arr(inner) => format!("Vec<{}>", format_typeref_rs(inner, false)),
         TypeRef::Ref(name) => name.clone(),
     };
@@ -574,61 +570,100 @@ pub fn generate_python(index: &JsonIndex) -> String {
 
 // ─── JSON Schema ──────────────────────────────────────────────────────────────
 
-fn typeref_to_json_schema(tr: &TypeRef) -> serde_json::Value {
-    use serde_json::json;
-    match tr {
-        TypeRef::Str => json!({"type": "string"}),
-        TypeRef::Num => json!({"type": "number"}),
-        TypeRef::Bool => json!({"type": "boolean"}),
-        TypeRef::Null => json!({"type": "null"}),
-        TypeRef::Any => json!({}),
-        TypeRef::Arr(inner) => {
-            json!({"type": "array", "items": typeref_to_json_schema(inner)})
+/// Scrive `s` come stringa JSON con escaping minimo.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
         }
-        TypeRef::Ref(name) => json!({"$ref": format!("#/$defs/{}", name)}),
+    }
+    out.push('"');
+    out
+}
+
+/// Restituisce lo schema JSON compatto come stringa (senza pretty-print).
+fn typeref_to_json_schema(tr: &TypeRef) -> String {
+    match tr {
+        TypeRef::Str => r#"{"type":"string"}"#.to_string(),
+        TypeRef::Num => r#"{"type":"number"}"#.to_string(),
+        TypeRef::Bool => r#"{"type":"boolean"}"#.to_string(),
+        TypeRef::Null => r#"{"type":"null"}"#.to_string(),
+        TypeRef::Any => "{}".to_string(),
+        TypeRef::Arr(inner) => {
+            format!(r#"{{"type":"array","items":{}}}"#, typeref_to_json_schema(inner))
+        }
+        TypeRef::Ref(name) => format!("{{\"$ref\":\"#/$defs/{}\"}}", name),
     }
 }
 
 pub fn generate_json_schema(index: &JsonIndex) -> String {
     let (types, root_ref) = build_named_types(index);
 
-    let mut defs = serde_json::Map::new();
-    for obj in &types {
-        let mut props = serde_json::Map::new();
-        let mut required = Vec::new();
-        for (key, tr, opt) in &obj.fields {
-            props.insert(key.clone(), typeref_to_json_schema(tr));
-            if !opt {
-                required.push(serde_json::Value::String(key.clone()));
+    // Costruisce il JSON Schema come stringa compatta, poi usa sonic_rs per
+    // il pretty-print (evita qualsiasi dipendenza da serde_json).
+    let mut out = String::from(r#"{"$schema":"https://json-schema.org/draft/2020-12/schema""#);
+
+    if !types.is_empty() {
+        out.push_str(r#","$defs":{"#);
+        for (i, obj) in types.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
             }
+            out.push_str(&json_str(&obj.name));
+            out.push_str(r#":{"type":"object","properties":{"#);
+            for (j, (key, tr, _opt)) in obj.fields.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                out.push_str(&json_str(key));
+                out.push(':');
+                out.push_str(&typeref_to_json_schema(tr));
+            }
+            out.push('}');
+            let required: Vec<&str> = obj
+                .fields
+                .iter()
+                .filter(|(_, _, opt)| !*opt)
+                .map(|(key, _, _)| key.as_str())
+                .collect();
+            if !required.is_empty() {
+                out.push_str(r#","required":["#);
+                for (k, req) in required.iter().enumerate() {
+                    if k > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&json_str(req));
+                }
+                out.push(']');
+            }
+            out.push_str(r#","additionalProperties":false}"#);
         }
-        let mut def = serde_json::Map::new();
-        def.insert("type".into(), serde_json::Value::String("object".into()));
-        def.insert("properties".into(), serde_json::Value::Object(props));
-        if !required.is_empty() {
-            def.insert("required".into(), serde_json::Value::Array(required));
-        }
-        def.insert(
-            "additionalProperties".into(),
-            serde_json::Value::Bool(false),
-        );
-        defs.insert(obj.name.clone(), serde_json::Value::Object(def));
+        out.push('}');
     }
 
+    // Fonde i campi del root schema nel top-level
     let root_schema = typeref_to_json_schema(&root_ref);
-    let mut schema = serde_json::Map::new();
-    schema.insert(
-        "$schema".into(),
-        serde_json::Value::String("https://json-schema.org/draft/2020-12/schema".into()),
-    );
-    if !defs.is_empty() {
-        schema.insert("$defs".into(), serde_json::Value::Object(defs));
+    let inner = &root_schema[1..root_schema.len() - 1]; // strip { }
+    if !inner.is_empty() {
+        out.push(',');
+        out.push_str(inner);
     }
-    if let serde_json::Value::Object(root) = root_schema {
-        for (k, v) in root {
-            schema.insert(k, v);
-        }
-    }
+    out.push('}');
 
-    serde_json::to_string_pretty(&serde_json::Value::Object(schema)).unwrap_or_default()
+    // Pretty-print via sonic_rs
+    sonic_rs::from_str::<sonic_rs::Value>(&out)
+        .ok()
+        .and_then(|v| sonic_rs::to_string_pretty(&v).ok())
+        .unwrap_or(out)
 }

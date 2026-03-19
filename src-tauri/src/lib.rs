@@ -4,6 +4,7 @@ mod schema;
 
 use commands::AppState;
 use serde::{Deserialize, Serialize};
+use sonic_rs;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -40,7 +41,7 @@ fn window_state_path<R: tauri::Runtime>(window: &WebviewWindow<R>) -> Option<Pat
 fn load_window_state<R: tauri::Runtime>(window: &WebviewWindow<R>) -> Option<PersistedWindowState> {
     let path = window_state_path(window)?;
     let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    sonic_rs::from_slice(&bytes).ok()
 }
 
 fn capture_window_state<R: tauri::Runtime>(
@@ -81,7 +82,7 @@ fn save_window_state<R: tauri::Runtime>(window: &WebviewWindow<R>) {
     let Some(state) = state else {
         return;
     };
-    let Ok(bytes) = serde_json::to_vec(&state) else {
+    let Ok(bytes) = sonic_rs::to_vec(&state) else {
         return;
     };
     let _ = fs::write(path, bytes);

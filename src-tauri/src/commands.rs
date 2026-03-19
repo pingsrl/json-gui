@@ -1,6 +1,6 @@
 use crate::json_index::{
     JsonIndex, NodeValue, ObjectSearchFilter as IndexObjectSearchFilter, ObjectSearchOperator,
-    VisibleSliceRow,
+    InternedStrings, VisibleSliceRow,
 };
 use crate::schema;
 use serde::{Deserialize, Serialize};
@@ -185,7 +185,7 @@ fn node_type_byte(value: &NodeValue) -> u8 {
 
 /// Preview testuale del valore di un nodo, riutilizzata da node_to_dto e dal
 /// formato compatto di get_expanded_slice.
-fn node_value_preview(value: &NodeValue, children_len: usize) -> Cow<'static, str> {
+fn node_value_preview(value: &NodeValue, children_len: usize, val_strings: &InternedStrings, nums_pool: &[f64]) -> Cow<'static, str> {
     match value {
         NodeValue::Object => {
             if children_len == 0 {
@@ -201,14 +201,15 @@ fn node_value_preview(value: &NodeValue, children_len: usize) -> Cow<'static, st
                 Cow::Owned(format!("[{} items]", children_len))
             }
         }
-        NodeValue::Str(s) => {
+        NodeValue::Str(sid) => {
+            let s = val_strings.get(*sid);
             if s.chars().count() > 80 {
                 Cow::Owned(format!("\"{}…\"", truncate_str(s, 80)))
             } else {
                 Cow::Owned(format!("\"{}\"", s))
             }
         }
-        NodeValue::Num(n) => Cow::Owned(n.to_string()),
+        NodeValue::Num(nid) => Cow::Owned(nums_pool[*nid as usize].to_string()),
         NodeValue::Bool(true) => Cow::Borrowed("true"),
         NodeValue::Bool(false) => Cow::Borrowed("false"),
         NodeValue::Null => Cow::Borrowed("null"),
@@ -228,10 +229,10 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
     };
     NodeDto {
         id,
-        parent_id: node.parent,
-        key: node.key.map(|kid| index.keys.get(kid).to_string()),
+        parent_id: if node.parent == u32::MAX { None } else { Some(node.parent) },
+        key: if node.key == u32::MAX { None } else { Some(index.keys.get(node.key).to_string()) },
         value_type,
-        value_preview: node_value_preview(&node.value, children_len),
+        value_preview: node_value_preview(&node.value, children_len, &index.val_strings, &index.nums_pool),
         children_count: children_len,
     }
 }
@@ -384,8 +385,8 @@ pub async fn search(
         .map(|(id, path)| {
             let node = &index.nodes[id as usize];
             let value_preview = match &node.value {
-                NodeValue::Str(s) => format!("\"{}\"", truncate_str(s, 60)),
-                NodeValue::Num(n) => n.to_string(),
+                NodeValue::Str(sid) => format!("\"{}\"", truncate_str(index.val_strings.get(*sid), 60)),
+                NodeValue::Num(nid) => index.nums_pool[*nid as usize].to_string(),
                 NodeValue::Bool(b) => b.to_string(),
                 NodeValue::Null => "null".to_string(),
                 NodeValue::Object => "[object]".to_string(),
@@ -395,7 +396,7 @@ pub async fn search(
                 node_id: id,
                 file_order: node.preorder_index,
                 path,
-                key: node.key.map(|kid| index.keys.get(kid).to_string()),
+                key: if node.key == u32::MAX { None } else { Some(index.keys.get(node.key).to_string()) },
                 value_preview,
                 kind: "node",
                 match_preview: None,
@@ -490,7 +491,7 @@ pub async fn search_objects(
                 node_id: id,
                 file_order: node.preorder_index,
                 path: index.get_path(id),
-                key: node.key.map(|kid| index.keys.get(kid).to_string()),
+                key: if node.key == u32::MAX { None } else { Some(index.keys.get(node.key).to_string()) },
                 value_preview,
                 kind: "object",
                 match_preview: Some(Arc::clone(&match_preview)),
@@ -530,13 +531,10 @@ pub async fn expand_to(
     let mut current = node_id;
     loop {
         let node = &index.nodes[current as usize];
-        match node.parent {
-            Some(parent_id) => {
-                chain.push(parent_id);
-                current = parent_id;
-            }
-            None => break,
-        }
+        if node.parent == u32::MAX { break; }
+        let parent_id = node.parent;
+        chain.push(parent_id);
+        current = parent_id;
     }
     chain.reverse(); // da root verso il parent diretto
 
@@ -593,28 +591,28 @@ pub async fn get_expanded_slice(
         let node = &index.nodes[id as usize];
         let children_len = node.children_len as usize;
 
-        let key_idx: i32 = match node.key {
-            None => -1,
-            Some(kid) => {
-                // ricerca lineare sul pool locale (solitamente < 200 entry → cache-friendly)
-                match key_pool_ids.iter().position(|&k| k == kid) {
-                    Some(pos) => pos as i32,
-                    None => {
-                        let pos = key_pool.len() as i32;
-                        key_pool.push(index.keys.get(kid).to_string());
-                        key_pool_ids.push(kid);
-                        pos
-                    }
+        let key_idx: i32 = if node.key == u32::MAX {
+            -1
+        } else {
+            let kid = node.key;
+            // ricerca lineare sul pool locale (solitamente < 200 entry → cache-friendly)
+            match key_pool_ids.iter().position(|&k| k == kid) {
+                Some(pos) => pos as i32,
+                None => {
+                    let pos = key_pool.len() as i32;
+                    key_pool.push(index.keys.get(kid).to_string());
+                    key_pool_ids.push(kid);
+                    pos
                 }
             }
         };
 
         rows.push((
             id,
-            node.parent.map(|p| p as i32).unwrap_or(-1),
+            if node.parent == u32::MAX { -1i32 } else { node.parent as i32 },
             key_idx,
             node_type_byte(&node.value),
-            node_value_preview(&node.value, children_len).into_owned(),
+            node_value_preview(&node.value, children_len, &index.val_strings, &index.nums_pool).into_owned(),
             node.children_len,
             depth as u32,
         ));
