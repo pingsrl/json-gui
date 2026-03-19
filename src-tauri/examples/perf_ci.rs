@@ -1,4 +1,4 @@
-use json_gui_lib::json_index::JsonIndex;
+use json_gui_lib::json_index::{JsonIndex, Node, ObjectSearchFilter, ObjectSearchOperator};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::env;
@@ -11,7 +11,10 @@ use std::time::Instant;
 const DEFAULT_SIZE_MIB: usize = 64;
 const DEFAULT_ITERATIONS: usize = 3;
 const DEFAULT_MAX_RESULTS: usize = 1_000;
-const SEARCH_PATTERN: &str = r"\d+";
+const SEARCH_REGEX_QUERY: &str = r"\d+";
+const SEARCH_TEXT_QUERY: &str = "product";
+const OBJECT_SEARCH_PATH: &str = "content.mainImage.0.url";
+const OBJECT_SEARCH_VALUE: &str = "cdn.example.com/images/";
 
 #[derive(Debug)]
 struct Config {
@@ -41,7 +44,8 @@ struct DatasetInfo {
 
 #[derive(Serialize)]
 struct SearchInfo {
-    pattern: &'static str,
+    query: &'static str,
+    mode: &'static str,
     target: &'static str,
     max_results: usize,
     matches: usize,
@@ -53,14 +57,37 @@ struct ExpandInfo {
 }
 
 #[derive(Serialize)]
+struct ObjectSearchInfo {
+    path: &'static str,
+    operator: &'static str,
+    value: &'static str,
+    max_results: usize,
+    matches: usize,
+}
+
+#[derive(Serialize)]
+struct MemoryInfo {
+    index_heap_bytes_estimate: usize,
+    index_heap_mib_estimate: f64,
+    bytes_per_node: f64,
+    bytes_per_input_byte: f64,
+    node_size_bytes: usize,
+}
+
+#[derive(Serialize)]
 struct PerfReport {
     dataset: DatasetInfo,
     iterations: usize,
     load: PerfMetric,
     search_regex: PerfMetric,
-    search: SearchInfo,
+    search_regex_info: SearchInfo,
+    search_text: PerfMetric,
+    search_text_info: SearchInfo,
+    search_objects: PerfMetric,
+    search_objects_info: ObjectSearchInfo,
     expand_all: PerfMetric,
     expand: ExpandInfo,
+    memory: MemoryInfo,
 }
 
 fn print_help() {
@@ -313,9 +340,9 @@ fn main() -> Result<(), String> {
     let (load_metric, index) = timed(config.iterations, || JsonIndex::from_file(path_str))?;
     let node_count = index.nodes.len();
 
-    let (search_metric, matches) = timed(config.iterations, || {
+    let (search_regex_metric, search_regex_matches) = timed(config.iterations, || {
         Ok(index.search(
-            SEARCH_PATTERN,
+            SEARCH_REGEX_QUERY,
             "values",
             false,
             true,
@@ -326,8 +353,41 @@ fn main() -> Result<(), String> {
             false,
         ))
     })?;
+    let (search_text_metric, search_text_matches) = timed(config.iterations, || {
+        Ok(index.search(
+            SEARCH_TEXT_QUERY,
+            "values",
+            false,
+            false,
+            false,
+            DEFAULT_MAX_RESULTS,
+            None,
+            false,
+            false,
+        ))
+    })?;
+    let object_filters = [ObjectSearchFilter {
+        path: OBJECT_SEARCH_PATH.to_string(),
+        operator: ObjectSearchOperator::Contains,
+        value: Some(OBJECT_SEARCH_VALUE.to_string()),
+        ..Default::default()
+    }];
+    let (search_objects_metric, search_objects_matches) = timed(config.iterations, || {
+        Ok(index.search_objects(&object_filters, true, false, DEFAULT_MAX_RESULTS, None))
+    })?;
 
     let (expand_metric, descendants) = timed(config.iterations, || Ok(bfs_expand_all(&index)))?;
+    let index_heap_bytes_estimate = index.heap_bytes_estimate();
+    let bytes_per_node = if node_count == 0 {
+        0.0
+    } else {
+        index_heap_bytes_estimate as f64 / node_count as f64
+    };
+    let bytes_per_input_byte = if size_bytes == 0 {
+        0.0
+    } else {
+        index_heap_bytes_estimate as f64 / size_bytes as f64
+    };
 
     let report = PerfReport {
         dataset: DatasetInfo {
@@ -340,16 +400,40 @@ fn main() -> Result<(), String> {
         },
         iterations: config.iterations,
         load: load_metric,
-        search_regex: search_metric,
-        search: SearchInfo {
-            pattern: SEARCH_PATTERN,
+        search_regex: search_regex_metric,
+        search_regex_info: SearchInfo {
+            query: SEARCH_REGEX_QUERY,
+            mode: "regex",
             target: "values",
             max_results: DEFAULT_MAX_RESULTS,
-            matches: matches.len(),
+            matches: search_regex_matches.len(),
+        },
+        search_text: search_text_metric,
+        search_text_info: SearchInfo {
+            query: SEARCH_TEXT_QUERY,
+            mode: "text",
+            target: "values",
+            max_results: DEFAULT_MAX_RESULTS,
+            matches: search_text_matches.len(),
+        },
+        search_objects: search_objects_metric,
+        search_objects_info: ObjectSearchInfo {
+            path: OBJECT_SEARCH_PATH,
+            operator: "contains",
+            value: OBJECT_SEARCH_VALUE,
+            max_results: DEFAULT_MAX_RESULTS,
+            matches: search_objects_matches.len(),
         },
         expand_all: expand_metric,
         expand: ExpandInfo {
             total_descendants: descendants,
+        },
+        memory: MemoryInfo {
+            index_heap_bytes_estimate,
+            index_heap_mib_estimate: index_heap_bytes_estimate as f64 / (1024.0 * 1024.0),
+            bytes_per_node,
+            bytes_per_input_byte,
+            node_size_bytes: std::mem::size_of::<Node>(),
         },
     };
 

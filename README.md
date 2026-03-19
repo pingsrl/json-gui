@@ -197,8 +197,11 @@ A lightweight CI workflow is available in
 It generates a deterministic JSON dataset of about 64 MiB, then measures:
 
 - `load` via `JsonIndex::from_file`
+- `search_text` over values
 - `search_regex` over values
+- `search_objects` with a nested property path filter
 - `expand_all` via the same BFS helper used by the Rust benchmarks
+- structural memory metrics from the built index (`heap_bytes_estimate`, bytes per node, bytes per input byte)
 
 Each run publishes:
 
@@ -210,8 +213,9 @@ strict pass/fail performance budget: GitHub-hosted runners are noisy.
 
 For tagged releases, the same benchmark snapshot is also appended to the draft
 release notes by [`/.github/workflows/release.yml`](.github/workflows/release.yml),
-so the release page contains the measured `load`, `search_regex`, and
-`expand_all` numbers for that version.
+so the release page contains the measured `load`, `search_text`,
+`search_regex`, `search_objects`, `expand_all`, and structural memory numbers
+for that version.
 
 You can run the same smoke test locally with:
 

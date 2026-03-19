@@ -80,11 +80,20 @@ jobs:
           lines.extend(
               [
                   "",
-                  f"Search pattern: `{report['search']['pattern']}` over "
-                  f"`{report['search']['target']}` "
-                  f"(max `{report['search']['max_results']}` results, "
-                  f"observed `{report['search']['matches']}`)",
+                  f"Regex search: `{report['search_regex_info']['query']}` over "
+                  f"`{report['search_regex_info']['target']}` "
+                  f"(max `{report['search_regex_info']['max_results']}` results, "
+                  f"observed `{report['search_regex_info']['matches']}`)",
+                  f"Text search: `{report['search_text_info']['query']}` over "
+                  f"`{report['search_text_info']['target']}` "
+                  f"(max `{report['search_text_info']['max_results']}` results, "
+                  f"observed `{report['search_text_info']['matches']}`)",
+                  f"Object search: `{report['search_objects_info']['path']} {report['search_objects_info']['operator']} {report['search_objects_info']['value']}` "
+                  f"(max `{report['search_objects_info']['max_results']}` results, "
+                  f"observed `{report['search_objects_info']['matches']}`)",
                   f"Expand-all descendants visited: `{report['expand']['total_descendants']}`",
+                  "",
+                  "### Timings",
                   "",
                   "| Metric | Best | Median | Samples |",
                   "|---|---:|---:|---|",
@@ -94,6 +103,8 @@ jobs:
           for metric_name, key in [
               ("load", "load"),
               ("search_regex", "search_regex"),
+              ("search_text", "search_text"),
+              ("search_objects", "search_objects"),
               ("expand_all", "expand_all"),
           ]:
               metric = report[key]
@@ -105,6 +116,15 @@ jobs:
 
           lines.extend(
               [
+                  "",
+                  "### Memory",
+                  "",
+                  "| Metric | Value |",
+                  "|---|---:|",
+                  f"| index_heap_estimate | {report['memory']['index_heap_mib_estimate']:.2f} MiB |",
+                  f"| bytes_per_node | {report['memory']['bytes_per_node']:.2f} B |",
+                  f"| bytes_per_input_byte | {report['memory']['bytes_per_input_byte']:.3f} |",
+                  f"| node_size | {report['memory']['node_size_bytes']} B |",
                   "",
                   "These CI numbers are trend-oriented only. "
                   "GitHub-hosted runners are noisy, so treat them as a smoke test "

@@ -132,8 +132,12 @@ jobs:
               ),
               "",
               f"- Dataset: `{report['dataset']['size_mib']:.1f} MiB`, `{report['dataset']['node_count']}` nodes",
-              f"- Search pattern: `{report['search']['pattern']}` over `{report['search']['target']}`",
+              f"- Regex search: `{report['search_regex_info']['query']}` over `{report['search_regex_info']['target']}`",
+              f"- Text search: `{report['search_text_info']['query']}` over `{report['search_text_info']['target']}`",
+              f"- Object search: `{report['search_objects_info']['path']} {report['search_objects_info']['operator']} {report['search_objects_info']['value']}`",
               f"- Source run: [#{os.environ['RUN_NUMBER']}](https://github.com/{os.environ['REPO']}/actions/runs/{os.environ['RUN_ID']})",
+              "",
+              "### Timings",
               "",
               "| Metric | Best | Median | Samples |",
               "|---|---:|---:|---|",
@@ -143,6 +147,11 @@ jobs:
               "## Release benchmark snapshot",
               "",
               f"Dataset: `{report['dataset']['size_mib']:.1f} MiB`, `{report['dataset']['node_count']}` nodes",
+              f"Regex search: `{report['search_regex_info']['query']}` over `{report['search_regex_info']['target']}`",
+              f"Text search: `{report['search_text_info']['query']}` over `{report['search_text_info']['target']}`",
+              f"Object search: `{report['search_objects_info']['path']} {report['search_objects_info']['operator']} {report['search_objects_info']['value']}`",
+              "",
+              "### Timings",
               "",
               "| Metric | Best | Median | Samples |",
               "|---|---:|---:|---|",
@@ -151,6 +160,8 @@ jobs:
           for metric_name, key in [
               ("load", "load"),
               ("search_regex", "search_regex"),
+              ("search_text", "search_text"),
+              ("search_objects", "search_objects"),
               ("expand_all", "expand_all"),
           ]:
               metric = report[key]
@@ -161,6 +172,33 @@ jobs:
               )
               release_lines.append(row)
               action_lines.append(row)
+
+          release_lines.extend(
+              [
+                  "",
+                  "### Memory",
+                  "",
+                  "| Metric | Value |",
+                  "|---|---:|",
+                  f"| index_heap_estimate | {report['memory']['index_heap_mib_estimate']:.2f} MiB |",
+                  f"| bytes_per_node | {report['memory']['bytes_per_node']:.2f} B |",
+                  f"| bytes_per_input_byte | {report['memory']['bytes_per_input_byte']:.3f} |",
+                  f"| node_size | {report['memory']['node_size_bytes']} B |",
+              ]
+          )
+          action_lines.extend(
+              [
+                  "",
+                  "### Memory",
+                  "",
+                  "| Metric | Value |",
+                  "|---|---:|",
+                  f"| index_heap_estimate | {report['memory']['index_heap_mib_estimate']:.2f} MiB |",
+                  f"| bytes_per_node | {report['memory']['bytes_per_node']:.2f} B |",
+                  f"| bytes_per_input_byte | {report['memory']['bytes_per_input_byte']:.3f} |",
+                  f"| node_size | {report['memory']['node_size_bytes']} B |",
+              ]
+          )
 
           release_lines.extend(
               [
