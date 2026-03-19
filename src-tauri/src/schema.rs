@@ -1,4 +1,4 @@
-use crate::json_index::{JsonIndex, NodeValue};
+use crate::json_index::{JsonIndex, NodeKind};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
@@ -19,12 +19,13 @@ enum Schema {
 const SAMPLE_LIMIT: usize = 50;
 
 fn infer_node(index: &JsonIndex, id: u32) -> Schema {
-    match &index.nodes[id as usize].value {
-        NodeValue::Str(_) => Schema::Str,
-        NodeValue::Num(_) => Schema::Num,
-        NodeValue::Bool(_) => Schema::Bool,
-        NodeValue::Null => Schema::Null,
-        NodeValue::Array => {
+    let node = &index.nodes[id as usize];
+    match node.kind() {
+        NodeKind::Str  => Schema::Str,
+        NodeKind::Num  => Schema::Num,
+        NodeKind::Bool => Schema::Bool,
+        NodeKind::Null => Schema::Null,
+        NodeKind::Array => {
             let ch = index.get_children_slice(id);
             let n = ch.len().min(SAMPLE_LIMIT);
             if n == 0 {
@@ -33,13 +34,13 @@ fn infer_node(index: &JsonIndex, id: u32) -> Schema {
                 Schema::Arr(Box::new(merge_elements(index, &ch[..n])))
             }
         }
-        NodeValue::Object => {
+        NodeKind::Object => {
             let ch = index.get_children_slice(id);
             let fields = ch
                 .iter()
                 .map(|&cid| {
-                    let k = index.nodes[cid as usize].key;
-                    let key = if k == u32::MAX { String::new() } else { index.keys.get(k).to_string() };
+                    let key = index.nodes[cid as usize].key()
+                        .map_or_else(String::new, |k| index.keys.get(k).to_string());
                     (key, infer_node(index, cid), false)
                 })
                 .collect();
@@ -51,7 +52,7 @@ fn infer_node(index: &JsonIndex, id: u32) -> Schema {
 fn merge_elements(index: &JsonIndex, ids: &[u32]) -> Schema {
     let all_objs = ids
         .iter()
-        .all(|&id| matches!(index.nodes[id as usize].value, NodeValue::Object));
+        .all(|&id| index.nodes[id as usize].kind() == NodeKind::Object);
     if all_objs {
         return merge_object_array(index, ids);
     }
@@ -65,9 +66,9 @@ fn merge_object_array(index: &JsonIndex, ids: &[u32]) -> Schema {
     let total = ids.len();
     let mut fields: BTreeMap<String, (Vec<Schema>, usize)> = BTreeMap::new();
     for &oid in ids {
-        for &cid in index.get_children_slice(oid) {
-            let k = index.nodes[cid as usize].key;
-            let key = if k == u32::MAX { String::new() } else { index.keys.get(k).to_string() };
+        for &cid in index.get_children_slice(oid).iter() {
+            let key = index.nodes[cid as usize].key()
+                .map_or_else(String::new, |k| index.keys.get(k).to_string());
             let e = fields.entry(key).or_default();
             e.0.push(infer_node(index, cid));
             e.1 += 1;

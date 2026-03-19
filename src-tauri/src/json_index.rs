@@ -179,53 +179,75 @@ impl InternedStrings {
     }
 }
 
-// ---- NodeValue ----
-
-// NodeValue uses u32 for all payloads (Str=index in val_strings, Num=index in nums_pool)
-// so the max payload is 4 bytes → enum occupies 8 bytes instead of 16 (with direct f64).
-// Savings: 21M nodes × 8 bytes = ~168 MB on a 1 GB file.
-#[derive(Debug, Clone)]
-pub enum NodeValue {
-    Object,
-    Array,
-    Str(u32),  // index into JsonIndex.val_strings
-    Num(u32),  // index into JsonIndex.nums_pool: Vec<f64>
-    Bool(bool),
-    Null,
-}
-
-// ---- Node ----
+// ---- Node (16 bytes, 4×u32, no padding) ----
+//
+// ktype  bits[31:29] = NodeKind (0..5)
+// ktype  bits[28:0]  = key_id, or NO_KEY (0x1FFF_FFFF) if no key
+// value_data: Str→val_strings id, Num→nums_pool idx, Bool→0/1, others→0
 //
 // Note: the node id (index in the Vec) always coincides with the preorder DFS index,
 // because the streaming parser allocates the parent before its children and children in order.
-// It is therefore not necessary to store preorder_index separately.
+
+pub const NO_KEY: u32 = 0x1FFF_FFFF; // sentinel: no key (29 bits all ones)
+
+/// Node kind packed into the top 3 bits of `ktype`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Object = 0,
+    Array  = 1,
+    Str    = 2, // value_data = InternedStrings id in val_strings
+    Num    = 3, // value_data = index into nums_pool
+    Bool   = 4, // value_data = 0 (false) or 1 (true)
+    Null   = 5,
+}
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    // id removed - use the index in the Vec (= preorder DFS index)
-    pub parent: u32,          // u32::MAX = root node (no parent)
-    pub key: u32,             // u32::MAX = no key
-    pub value: NodeValue,
-    pub children_start: u32,
+    pub ktype: u32,
+    pub value_data: u32,
     pub children_len: u32,
     pub subtree_len: u32,
+}
+
+impl Node {
+    #[inline]
+    pub fn kind(&self) -> NodeKind {
+        match self.ktype >> 29 {
+            0 => NodeKind::Object,
+            1 => NodeKind::Array,
+            2 => NodeKind::Str,
+            3 => NodeKind::Num,
+            4 => NodeKind::Bool,
+            _ => NodeKind::Null,
+        }
+    }
+    #[inline]
+    pub fn key(&self) -> Option<u32> {
+        let k = self.ktype & NO_KEY;
+        if k == NO_KEY { None } else { Some(k) }
+    }
+    #[inline]
+    pub fn make_ktype(kind: NodeKind, key: Option<u32>) -> u32 {
+        let k = key.unwrap_or(NO_KEY);
+        debug_assert!(k <= NO_KEY);
+        ((kind as u32) << 29) | k
+    }
 }
 
 // ---- Streaming parser: zero intermediate allocations ----
 //
 // Final Nodes are allocated DIRECTLY during DFS streaming.
-// No temporary linked-lists needed: children_len values are updated in alloc(),
-// finish_index builds children_arena with prefix-sum + fill-by-id-order
-// using a single temporary Vec<u32> (pos[]) instead of 3 × 84 MB.
+// subtree_len is set after all children are processed (no finish_index heavy pass).
 
 struct StreamCtx {
     nodes: Vec<Node>,
     keys: InternedStrings,
     val_strings: InternedStrings,
-    nums_pool: Vec<f64>,     // f64 pool: NodeValue::Num(idx) → nums_pool[idx]
+    nums_pool: Vec<f64>,     // f64 pool: NodeKind::Num → nums_pool[value_data]
 }
 
 impl StreamCtx {
+    #[allow(dead_code)]
     fn new() -> Self {
         Self::with_capacity(0, 0)
     }
@@ -249,15 +271,13 @@ impl StreamCtx {
         }
     }
 
-    fn alloc(&mut self, value: NodeValue, parent: u32, key: u32) -> u32 {
+    fn alloc(&mut self, kind: NodeKind, key: Option<u32>, value_data: u32, parent: u32) -> u32 {
         let id = self.nodes.len() as u32;
         self.nodes.push(Node {
-            parent,
-            key,
-            value,
-            children_start: 0,  // filled in finish_index
-            children_len: 0,    // incremented below
-            subtree_len: 1,     // filled in finish_index
+            ktype: Node::make_ktype(kind, key),
+            value_data,
+            children_len: 0,
+            subtree_len: 0,
         });
         if parent != u32::MAX {
             self.nodes[parent as usize].children_len += 1;
@@ -269,7 +289,7 @@ impl StreamCtx {
 struct ValSeed {
     ctx: Rc<RefCell<StreamCtx>>,
     parent: u32,
-    key: u32,
+    key: Option<u32>,
 }
 
 impl<'de> DeserializeSeed<'de> for ValSeed {
@@ -282,7 +302,7 @@ impl<'de> DeserializeSeed<'de> for ValSeed {
 struct ValVisitor {
     ctx: Rc<RefCell<StreamCtx>>,
     parent: u32,
-    key: u32,
+    key: Option<u32>,
 }
 
 impl<'de> Visitor<'de> for ValVisitor {
@@ -291,115 +311,85 @@ impl<'de> Visitor<'de> for ValVisitor {
         write!(f, "a JSON value")
     }
     fn visit_bool<E: de::Error>(self, v: bool) -> Result<u32, E> {
-        Ok(self.ctx.borrow_mut().alloc(NodeValue::Bool(v), self.parent, self.key))
+        Ok(self.ctx.borrow_mut().alloc(NodeKind::Bool, self.key, v as u32, self.parent))
     }
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<u32, E> {
         let mut ctx = self.ctx.borrow_mut();
         let nid = ctx.nums_pool.len() as u32;
         ctx.nums_pool.push(v as f64);
-        Ok(ctx.alloc(NodeValue::Num(nid), self.parent, self.key))
+        Ok(ctx.alloc(NodeKind::Num, self.key, nid, self.parent))
     }
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<u32, E> {
         let mut ctx = self.ctx.borrow_mut();
         let nid = ctx.nums_pool.len() as u32;
         ctx.nums_pool.push(v as f64);
-        Ok(ctx.alloc(NodeValue::Num(nid), self.parent, self.key))
+        Ok(ctx.alloc(NodeKind::Num, self.key, nid, self.parent))
     }
     fn visit_f64<E: de::Error>(self, v: f64) -> Result<u32, E> {
         let mut ctx = self.ctx.borrow_mut();
         let nid = ctx.nums_pool.len() as u32;
         ctx.nums_pool.push(v);
-        Ok(ctx.alloc(NodeValue::Num(nid), self.parent, self.key))
+        Ok(ctx.alloc(NodeKind::Num, self.key, nid, self.parent))
     }
     fn visit_str<E: de::Error>(self, v: &str) -> Result<u32, E> {
         let sid = self.ctx.borrow_mut().val_strings.intern(v);
-        Ok(self.ctx.borrow_mut().alloc(NodeValue::Str(sid), self.parent, self.key))
+        Ok(self.ctx.borrow_mut().alloc(NodeKind::Str, self.key, sid, self.parent))
     }
     fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<u32, E> {
         self.visit_str(v)
     }
     fn visit_unit<E: de::Error>(self) -> Result<u32, E> {
-        Ok(self.ctx.borrow_mut().alloc(NodeValue::Null, self.parent, self.key))
+        Ok(self.ctx.borrow_mut().alloc(NodeKind::Null, self.key, 0, self.parent))
     }
     fn visit_none<E: de::Error>(self) -> Result<u32, E> {
-        Ok(self.ctx.borrow_mut().alloc(NodeValue::Null, self.parent, self.key))
+        Ok(self.ctx.borrow_mut().alloc(NodeKind::Null, self.key, 0, self.parent))
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<u32, A::Error> {
-        let id = self.ctx.borrow_mut().alloc(NodeValue::Object, self.parent, self.key);
+        let id = {
+            let mut ctx = self.ctx.borrow_mut();
+            ctx.alloc(NodeKind::Object, self.key, 0, self.parent)
+        };
         while let Some(key_str) = map.next_key::<String>()? {
             let kid = self.ctx.borrow_mut().keys.intern(&key_str);
-            map.next_value_seed(ValSeed { ctx: Rc::clone(&self.ctx), parent: id, key: kid })?;
+            map.next_value_seed(ValSeed { ctx: Rc::clone(&self.ctx), parent: id, key: Some(kid) })?;
+        }
+        // Set subtree_len AFTER all children are allocated
+        {
+            let mut ctx = self.ctx.borrow_mut();
+            ctx.nodes[id as usize].subtree_len = ctx.nodes.len() as u32 - id - 1;
         }
         Ok(id)
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<u32, A::Error> {
-        let id = self.ctx.borrow_mut().alloc(NodeValue::Array, self.parent, self.key);
+        let id = {
+            let mut ctx = self.ctx.borrow_mut();
+            ctx.alloc(NodeKind::Array, self.key, 0, self.parent)
+        };
         let mut index = 0usize;
         loop {
             let kid = self.ctx.borrow_mut().keys.intern(&index.to_string());
             if seq
-                .next_element_seed(ValSeed { ctx: Rc::clone(&self.ctx), parent: id, key: kid })?
+                .next_element_seed(ValSeed { ctx: Rc::clone(&self.ctx), parent: id, key: Some(kid) })?
                 .is_none()
             {
                 break;
             }
             index += 1;
         }
+        // Set subtree_len AFTER all children are allocated
+        {
+            let mut ctx = self.ctx.borrow_mut();
+            ctx.nodes[id as usize].subtree_len = ctx.nodes.len() as u32 - id - 1;
+        }
         Ok(id)
     }
 }
 
-/// Finalizes the JsonIndex: builds children_arena with prefix-sum + fill-by-id-order,
-/// then computes subtree_len bottom-up.
-/// Zero temporary Vecs: reuses children_start as a fill cursor, then recomputes it.
-/// The property that makes the algorithm correct: the streaming parser allocates nodes in
-/// DFS preorder, so children of the same parent have increasing ids in visit order.
+/// Finalizes the JsonIndex: trivial finish since subtree_len is already set during streaming.
+/// For leaf nodes (Bool, Str, Num, Null) subtree_len remains 0 (set in alloc), which is correct.
 fn finish_index(ctx: StreamCtx) -> JsonIndex {
-    let StreamCtx { mut nodes, keys, val_strings, nums_pool } = ctx;
-
-    let n = nodes.len();
-    let total_children: usize = nodes.iter().map(|nd| nd.children_len as usize).sum();
-
-    // Step 1: children_start = prefix-sum of children_len
-    {
-        let mut sum = 0u32;
-        for node in &mut nodes {
-            node.children_start = sum;
-            sum += node.children_len;
-        }
-    }
-
-    // Passo 2: riempie children_arena in ordine crescente di id.
-    // Usa children_start come cursore temporaneo (viene sovrascritto e poi ricalcolato).
-    // Zero allocazioni extra: nessun Vec<u32> pos[] separato.
-    let mut children_arena: Vec<u32> = vec![0u32; total_children];
-    for id in 1..n as u32 {
-        let parent = nodes[id as usize].parent;
-        let slot = nodes[parent as usize].children_start as usize;
-        children_arena[slot] = id;
-        nodes[parent as usize].children_start += 1;
-    }
-
-    // Passo 3: ripristina children_start ai valori corretti (prefix-sum)
-    {
-        let mut sum = 0u32;
-        for node in &mut nodes {
-            let len = node.children_len;
-            node.children_start = sum;
-            sum += len;
-        }
-    }
-
-    // Calcola subtree_len (bottom-up: foglie prima, poi risale)
-    for idx in (0..n).rev() {
-        let nd = &nodes[idx];
-        let s = nd.children_start as usize;
-        let e = s + nd.children_len as usize;
-        let sub: u32 = children_arena[s..e].iter().map(|&c| nodes[c as usize].subtree_len).sum();
-        nodes[idx].subtree_len = 1 + sub;
-    }
-
-    JsonIndex { nodes, children: children_arena, keys, val_strings, nums_pool, root: 0 }
+    let StreamCtx { nodes, keys, val_strings, nums_pool } = ctx;
+    JsonIndex { nodes, keys, val_strings, nums_pool, root: 0 }
 }
 
 fn parse_streaming<'de, D: de::Deserializer<'de>>(de: D) -> Result<JsonIndex, D::Error> {
@@ -408,7 +398,7 @@ fn parse_streaming<'de, D: de::Deserializer<'de>>(de: D) -> Result<JsonIndex, D:
 
 fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(de: D, node_cap: usize, str_bytes: usize) -> Result<JsonIndex, D::Error> {
     let ctx = Rc::new(RefCell::new(StreamCtx::with_capacity(node_cap, str_bytes)));
-    de.deserialize_any(ValVisitor { ctx: Rc::clone(&ctx), parent: u32::MAX, key: u32::MAX })?;
+    de.deserialize_any(ValVisitor { ctx: Rc::clone(&ctx), parent: u32::MAX, key: None })?;
     Ok(finish_index(Rc::try_unwrap(ctx).ok().expect("ctx: more than one Rc reference").into_inner()))
 }
 
@@ -416,10 +406,9 @@ fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(de: D, node_cap: usiz
 
 pub struct JsonIndex {
     pub nodes: Vec<Node>,
-    pub children: Vec<u32>,
     pub keys: InternedStrings,
-    pub val_strings: InternedStrings, // stringhe dei valori: pool compatto zero-alloc
-    pub nums_pool: Vec<f64>,          // valori numerici: NodeValue::Num(idx) → nums_pool[idx]
+    pub val_strings: InternedStrings, // string values: compact zero-alloc pool
+    pub nums_pool: Vec<f64>,          // numeric values: NodeKind::Num(idx) → nums_pool[idx]
     pub root: u32,
 }
 
@@ -461,11 +450,40 @@ struct CompiledPathSegment {
 }
 
 impl JsonIndex {
-    pub fn get_children_slice(&self, node_id: u32) -> &[u32] {
-        let node = &self.nodes[node_id as usize];
-        let start = node.children_start as usize;
-        let end = start + node.children_len as usize;
-        &self.children[start..end]
+    /// Returns the ids of direct children of `id`, computed from DFS preorder.
+    /// First child = id+1; next sibling = prev_child + prev_child.subtree_len + 1.
+    pub fn get_children(&self, id: u32) -> Vec<u32> {
+        let node = &self.nodes[id as usize];
+        let count = node.children_len as usize;
+        let mut out = Vec::with_capacity(count);
+        let mut cur = id + 1;
+        for _ in 0..count {
+            out.push(cur);
+            cur += self.nodes[cur as usize].subtree_len + 1;
+        }
+        out
+    }
+
+    /// Returns a Vec of direct children ids (same as get_children).
+    /// Name kept for minimal diff in callers.
+    #[inline]
+    pub fn get_children_slice(&self, id: u32) -> Vec<u32> {
+        self.get_children(id)
+    }
+
+    /// Finds the direct parent of `id` via backward scan on subtree_len.
+    /// O(siblings_before_id) ≈ O(1) for typical JSON. Returns None for root.
+    pub fn parent_of(&self, id: u32) -> Option<u32> {
+        if id == self.root { return None; }
+        let mut i = id - 1;
+        loop {
+            // Node i's subtree spans [i+1 .. i+subtree_len[i]]
+            if i + self.nodes[i as usize].subtree_len >= id {
+                return Some(i);
+            }
+            if i == 0 { return None; }
+            i -= 1;
+        }
     }
 
     pub fn from_str(json: &str) -> Result<Self, String> {
@@ -484,82 +502,92 @@ impl JsonIndex {
     pub fn from_file(path: &str) -> Result<Self, String> {
         let file = File::open(path).map_err(|e| e.to_string())?;
         let file_size = file.metadata().map_err(|e| e.to_string())?.len();
-        // Stima conservativa: 1 nodo ogni 50 byte. Pone la capacità iniziale senza
-        // sovra-allocare, così il Vec cresce al massimo una volta invece di fare
-        // log2(N) raddoppi da 0 → 32M con un picco di capacità 2× necessario.
+        // Conservative estimate: 1 node per 50 bytes. Sets initial capacity without
+        // over-allocating, so the Vec grows at most once instead of doing
+        // log2(N) doublings from 0 → 32M with a 2× peak capacity needed.
         let node_cap = (file_size / 50).min(200_000_000) as usize;
-        // Stima byte unici per val_strings: ~10% del file (deduplicazione + struttura JSON)
+        // Estimated unique bytes for val_strings: ~10% of the file (deduplication + JSON structure)
         let str_bytes = (file_size / 10).min(500_000_000) as usize;
         let reader = BufReader::with_capacity(1 << 20, file);
         let mut de = serde_json::Deserializer::from_reader(reader);
         parse_streaming_with_cap(&mut de, node_cap, str_bytes).map_err(|e| e.to_string())
     }
 
-    /// Parsing veramente streaming: legge dal disco a chunk senza buffering in RAM.
+    /// Truly streaming parsing: reads from disk in chunks without buffering in RAM.
     pub fn from_reader<R: std::io::Read>(reader: R) -> Result<Self, String> {
         let mut de = serde_json::Deserializer::from_reader(reader);
         parse_streaming(&mut de).map_err(|e| e.to_string())
     }
 
     pub fn expanded_visible_count(&self) -> usize {
-        self.nodes[self.root as usize].subtree_len.saturating_sub(1) as usize
+        // root.subtree_len = total descendants. We show all except root itself.
+        self.nodes[self.root as usize].subtree_len as usize
     }
 
     pub fn get_expanded_slice(&self, offset: usize, limit: usize) -> Vec<VisibleSliceRow> {
-        if limit == 0 {
-            return Vec::new();
-        }
+        if limit == 0 { return Vec::new(); }
 
         struct Frame {
-            parent_id: u32,
-            next_child_index: usize,
+            next_child_id: u32,
+            remaining: u32,
             depth: usize,
         }
 
-        let mut rows = Vec::with_capacity(limit);
-        let mut skip = offset as u32;
-        let mut stack = vec![Frame {
-            parent_id: self.root,
-            next_child_index: 0,
-            depth: 0,
-        }];
+        let root_node = &self.nodes[self.root as usize];
+        let mut stack: Vec<Frame> = Vec::new();
+        if root_node.children_len > 0 {
+            stack.push(Frame {
+                next_child_id: self.root + 1,
+                remaining: root_node.children_len,
+                depth: 0,
+            });
+        }
 
-        while !stack.is_empty() {
-            let (child_id, depth) = {
-                let frame = stack.last_mut().unwrap();
-                let children = self.get_children_slice(frame.parent_id);
-                if frame.next_child_index >= children.len() {
-                    stack.pop();
-                    continue;
-                }
+        let mut skipped = 0usize;
+        let mut rows = Vec::with_capacity(limit.min(1024));
 
-                let child_id = children[frame.next_child_index];
-                frame.next_child_index += 1;
-                (child_id, frame.depth)
-            };
-            let child = &self.nodes[child_id as usize];
-
-            if skip >= child.subtree_len {
-                skip -= child.subtree_len;
+        'outer: while let Some(frame) = stack.last_mut() {
+            if frame.remaining == 0 {
+                stack.pop();
                 continue;
             }
 
-            if skip == 0 {
-                rows.push(VisibleSliceRow {
-                    id: child_id,
-                    depth,
-                });
-                if rows.len() >= limit {
-                    break;
+            let child_id = frame.next_child_id;
+            let child = &self.nodes[child_id as usize];
+            let depth = frame.depth;
+
+            // Advance frame to next sibling
+            frame.next_child_id = child_id + 1 + child.subtree_len;
+            frame.remaining -= 1;
+
+            if skipped < offset {
+                let subtree_size = child.subtree_len as usize + 1; // this node + descendants
+                if skipped + subtree_size <= offset {
+                    // Skip entire subtree in O(1)
+                    skipped += subtree_size;
+                    continue;
                 }
-            } else {
-                skip -= 1;
+                // Enter the subtree to find the offset
+                skipped += 1;
+                if child.children_len > 0 {
+                    stack.push(Frame {
+                        next_child_id: child_id + 1,
+                        remaining: child.children_len,
+                        depth: depth + 1,
+                    });
+                }
+                continue;
+            }
+
+            rows.push(VisibleSliceRow { id: child_id, depth });
+            if rows.len() >= limit {
+                break 'outer;
             }
 
             if child.children_len > 0 {
                 stack.push(Frame {
-                    parent_id: child_id,
-                    next_child_index: 0,
+                    next_child_id: child_id + 1,
+                    remaining: child.children_len,
                     depth: depth + 1,
                 });
             }
@@ -592,9 +620,9 @@ impl JsonIndex {
                 }
                 Task::Node(id) => {
                     let node = &self.nodes[id as usize];
-                    let children_slice = self.get_children_slice(id);
-                    match &node.value {
-                        NodeValue::Object => {
+                    let children_slice = self.get_children(id);
+                    match node.kind() {
+                        NodeKind::Object => {
                             if children_slice.is_empty() {
                                 out.push_str("{}");
                             } else {
@@ -603,8 +631,8 @@ impl JsonIndex {
                                 for (i, &child_id) in children_slice.iter().enumerate().rev() {
                                     stack.push(Task::Node(child_id));
                                     let child_node = &self.nodes[child_id as usize];
-                                    if child_node.key != u32::MAX {
-                                        stack.push(Task::Key(child_node.key));
+                                    if let Some(kid) = child_node.key() {
+                                        stack.push(Task::Key(kid));
                                     }
                                     if i > 0 {
                                         stack.push(Task::Literal(","));
@@ -613,7 +641,7 @@ impl JsonIndex {
                                 out.push('{');
                             }
                         }
-                        NodeValue::Array => {
+                        NodeKind::Array => {
                             if children_slice.is_empty() {
                                 out.push_str("[]");
                             } else {
@@ -627,13 +655,13 @@ impl JsonIndex {
                                 out.push('[');
                             }
                         }
-                        NodeValue::Str(sid) => {
+                        NodeKind::Str => {
                             out.push('"');
-                            json_escape_into(&mut out, self.val_strings.get(*sid));
+                            json_escape_into(&mut out, self.val_strings.get(node.value_data));
                             out.push('"');
                         }
-                        NodeValue::Num(nid) => {
-                            let f = self.nums_pool[*nid as usize];
+                        NodeKind::Num => {
+                            let f = self.nums_pool[node.value_data as usize];
                             if f.fract() == 0.0 && f.abs() < 1e15 {
                                 let i = f as i64;
                                 out.push_str(&i.to_string());
@@ -641,10 +669,10 @@ impl JsonIndex {
                                 out.push_str(&f.to_string());
                             }
                         }
-                        NodeValue::Bool(b) => {
-                            out.push_str(if *b { "true" } else { "false" });
+                        NodeKind::Bool => {
+                            out.push_str(if node.value_data != 0 { "true" } else { "false" });
                         }
-                        NodeValue::Null => {
+                        NodeKind::Null => {
                             out.push_str("null");
                         }
                     }
@@ -656,24 +684,26 @@ impl JsonIndex {
     }
 
     pub fn get_path(&self, node_id: u32) -> String {
-        // Accumula key IDs senza clonare stringhe
+        // Accumulate key IDs without cloning strings
         let mut key_ids: Vec<u32> = Vec::with_capacity(16);
         let mut current = node_id;
         loop {
             let node = &self.nodes[current as usize];
-            if node.key != u32::MAX {
-                key_ids.push(node.key);
+            if let Some(kid) = node.key() {
+                key_ids.push(kid);
             }
-            if node.parent == u32::MAX { break; }
-            current = node.parent;
+            match self.parent_of(current) {
+                None => break,
+                Some(p) => current = p,
+            }
         }
         key_ids.reverse();
         if key_ids.is_empty() {
             "$".to_string()
         } else {
-            // Pre-alloca: "$." + somma lunghezze + separatori
+            // Pre-allocate: "$." + sum of lengths + separators
             let total_len: usize = key_ids.iter().map(|&k| self.keys.get(k).len()).sum::<usize>()
-                + key_ids.len() // separatori "."
+                + key_ids.len() // separators "."
                 + 2; // "$."
             let mut out = String::with_capacity(total_len);
             out.push('$');
@@ -730,15 +760,15 @@ impl JsonIndex {
                         }
                     }
 
-                    let key_str: Option<&str> = if node.key != u32::MAX { Some(self.keys.get(node.key)) } else { None };
+                    let key_str: Option<&str> = node.key().map(|kid| self.keys.get(kid));
                     let matches_key = (target == "keys" || target == "both")
                         && key_str.map(|k| re.is_match(k)).unwrap_or(false);
 
                     let matches_value = (target == "values" || target == "both")
-                        && match &node.value {
-                            NodeValue::Str(sid) => re.is_match(self.val_strings.get(*sid)),
-                            NodeValue::Num(nid) => re.is_match(&self.nums_pool[*nid as usize].to_string()),
-                            NodeValue::Bool(b) => re.is_match(&b.to_string()),
+                        && match node.kind() {
+                            NodeKind::Str => re.is_match(self.val_strings.get(node.value_data)),
+                            NodeKind::Num => re.is_match(&self.nums_pool[node.value_data as usize].to_string()),
+                            NodeKind::Bool => re.is_match(&(node.value_data != 0).to_string()),
                             _ => false,
                         };
 
@@ -767,7 +797,7 @@ impl JsonIndex {
                         }
                     }
 
-                    let key_str: Option<&str> = if node.key != u32::MAX { Some(self.keys.get(node.key)) } else { None };
+                    let key_str: Option<&str> = node.key().map(|kid| self.keys.get(kid));
                     let matches_key = if target == "keys" || target == "both" {
                         key_str
                             .map(|k| {
@@ -788,10 +818,10 @@ impl JsonIndex {
                     };
 
                     let matches_value = if target == "values" || target == "both" {
-                        let val_str = match &node.value {
-                            NodeValue::Str(sid) => Some(self.val_strings.get(*sid).to_string()),
-                            NodeValue::Num(nid) => Some(self.nums_pool[*nid as usize].to_string()),
-                            NodeValue::Bool(b) => Some(b.to_string()),
+                        let val_str = match node.kind() {
+                            NodeKind::Str => Some(self.val_strings.get(node.value_data).to_string()),
+                            NodeKind::Num => Some(self.nums_pool[node.value_data as usize].to_string()),
+                            NodeKind::Bool => Some((node.value_data != 0).to_string()),
                             _ => None,
                         };
                         val_str
@@ -840,12 +870,11 @@ impl JsonIndex {
         let mut current = self.root;
         for segment in normalized.split('.').filter(|segment| !segment.is_empty()) {
             current = self
-                .get_children_slice(current)
-                .iter()
-                .copied()
+                .get_children(current)
+                .into_iter()
                 .find(|&child_id| {
-                    let k = self.nodes[child_id as usize].key;
-                    k != u32::MAX && self.keys.get(k) == segment
+                    let node = &self.nodes[child_id as usize];
+                    node.key().map_or(false, |kid| self.keys.get(kid) == segment)
                 })?;
         }
 
@@ -853,13 +882,10 @@ impl JsonIndex {
     }
 
     fn is_descendant_or_self(&self, node_id: u32, ancestor_id: u32) -> bool {
-        let mut current = node_id;
-        loop {
-            if current == ancestor_id { return true; }
-            let p = self.nodes[current as usize].parent;
-            if p == u32::MAX { return false; }
-            current = p;
-        }
+        // In DFS preorder layout, node_id is a descendant of ancestor_id iff
+        // ancestor_id <= node_id <= ancestor_id + ancestor_subtree_len
+        let anc = &self.nodes[ancestor_id as usize];
+        node_id >= ancestor_id && node_id <= ancestor_id + anc.subtree_len
     }
 
     fn compile_object_search_filters(
@@ -942,14 +968,16 @@ impl JsonIndex {
         let mut current = start_node_id;
         for segment in path_segments {
             current = self
-                .get_children_slice(current)
-                .iter()
-                .copied()
+                .get_children(current)
+                .into_iter()
                 .find(|&child_id| {
-                    let child_key_id = self.nodes[child_id as usize].key;
-                    if child_key_id == u32::MAX { return false; }
+                    let node = &self.nodes[child_id as usize];
+                    let child_key_id = match node.key() {
+                        Some(k) => k,
+                        None => return false,
+                    };
                     if key_case_sensitive {
-                        return child_key_id == segment.exact_id.unwrap_or(u32::MAX);
+                        return Some(child_key_id) == segment.exact_id;
                     }
                     let child_key = self.keys.get(child_key_id);
                     child_key.eq_ignore_ascii_case(&segment.raw)
@@ -960,12 +988,13 @@ impl JsonIndex {
     }
 
     fn scalar_value_for_filter(&self, node_id: u32) -> Option<String> {
-        match &self.nodes[node_id as usize].value {
-            NodeValue::Str(sid) => Some(self.val_strings.get(*sid).to_string()),
-            NodeValue::Num(nid) => Some(self.nums_pool[*nid as usize].to_string()),
-            NodeValue::Bool(b) => Some(b.to_string()),
-            NodeValue::Null => Some("null".to_string()),
-            NodeValue::Object | NodeValue::Array => None,
+        let node = &self.nodes[node_id as usize];
+        match node.kind() {
+            NodeKind::Str => Some(self.val_strings.get(node.value_data).to_string()),
+            NodeKind::Num => Some(self.nums_pool[node.value_data as usize].to_string()),
+            NodeKind::Bool => Some((node.value_data != 0).to_string()),
+            NodeKind::Null => Some("null".to_string()),
+            NodeKind::Object | NodeKind::Array => None,
         }
     }
 
@@ -1039,7 +1068,7 @@ impl JsonIndex {
             .enumerate()
             .filter_map(|(idx, node)| {
                 let node_id = idx as u32;
-                if !matches!(node.value, NodeValue::Object) {
+                if node.kind() != NodeKind::Object {
                     return None;
                 }
                 if let Some(scope_id) = scope_node_id {
@@ -1382,7 +1411,7 @@ mod tests {
         assert_eq!(index.nodes.len(), 1);
         assert_eq!(index.get_children_slice(index.root).len(), 0);
         let root = &index.nodes[index.root as usize];
-        assert!(matches!(root.value, NodeValue::Str(_)));
+        assert!(matches!(root.kind(), NodeKind::Str));
     }
 
     #[test]
@@ -1390,7 +1419,7 @@ mod tests {
         let index = idx("42");
         assert_eq!(index.nodes.len(), 1);
         let root = &index.nodes[index.root as usize];
-        assert!(matches!(root.value, NodeValue::Num(_)));
+        assert!(matches!(root.kind(), NodeKind::Num));
     }
 
     #[test]
@@ -1398,7 +1427,8 @@ mod tests {
         let index = idx("true");
         assert_eq!(index.nodes.len(), 1);
         let root = &index.nodes[index.root as usize];
-        assert!(matches!(root.value, NodeValue::Bool(true)));
+        assert!(matches!(root.kind(), NodeKind::Bool));
+        assert_eq!(root.value_data, 1);
     }
 
     #[test]
@@ -1406,7 +1436,7 @@ mod tests {
         let index = idx("null");
         assert_eq!(index.nodes.len(), 1);
         let root = &index.nodes[index.root as usize];
-        assert!(matches!(root.value, NodeValue::Null));
+        assert!(matches!(root.kind(), NodeKind::Null));
     }
 
     #[test]
@@ -1530,18 +1560,18 @@ mod tests {
     fn node_types_correct() {
         let index = idx(r#"{"s":"hello","n":42,"b":true,"null":null,"arr":[],"obj":{}}"#);
         let children = index.get_children_slice(index.root);
-        let type_of = |id: u32| match &index.nodes[id as usize].value {
-            NodeValue::Str(_) => "string",
-            NodeValue::Num(_) => "number",
-            NodeValue::Bool(_) => "bool",
-            NodeValue::Null => "null",
-            NodeValue::Array => "array",
-            NodeValue::Object => "object",
+        let type_of = |id: u32| match index.nodes[id as usize].kind() {
+            NodeKind::Str => "string",
+            NodeKind::Num => "number",
+            NodeKind::Bool => "bool",
+            NodeKind::Null => "null",
+            NodeKind::Array => "array",
+            NodeKind::Object => "object",
         };
         let keys: Vec<&str> = children
             .iter()
             .map(|&id| {
-                let k = index.nodes[id as usize].key;
+                let k = index.nodes[id as usize].key().unwrap();
                 index.keys.get(k)
             })
             .collect();

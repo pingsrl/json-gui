@@ -1,6 +1,6 @@
 use crate::json_index::{
-    JsonIndex, NodeValue, ObjectSearchFilter as IndexObjectSearchFilter, ObjectSearchOperator,
-    InternedStrings, VisibleSliceRow,
+    JsonIndex, NodeKind, ObjectSearchFilter as IndexObjectSearchFilter, ObjectSearchOperator,
+    VisibleSliceRow,
 };
 use crate::schema;
 use serde::{Deserialize, Serialize};
@@ -172,67 +172,70 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
 
 /// Node type as a byte for the compact IPC format (get_expanded_slice).
 /// 0=object, 1=array, 2=string, 3=number, 4=boolean, 5=null
-fn node_type_byte(value: &NodeValue) -> u8 {
-    match value {
-        NodeValue::Object => 0,
-        NodeValue::Array => 1,
-        NodeValue::Str(_) => 2,
-        NodeValue::Num(_) => 3,
-        NodeValue::Bool(_) => 4,
-        NodeValue::Null => 5,
+fn node_type_byte(kind: NodeKind) -> u8 {
+    match kind {
+        NodeKind::Object => 0,
+        NodeKind::Array  => 1,
+        NodeKind::Str    => 2,
+        NodeKind::Num    => 3,
+        NodeKind::Bool   => 4,
+        NodeKind::Null   => 5,
     }
 }
 
 /// Text preview of a node's value, shared by node_to_dto and the compact
 /// format of get_expanded_slice.
-fn node_value_preview(value: &NodeValue, children_len: usize, val_strings: &InternedStrings, nums_pool: &[f64]) -> Cow<'static, str> {
-    match value {
-        NodeValue::Object => {
+fn node_value_preview(index: &JsonIndex, id: u32) -> Cow<'static, str> {
+    let node = &index.nodes[id as usize];
+    let children_len = node.children_len as usize;
+    match node.kind() {
+        NodeKind::Object => {
             if children_len == 0 {
                 Cow::Borrowed("{}")
             } else {
                 Cow::Owned(format!("{{{} keys}}", children_len))
             }
         }
-        NodeValue::Array => {
+        NodeKind::Array => {
             if children_len == 0 {
                 Cow::Borrowed("[]")
             } else {
                 Cow::Owned(format!("[{} items]", children_len))
             }
         }
-        NodeValue::Str(sid) => {
-            let s = val_strings.get(*sid);
+        NodeKind::Str => {
+            let s = index.val_strings.get(node.value_data);
             if s.chars().count() > 80 {
                 Cow::Owned(format!("\"{}…\"", truncate_str(s, 80)))
             } else {
                 Cow::Owned(format!("\"{}\"", s))
             }
         }
-        NodeValue::Num(nid) => Cow::Owned(nums_pool[*nid as usize].to_string()),
-        NodeValue::Bool(true) => Cow::Borrowed("true"),
-        NodeValue::Bool(false) => Cow::Borrowed("false"),
-        NodeValue::Null => Cow::Borrowed("null"),
+        NodeKind::Num => Cow::Owned(index.nums_pool[node.value_data as usize].to_string()),
+        NodeKind::Bool => {
+            if node.value_data != 0 { Cow::Borrowed("true") } else { Cow::Borrowed("false") }
+        }
+        NodeKind::Null => Cow::Borrowed("null"),
     }
 }
 
 fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
     let node = &index.nodes[id as usize];
     let children_len = node.children_len as usize;
-    let value_type: &'static str = match &node.value {
-        NodeValue::Object => "object",
-        NodeValue::Array => "array",
-        NodeValue::Str(_) => "string",
-        NodeValue::Num(_) => "number",
-        NodeValue::Bool(_) => "boolean",
-        NodeValue::Null => "null",
+    let value_type: &'static str = match node.kind() {
+        NodeKind::Object => "object",
+        NodeKind::Array  => "array",
+        NodeKind::Str    => "string",
+        NodeKind::Num    => "number",
+        NodeKind::Bool   => "boolean",
+        NodeKind::Null   => "null",
     };
     NodeDto {
         id,
-        parent_id: if node.parent == u32::MAX { None } else { Some(node.parent) },
-        key: if node.key == u32::MAX { None } else { Some(index.keys.get(node.key).to_string()) },
+        parent_id: index.parent_of(id),
+        key: node.key().map(|kid| index.keys.get(kid).to_string()),
         value_type,
-        value_preview: node_value_preview(&node.value, children_len, &index.val_strings, &index.nums_pool),
+        value_preview: node_value_preview(index, id),
         children_count: children_len,
     }
 }
@@ -332,7 +335,7 @@ pub async fn expand_subtree(
 
         total_nodes += children_ids.len();
 
-        for &child_id in children_ids {
+        for &child_id in &children_ids {
             if total_nodes < limit && index.nodes[child_id as usize].children_len > 0 {
                 queue.push(child_id);
             }
@@ -384,19 +387,19 @@ pub async fn search(
         .into_iter()
         .map(|(id, path)| {
             let node = &index.nodes[id as usize];
-            let value_preview = match &node.value {
-                NodeValue::Str(sid) => format!("\"{}\"", truncate_str(index.val_strings.get(*sid), 60)),
-                NodeValue::Num(nid) => index.nums_pool[*nid as usize].to_string(),
-                NodeValue::Bool(b) => b.to_string(),
-                NodeValue::Null => "null".to_string(),
-                NodeValue::Object => "[object]".to_string(),
-                NodeValue::Array => "[array]".to_string(),
+            let value_preview = match node.kind() {
+                NodeKind::Str => format!("\"{}\"", truncate_str(index.val_strings.get(node.value_data), 60)),
+                NodeKind::Num => index.nums_pool[node.value_data as usize].to_string(),
+                NodeKind::Bool => (node.value_data != 0).to_string(),
+                NodeKind::Null => "null".to_string(),
+                NodeKind::Object => "[object]".to_string(),
+                NodeKind::Array => "[array]".to_string(),
             };
             SearchResult {
                 node_id: id,
                 file_order: id,
                 path,
-                key: if node.key == u32::MAX { None } else { Some(index.keys.get(node.key).to_string()) },
+                key: node.key().map(|kid| index.keys.get(kid).to_string()),
                 value_preview,
                 kind: "node",
                 match_preview: None,
@@ -491,7 +494,7 @@ pub async fn search_objects(
                 node_id: id,
                 file_order: id,
                 path: index.get_path(id),
-                key: if node.key == u32::MAX { None } else { Some(index.keys.get(node.key).to_string()) },
+                key: node.key().map(|kid| index.keys.get(kid).to_string()),
                 value_preview,
                 kind: "object",
                 match_preview: Some(Arc::clone(&match_preview)),
@@ -530,11 +533,10 @@ pub async fn expand_to(
     let mut chain: Vec<u32> = Vec::new();
     let mut current = node_id;
     loop {
-        let node = &index.nodes[current as usize];
-        if node.parent == u32::MAX { break; }
-        let parent_id = node.parent;
-        chain.push(parent_id);
-        current = parent_id;
+        match index.parent_of(current) {
+            None => break,
+            Some(p) => { chain.push(p); current = p; }
+        }
     }
     chain.reverse(); // from root toward the direct parent
 
@@ -589,30 +591,34 @@ pub async fn get_expanded_slice(
     let mut rows = Vec::with_capacity(slice.len());
     for VisibleSliceRow { id, depth } in slice {
         let node = &index.nodes[id as usize];
-        let children_len = node.children_len as usize;
 
-        let key_idx: i32 = if node.key == u32::MAX {
-            -1
-        } else {
-            let kid = node.key;
-            // linear search on the local pool (usually < 200 entries → cache-friendly)
-            match key_pool_ids.iter().position(|&k| k == kid) {
-                Some(pos) => pos as i32,
-                None => {
-                    let pos = key_pool.len() as i32;
-                    key_pool.push(index.keys.get(kid).to_string());
-                    key_pool_ids.push(kid);
-                    pos
+        let key_idx: i32 = match node.key() {
+            None => -1,
+            Some(kid) => {
+                // linear search on the local pool (usually < 200 entries → cache-friendly)
+                match key_pool_ids.iter().position(|&k| k == kid) {
+                    Some(pos) => pos as i32,
+                    None => {
+                        let pos = key_pool.len() as i32;
+                        key_pool.push(index.keys.get(kid).to_string());
+                        key_pool_ids.push(kid);
+                        pos
+                    }
                 }
             }
         };
 
+        let parent_id_i32 = match index.parent_of(id) {
+            None => -1i32,
+            Some(p) => p as i32,
+        };
+
         rows.push((
             id,
-            if node.parent == u32::MAX { -1i32 } else { node.parent as i32 },
+            parent_id_i32,
             key_idx,
-            node_type_byte(&node.value),
-            node_value_preview(&node.value, children_len, &index.val_strings, &index.nums_pool).into_owned(),
+            node_type_byte(node.kind()),
+            node_value_preview(index, id).into_owned(),
             node.children_len,
             depth as u32,
         ));

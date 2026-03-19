@@ -6,7 +6,7 @@
 ///
 /// HTML reports in: src-tauri/target/criterion/
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use json_gui_lib::json_index::{JsonIndex, NodeValue};
+use json_gui_lib::json_index::{JsonIndex, NodeKind};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 
@@ -61,7 +61,7 @@ fn nested_array_json(n: usize) -> String {
 fn bfs_collect_all_dtos(index: &JsonIndex) -> Vec<(u32, Vec<NodeDtoSimple>)> {
     let mut result = Vec::new();
     let mut queue = VecDeque::new();
-    for &child_id in index.get_children_slice(index.root) {
+    for child_id in index.get_children_slice(index.root) {
         queue.push_back(child_id);
     }
     while let Some(node_id) = queue.pop_front() {
@@ -73,8 +73,8 @@ fn bfs_collect_all_dtos(index: &JsonIndex) -> Vec<(u32, Vec<NodeDtoSimple>)> {
             .iter()
             .map(|&id| node_to_dto_simple(index, id))
             .collect();
-        for &child_id in children_slice {
-            queue.push_back(child_id);
+        for child_id in &children_slice {
+            queue.push_back(*child_id);
         }
         result.push((node_id, children));
     }
@@ -94,32 +94,37 @@ struct NodeDtoSimple {
 fn node_to_dto_simple(index: &JsonIndex, id: u32) -> NodeDtoSimple {
     let node = &index.nodes[id as usize];
     let children_len = node.children_len as usize;
-    let (value_type, value_preview): (&'static str, Cow<'static, str>) = match &node.value {
-        NodeValue::Object => (
+    let (value_type, value_preview): (&'static str, Cow<'static, str>) = match node.kind() {
+        NodeKind::Object => (
             "object",
             if children_len == 0 { Cow::Borrowed("{}") } else { Cow::Owned(format!("{{{} keys}}", children_len)) },
         ),
-        NodeValue::Array => (
+        NodeKind::Array => (
             "array",
             if children_len == 0 { Cow::Borrowed("[]") } else { Cow::Owned(format!("[{} items]", children_len)) },
         ),
-        NodeValue::Str(s) => (
-            "string",
-            if s.chars().count() > 80 {
-                let end = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
-                Cow::Owned(format!("\"{}…\"", &s[..end]))
-            } else {
-                Cow::Owned(format!("\"{}\"", s))
-            },
+        NodeKind::Str => {
+            let s = index.val_strings.get(node.value_data);
+            (
+                "string",
+                if s.chars().count() > 80 {
+                    let end = s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len());
+                    Cow::Owned(format!("\"{}…\"", &s[..end]))
+                } else {
+                    Cow::Owned(format!("\"{}\"", s))
+                },
+            )
+        }
+        NodeKind::Num => ("number", Cow::Owned(index.nums_pool[node.value_data as usize].to_string())),
+        NodeKind::Bool => (
+            "boolean",
+            if node.value_data != 0 { Cow::Borrowed("true") } else { Cow::Borrowed("false") },
         ),
-        NodeValue::Num(n) => ("number", Cow::Owned(n.to_string())),
-        NodeValue::Bool(true) => ("boolean", Cow::Borrowed("true")),
-        NodeValue::Bool(false) => ("boolean", Cow::Borrowed("false")),
-        NodeValue::Null => ("null", Cow::Borrowed("null")),
+        NodeKind::Null => ("null", Cow::Borrowed("null")),
     };
     NodeDtoSimple {
         id,
-        key: node.key.map(|kid| index.keys.get(kid).to_string()),
+        key: node.key().map(|kid| index.keys.get(kid).to_string()),
         value_type,
         value_preview,
         children_count: children_len,
@@ -327,7 +332,7 @@ fn bench_real_file(c: &mut Criterion) {
         b.iter(|| {
             let mut count = 0u64;
             let mut queue = VecDeque::new();
-            for &child_id in index.get_children_slice(index.root) {
+            for child_id in index.get_children_slice(index.root) {
                 queue.push_back(child_id);
             }
             while let Some(node_id) = queue.pop_front() {
@@ -335,8 +340,8 @@ fn bench_real_file(c: &mut Criterion) {
                 if children_slice.is_empty() {
                     continue;
                 }
-                for &child_id in children_slice {
-                    queue.push_back(child_id);
+                for child_id in &children_slice {
+                    queue.push_back(*child_id);
                 }
                 count += children_slice.len() as u64;
             }
