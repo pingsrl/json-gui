@@ -365,12 +365,29 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   },
 
   toggleNode: async (nodeId: number) => {
-    const { expandedNodes, rootChildren, selectedNodeId } = get();
+    const { expandedNodes, visibleNodes: currentVisible, rootChildren, selectedNodeId } = get();
     let next: Map<number, NodeDto[]>;
+    let newVisibleNodes: VNode[];
+
     if (expandedNodes.has(nodeId)) {
+      // --- COLLAPSE: rimuovi i discendenti visibili in modo incrementale ---
       next = new Map(expandedNodes);
       next.delete(nodeId);
+      // Trova la posizione del nodo e rimuovi tutti i discendenti (depth > nodeDepth)
+      const nodeIdx = currentVisible.findIndex(vn => vn.node.id === nodeId);
+      if (nodeIdx >= 0) {
+        const nodeDepth = currentVisible[nodeIdx].depth;
+        let end = nodeIdx + 1;
+        while (end < currentVisible.length && currentVisible[end].depth > nodeDepth) end++;
+        newVisibleNodes = [
+          ...currentVisible.slice(0, nodeIdx + 1),
+          ...currentVisible.slice(end)
+        ];
+      } else {
+        newVisibleNodes = buildVisibleNodes(rootChildren, next);
+      }
     } else {
+      // --- EXPAND: aggiungi figli in modo incrementale ---
       let children = childrenCache.get(nodeId);
       if (!children) {
         children = await invoke<NodeDto[]>("get_children", { nodeId });
@@ -382,13 +399,26 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       registerChildren(nodeId, children);
       next = new Map(expandedNodes);
       next.set(nodeId, children);
+      // Trova la posizione del nodo e inserisci i figli subito dopo
+      const nodeIdx = currentVisible.findIndex(vn => vn.node.id === nodeId);
+      if (nodeIdx >= 0 && children.length > 0) {
+        const childDepth = currentVisible[nodeIdx].depth + 1;
+        const childVNodes: VNode[] = children.map(node => ({ node, depth: childDepth }));
+        newVisibleNodes = [
+          ...currentVisible.slice(0, nodeIdx + 1),
+          ...childVNodes,
+          ...currentVisible.slice(nodeIdx + 1)
+        ];
+      } else {
+        newVisibleNodes = buildVisibleNodes(rootChildren, next);
+      }
     }
-    const visibleNodes = buildVisibleNodes(rootChildren, next);
+
     const selectedNodeSiblings =
       selectedNodeId !== null
         ? findSiblings(selectedNodeId, rootChildren, next)
         : null;
-    set({ expandedNodes: next, visibleNodes, selectedNodeSiblings });
+    set({ expandedNodes: next, visibleNodes: newVisibleNodes, selectedNodeSiblings });
   },
 
   selectNode: async (node: NodeDto) => {

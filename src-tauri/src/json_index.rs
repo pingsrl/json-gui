@@ -1,3 +1,4 @@
+use memchr::memmem;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -287,10 +288,10 @@ fn decode_inline_i31(data: u32) -> i32 {
 }
 
 #[inline]
-fn subtree_len_from_parts(nodes: &[Node], container_meta: &[ContainerMeta], id: u32) -> u32 {
+fn subtree_len_from_parts(nodes: &[Node], container_subtrees: &[u32], id: u32) -> u32 {
     let node = &nodes[id as usize];
     if node.kind().is_container() {
-        container_meta[node.value_data as usize].subtree_len
+        container_subtrees[node.value_data as usize]
     } else {
         0
     }
@@ -301,7 +302,7 @@ fn subtree_len_from_parts(nodes: &[Node], container_meta: &[ContainerMeta], id: 
 /// next sibling = cur + 1 + nodes[cur].subtree_len.
 pub struct ChildrenIter<'a> {
     nodes: &'a [Node],
-    container_meta: &'a [ContainerMeta],
+    container_subtrees: &'a [u32],
     cur: u32,
     remaining: u32,
 }
@@ -314,7 +315,7 @@ impl<'a> Iterator for ChildrenIter<'a> {
             return None;
         }
         let id = self.cur;
-        self.cur += subtree_len_from_parts(self.nodes, self.container_meta, id) + 1;
+        self.cur += subtree_len_from_parts(self.nodes, self.container_subtrees, id) + 1;
         self.remaining -= 1;
         Some(id)
     }
@@ -446,11 +447,7 @@ fn matches_text(
     exact_match: bool,
 ) -> bool {
     if case_sensitive {
-        if exact_match {
-            haystack == query
-        } else {
-            haystack.contains(query)
-        }
+        if exact_match { haystack == query } else { haystack.contains(query) }
     } else if haystack.is_ascii() && query.is_ascii() {
         if exact_match {
             haystack.eq_ignore_ascii_case(query)
@@ -459,11 +456,7 @@ fn matches_text(
         }
     } else {
         let haystack_lower = haystack.to_lowercase();
-        if exact_match {
-            haystack_lower == query_lower
-        } else {
-            haystack_lower.contains(query_lower)
-        }
+        if exact_match { haystack_lower == query_lower } else { haystack_lower.contains(query_lower) }
     }
 }
 
@@ -696,23 +689,47 @@ impl<'de> Visitor<'de> for ValVisitor {
 /// Leaf nodes do not allocate container metadata and implicitly have subtree_len=0.
 fn finish_index(ctx: StreamCtx) -> JsonIndex {
     let StreamCtx {
-        nodes,
-        parent_deltas,
-        parent_overflow_ids,
-        parent_overflow_values,
+        mut nodes,
+        mut parent_deltas,
+        mut parent_overflow_ids,
+        mut parent_overflow_values,
         container_meta,
-        keys,
+        keys: mut keys_pool,
         mut val_strings,
-        nums_pool,
+        mut nums_pool,
     } = ctx;
+
+    // Shrink all Vecs to actual size, releasing over-allocated capacity.
+    nodes.shrink_to_fit();
+    parent_deltas.shrink_to_fit();
+    parent_overflow_ids.shrink_to_fit();
+    parent_overflow_values.shrink_to_fit();
+    nums_pool.shrink_to_fit();
+
     val_strings.release_lookup_index();
+    val_strings.data.shrink_to_fit();
+    val_strings.offsets.shrink_to_fit();
+    keys_pool.data.shrink_to_fit();
+    keys_pool.offsets.shrink_to_fit();
+
+    // Split ContainerMeta into two parallel Vecs for better memory density.
+    let mut container_subtrees = Vec::with_capacity(container_meta.len());
+    let mut container_children = Vec::with_capacity(container_meta.len());
+    for meta in container_meta {
+        container_subtrees.push(meta.subtree_len);
+        container_children.push(meta.children_len.min(u16::MAX as u32) as u16);
+    }
+    container_subtrees.shrink_to_fit();
+    container_children.shrink_to_fit();
+
     JsonIndex {
         nodes,
         parent_deltas,
         parent_overflow_ids,
         parent_overflow_values,
-        container_meta,
-        keys,
+        container_subtrees,
+        container_children,
+        keys: keys_pool,
         val_strings,
         nums_pool,
         root: 0,
@@ -749,7 +766,8 @@ pub struct JsonIndex {
     pub parent_deltas: Vec<u16>,
     pub parent_overflow_ids: Vec<u32>,
     pub parent_overflow_values: Vec<u32>,
-    pub container_meta: Vec<ContainerMeta>,
+    pub container_subtrees: Vec<u32>,  // subtree_len per container (same index as container_meta)
+    pub container_children: Vec<u16>,  // children_len per container (capped at 65535)
     pub keys: InternedStrings,
     pub val_strings: InternedStrings, // string values: compact zero-alloc pool
     pub nums_pool: Vec<f64>,          // numeric values: NodeKind::Num(idx) → nums_pool[idx]
@@ -760,7 +778,7 @@ pub struct JsonIndex {
 pub struct HeapBytesBreakdown {
     pub nodes: usize,
     pub parent_index: usize,
-    pub container_meta: usize,
+    pub container_meta: usize, // kept for API compatibility: now covers both split Vecs
     pub keys: usize,
     pub val_strings: usize,
     pub nums_pool: usize,
@@ -819,22 +837,21 @@ struct CompiledPathSegment {
 
 impl JsonIndex {
     #[inline]
-    fn container_meta_for_node(&self, node: &Node) -> Option<&ContainerMeta> {
-        node.kind()
-            .is_container()
-            .then(|| &self.container_meta[node.value_data as usize])
-    }
-
-    #[inline]
     fn children_len_for_node(&self, node: &Node) -> u32 {
-        self.container_meta_for_node(node)
-            .map_or(0, |meta| meta.children_len)
+        if node.kind().is_container() {
+            self.container_children[node.value_data as usize] as u32
+        } else {
+            0
+        }
     }
 
     #[inline]
     fn subtree_len_for_node(&self, node: &Node) -> u32 {
-        self.container_meta_for_node(node)
-            .map_or(0, |meta| meta.subtree_len)
+        if node.kind().is_container() {
+            self.container_subtrees[node.value_data as usize]
+        } else {
+            0
+        }
     }
 
     #[inline]
@@ -904,7 +921,7 @@ impl JsonIndex {
     pub fn children_iter(&self, id: u32) -> ChildrenIter<'_> {
         ChildrenIter {
             nodes: &self.nodes,
-            container_meta: &self.container_meta,
+            container_subtrees: &self.container_subtrees,
             cur: id + 1,
             remaining: self.children_len(id),
         }
@@ -916,7 +933,8 @@ impl JsonIndex {
             parent_index: self.parent_deltas.capacity() * std::mem::size_of::<u16>()
                 + self.parent_overflow_ids.capacity() * std::mem::size_of::<u32>()
                 + self.parent_overflow_values.capacity() * std::mem::size_of::<u32>(),
-            container_meta: self.container_meta.capacity() * std::mem::size_of::<ContainerMeta>(),
+            container_meta: self.container_subtrees.capacity() * std::mem::size_of::<u32>()
+                + self.container_children.capacity() * std::mem::size_of::<u16>(),
             keys: self.keys.heap_bytes_estimate(),
             val_strings: self.val_strings.heap_bytes_estimate(),
             nums_pool: self.nums_pool.capacity() * std::mem::size_of::<f64>(),
@@ -1311,25 +1329,15 @@ impl JsonIndex {
         exact_array_index: Option<u32>,
     ) -> bool {
         match node.key() {
-            Some(NodeKey::String(id)) => matches_text(
-                self.keys.get(id),
-                query,
-                query_lower,
-                case_sensitive,
-                exact_match,
-            ),
+            Some(NodeKey::String(id)) => {
+                matches_text(self.keys.get(id), query, query_lower, case_sensitive, exact_match)
+            }
             Some(NodeKey::ArrayIndex(index)) => {
                 if exact_match {
                     return exact_array_index == Some(index);
                 }
                 let mut key_buf = [0u8; 10];
-                matches_text(
-                    format_u32_decimal(&mut key_buf, index),
-                    query,
-                    query_lower,
-                    case_sensitive,
-                    false,
-                )
+                matches_text(format_u32_decimal(&mut key_buf, index), query, query_lower, case_sensitive, false)
             }
             None => false,
         }
@@ -1375,20 +1383,10 @@ impl JsonIndex {
                     return exact_number.is_some_and(|expected| value == expected);
                 }
                 let mut text = StackString::<64>::new();
-                matches_text(
-                    self.format_number(node, &mut text),
-                    query,
-                    query_lower,
-                    case_sensitive,
-                    false,
-                )
+                matches_text(self.format_number(node, &mut text), query, query_lower, case_sensitive, false)
             }
             NodeKind::Bool => matches_text(
-                if node.value_data != 0 {
-                    "true"
-                } else {
-                    "false"
-                },
+                if node.value_data != 0 { "true" } else { "false" },
                 query,
                 query_lower,
                 case_sensitive,
@@ -1468,6 +1466,7 @@ impl JsonIndex {
                 None
             };
 
+            // Fast-path: exact case-sensitive key lookup (O(1) via hash table).
             if want_keys && !want_values && exact_match && case_sensitive {
                 let target_string_key = self.keys.id_of(query);
                 return self.collect_matching_ids(
@@ -1482,6 +1481,45 @@ impl JsonIndex {
                 );
             }
 
+            // Fast-path: case-sensitive substring — use memmem (SIMD) built once.
+            // Kept separate so the common case-insensitive path has zero Option overhead.
+            if case_sensitive && !exact_match {
+                let finder = memmem::Finder::new(query.as_bytes());
+                return self.collect_matching_ids(start_id, scoped_nodes, max_results, |_, node| {
+                    if want_keys && !want_values && node.key().is_none() {
+                        return false;
+                    }
+                    let matches_key = want_keys && match node.key() {
+                        Some(NodeKey::String(id)) => {
+                            finder.find(self.keys.get(id).as_bytes()).is_some()
+                        }
+                        Some(NodeKey::ArrayIndex(idx)) => {
+                            let mut buf = [0u8; 10];
+                            finder.find(format_u32_decimal(&mut buf, idx).as_bytes()).is_some()
+                        }
+                        None => false,
+                    };
+                    if matches_key {
+                        return true;
+                    }
+                    want_values && match node.kind() {
+                        NodeKind::Str => {
+                            finder.find(self.val_strings.get(node.value_data).as_bytes()).is_some()
+                        }
+                        NodeKind::Num => {
+                            let mut text = StackString::<64>::new();
+                            finder.find(self.format_number(node, &mut text).as_bytes()).is_some()
+                        }
+                        NodeKind::Bool => finder
+                            .find(if node.value_data != 0 { b"true" } else { b"false" })
+                            .is_some(),
+                        NodeKind::Null => finder.find(b"null").is_some(),
+                        NodeKind::Object | NodeKind::Array => false,
+                    }
+                });
+            }
+
+            // Default path: case-insensitive or exact-match (no finder overhead).
             self.collect_matching_ids(start_id, scoped_nodes, max_results, |_, node| {
                 if want_keys && !want_values && node.key().is_none() {
                     return false;
@@ -1492,7 +1530,6 @@ impl JsonIndex {
                 {
                     return false;
                 }
-
                 let matches_key = want_keys
                     && self.key_matches_query(
                         node,
@@ -2353,5 +2390,48 @@ mod tests {
         let rows = index.get_expanded_slice(2, 2);
         let paths: Vec<String> = rows.iter().map(|row| index.get_path(row.id)).collect();
         assert_eq!(paths, vec!["$.c", "$.c.0"]);
+    }
+
+    /// Verifica che children_len e subtree_len siano corretti dopo lo split ContainerMeta.
+    /// Questo test cattura regressioni introdotte da modifiche all'indice.
+    #[test]
+    fn container_meta_split_correctness() {
+        // Array flat con 200 oggetti {id, name} → 1 + 200*3 = 601 nodi
+        let mut s = String::from("[");
+        for i in 0..200usize {
+            if i > 0 { s.push(','); }
+            s.push_str(&format!(r#"{{"id":{},"name":"item{}"}}"#, i, i));
+        }
+        s.push(']');
+        let index = idx(&s);
+
+        // La radice è un array con 200 figli
+        assert_eq!(index.children_len(index.root), 200, "root children_len wrong");
+        assert_eq!(index.subtree_len(index.root), 600, "root subtree_len wrong");
+
+        // Ogni item è un oggetto con 2 figli (id, name)
+        let mut count = 0usize;
+        for child_id in index.children_iter(index.root) {
+            assert_eq!(index.children_len(child_id), 2, "item children_len wrong for id={}", child_id);
+            assert_eq!(index.subtree_len(child_id), 2, "item subtree_len wrong for id={}", child_id);
+            count += 1;
+        }
+        assert_eq!(count, 200, "children_iter should yield exactly 200 items");
+
+        // Struttura annidata: {users: [{name, age}, ...]}
+        let mut json2 = String::from(r#"{"users":["#);
+        for i in 0..50usize {
+            if i > 0 { json2.push(','); }
+            json2.push_str(&format!(r#"{{"name":"user{}","age":{}}}"#, i, i + 20));
+        }
+        json2.push_str("]}");
+        let idx2 = idx(&json2);
+        // root → object {users: array}
+        assert_eq!(idx2.children_len(idx2.root), 1);
+        let users_id = idx2.children_iter(idx2.root).next().unwrap();
+        // users → array con 50 elementi
+        assert_eq!(idx2.children_len(users_id), 50);
+        // subtree di users = 50 oggetti × 3 nodi ciascuno = 150
+        assert_eq!(idx2.subtree_len(users_id), 150);
     }
 }
