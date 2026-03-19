@@ -5,6 +5,8 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::fs::File;
+#[cfg(windows)]
+use std::fs::OpenOptions;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
@@ -233,9 +235,12 @@ fn capacity_hints(file_size: u64) -> (usize, usize) {
 }
 
 fn shrink_vec_if_wasteful<T>(vec: &mut Vec<T>) {
-    // Shrink to exact length: the small overhead of a potential future
-    // reallocation is far cheaper than holding unused capacity in a large file.
-    if vec.capacity() > vec.len() {
+    // Only shrink if wasted capacity exceeds 25 % of used length (or > 4 MB
+    // of raw bytes) — avoids an expensive realloc+copy on large Vecs where
+    // the capacity overshoot is just a few elements from the last doubling.
+    let waste = vec.capacity().saturating_sub(vec.len());
+    let threshold = (vec.len() >> 2).max(1024 * 1024 / std::mem::size_of::<T>().max(1));
+    if waste > threshold {
         vec.shrink_to_fit();
     }
 }
@@ -1175,7 +1180,23 @@ impl JsonIndex {
     /// The mapped file must not be modified externally while this function runs.
     /// This is the standard documented caveat for memory-mapped I/O.
     pub fn from_file(path: &str) -> Result<Self, String> {
+        #[cfg(not(windows))]
         let file = File::open(path).map_err(|e| e.to_string())?;
+
+        // On Windows use FILE_FLAG_SEQUENTIAL_SCAN (0x0800_0000) so the OS
+        // prefetches pages ahead of the sequential SIMD scan — equivalent to
+        // MADV_SEQUENTIAL on Unix.
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+                .open(path)
+                .map_err(|e| e.to_string())?
+        };
+
         let file_size = file.metadata().map_err(|e| e.to_string())?.len();
 
         if file_size == 0 {
