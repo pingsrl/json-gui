@@ -866,6 +866,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       get().clearSearch();
       return;
     }
+    const startedAtMs = performance.now();
     set({
       searching: true,
       selectedNode: null,
@@ -895,6 +896,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
         activeSearchMode: "text",
         hasActiveSearch: true
       });
+      await finishOperationMeasurement("search", startedAtMs, set, get);
     } catch (err) {
       console.error("Search error:", err);
       set({
@@ -915,6 +917,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       get().clearSearch();
       return;
     }
+    const startedAtMs = performance.now();
     set({
       searching: true,
       selectedNode: null,
@@ -939,6 +942,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
         activeSearchMode: "object",
         hasActiveSearch: true
       });
+      await finishOperationMeasurement("search-objects", startedAtMs, set, get);
     } catch (err) {
       console.error("Object search error:", err);
       set({
