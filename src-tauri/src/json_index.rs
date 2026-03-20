@@ -1540,7 +1540,7 @@ impl JsonIndex {
             let nums_base = merged_nums.len() as u32;
 
             // Remap nodes (skipping local id 0 = synthetic root)
-            for local_id in 1..sub.nodes.len() {
+            for _local_id in 1..sub.nodes.len() {
                 let node = &mut nodes[merged_node_idx];
                 let kind = node.kind();
 
