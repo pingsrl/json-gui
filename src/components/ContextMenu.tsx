@@ -7,15 +7,26 @@ export const ContextMenu: FC = () => {
   const { contextMenu, hideContextMenu, setSearchScopePath, expandSubtree } = useJsonStore();
   const { t } = useI18n();
   const menuRef = useRef<HTMLDivElement>(null);
+  // Pre-carica path e raw non appena il menu si apre, così le funzioni
+  // di copia non devono fare await prima di writeText (il user-gesture token
+  // in WKWebView scade dopo il primo await asincrono).
+  const prefetchRef = useRef<{ path: string; raw: string } | null>(null);
 
   useEffect(() => {
-    if (!contextMenu) return;
+    if (!contextMenu) { prefetchRef.current = null; return; }
     const handler = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         hideContextMenu();
       }
     };
     document.addEventListener("mousedown", handler);
+    // Pre-fetch in background: path + raw per quando l'utente clicca Copia
+    const { nodeId } = contextMenu;
+    prefetchRef.current = null;
+    Promise.all([
+      invoke<string>("get_path", { nodeId }),
+      invoke<string>("get_raw", { nodeId }),
+    ]).then(([path, raw]) => { prefetchRef.current = { path, raw }; });
     return () => document.removeEventListener("mousedown", handler);
   }, [contextMenu, hideContextMenu]);
 
@@ -34,52 +45,28 @@ export const ContextMenu: FC = () => {
     });
   };
 
-  const copyKey = async () => {
-    if (!hasNodeKey) {
-      hideContextMenu();
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(nodeKey);
-    } catch (err) {
-      console.error("copyKey error:", err);
-    }
+  const write = (text: string) => navigator.clipboard.writeText(text).catch(console.error);
+
+  const copyKey = () => {
+    if (hasNodeKey) void write(nodeKey);
     hideContextMenu();
   };
 
   const copyPath = async () => {
-    try {
-      // Usa pathCache tramite selectNode oppure chiama direttamente
-      const path = await invoke<string>("get_path", { nodeId });
-      await navigator.clipboard.writeText(path);
-    } catch (err) {
-      console.error("copyPath error:", err);
-    }
+    const text = prefetchRef.current?.path ?? await invoke<string>("get_path", { nodeId });
+    void write(text);
     hideContextMenu();
   };
 
   const copyValue = async () => {
-    try {
-      const raw = await invoke<string>("get_raw", { nodeId });
-      if (valueType === "string") {
-        await navigator.clipboard.writeText(JSON.parse(raw));
-      } else {
-        await navigator.clipboard.writeText(raw);
-      }
-    } catch (err) {
-      console.error("copyValue error:", err);
-    }
+    const raw = prefetchRef.current?.raw ?? await invoke<string>("get_raw", { nodeId });
+    void write(valueType === "string" ? JSON.parse(raw) as string : raw);
     hideContextMenu();
   };
 
   const copyRaw = async () => {
-    try {
-      const raw = await invoke<string>("get_raw", { nodeId });
-      const pretty = JSON.stringify(JSON.parse(raw), null, 2);
-      await navigator.clipboard.writeText(pretty);
-    } catch (err) {
-      console.error("copyRaw error:", err);
-    }
+    const raw = prefetchRef.current?.raw ?? await invoke<string>("get_raw", { nodeId });
+    void write(JSON.stringify(JSON.parse(raw), null, 2));
     hideContextMenu();
   };
 
