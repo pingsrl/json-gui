@@ -16,6 +16,7 @@ export interface Translations {
   searchModeText: string;
   searchModeObjects: string;
   searchScope: string;
+  searchScopeHint: string;
   searchFilters: string;
   searchPath: string;
   searchPathPlaceholder: string;
@@ -103,6 +104,7 @@ const translations: Record<Lang, Translations> = {
     searchModeText: "Text",
     searchModeObjects: "Objects",
     searchScope: "Scope",
+    searchScopeHint: "Limit search to a subtree using a JSON path (e.g. $.users.0)",
     searchFilters: "Filters",
     searchPath: "Path",
     searchPathPlaceholder: "$.users.0",
@@ -202,6 +204,7 @@ const translations: Record<Lang, Translations> = {
     searchModeText: "Testo",
     searchModeObjects: "Oggetti",
     searchScope: "Ambito",
+    searchScopeHint: "Limita la ricerca a un sottoalbero tramite path JSON (es. $.users.0)",
     searchFilters: "Filtri",
     searchPath: "Path",
     searchPathPlaceholder: "$.users.0",
@@ -302,6 +305,7 @@ const translations: Record<Lang, Translations> = {
     searchModeText: "文本",
     searchModeObjects: "对象",
     searchScope: "范围",
+    searchScopeHint: "通过 JSON 路径将搜索限制到子树（如 $.users.0）",
     searchFilters: "筛选",
     searchPath: "路径",
     searchPathPlaceholder: "$.users.0",

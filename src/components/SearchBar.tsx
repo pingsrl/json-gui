@@ -53,7 +53,14 @@ export const SearchBar: FC = () => {
             onChange={(mode) => setSearchMode(mode as "text" | "object")}
             name="search-mode"
           />
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-col gap-0.5">
+            <label
+              htmlFor="search-path-input"
+              className="text-xs font-medium text-gray-500 dark:text-gray-400 select-none cursor-default"
+              title={t.searchScopeHint}
+            >
+              {t.searchScope}
+            </label>
             <SearchScopeInput
               value={searchScopePath}
               placeholder={t.searchPathPlaceholder}
