@@ -3,27 +3,24 @@ use rayon::prelude::*;
 use regex::Regex;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 #[cfg(windows)]
 use std::fs::OpenOptions;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::sync::{Arc, Mutex};
 
-const LARGE_FILE_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
-const VERY_LARGE_FILE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
-const NODE_CAP_DIVISOR_DEFAULT: u64 = 50;
-const NODE_CAP_DIVISOR_LARGE_FILE: u64 = 55;
-const NODE_CAP_DIVISOR_VERY_LARGE_FILE: u64 = 80;
-const STRING_BYTES_DIVISOR_DEFAULT: u64 = 10;
-const STRING_BYTES_DIVISOR_LARGE_FILE: u64 = 20;
-const STRING_BYTES_DIVISOR_VERY_LARGE_FILE: u64 = 40;
-/// For files > VERY_LARGE_FILE_THRESHOLD_BYTES, string values longer than this
-/// are stored truncated in val_strings.  This caps memory used by long strings
-/// (descriptions, URLs, base64 blobs) while keeping the UI display correct
-/// (previews are already limited to 80 chars).  The raw export of truncated
-/// nodes will be shortened.
-const VERY_LARGE_FILE_STR_MAX_BYTES: usize = 256;
+/// Containers at depth >= this become lazy nodes (root = depth 0).
+pub const LAZY_DEPTH_THRESHOLD: u32 = 1;
+/// Lazy nodes with byte span larger than this use paginated scanning instead of full parse.
+pub const LAZY_PAGINATE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MB
+/// Default page size for inline lazy expansion (get_children_any on large lazy nodes).
+const EXPAND_SUBTREE_INLINE_PAGE: usize = 1_000;
+/// Maximum number of sub-nodes encoded per sub-index in the global ID space.
+/// Global ID for extra node: base + sub_idx * SUB_INDEX_ID_RANGE + sub_id.
+pub const SUB_INDEX_ID_RANGE: u32 = 1 << 16; // 65536
 
 
 // ---- InternedStrings ----
@@ -216,23 +213,6 @@ impl InternedStrings {
     }
 }
 
-fn capacity_hints(file_size: u64) -> (usize, usize) {
-    let (node_divisor, string_divisor) = if file_size >= VERY_LARGE_FILE_THRESHOLD_BYTES {
-        (
-            NODE_CAP_DIVISOR_VERY_LARGE_FILE,
-            STRING_BYTES_DIVISOR_VERY_LARGE_FILE,
-        )
-    } else if file_size >= LARGE_FILE_THRESHOLD_BYTES {
-        (NODE_CAP_DIVISOR_LARGE_FILE, STRING_BYTES_DIVISOR_LARGE_FILE)
-    } else {
-        (NODE_CAP_DIVISOR_DEFAULT, STRING_BYTES_DIVISOR_DEFAULT)
-    };
-    // For very large files, cap node_cap conservatively – we prefer one
-    // Vec doubling over pre-allocating hundreds of MB that may never be used.
-    let node_cap = (file_size / node_divisor).min(80_000_000) as usize;
-    let str_bytes = (file_size / string_divisor).min(200_000_000) as usize;
-    (node_cap.max(1024), str_bytes.max(4096))
-}
 
 fn shrink_vec_if_wasteful<T>(vec: &mut Vec<T>) {
     // Only shrink if wasted capacity exceeds 25 % of used length (or > 4 MB
@@ -281,17 +261,56 @@ pub enum NodeKey {
 pub enum NodeKind {
     Object = 0,
     Array = 1,
-    Str = 2,  // value_data = InternedStrings id in val_strings
-    Num = 3,  // value_data = inline i31 or nums_pool index
-    Bool = 4, // value_data = 0 (false) or 1 (true)
+    Str = 2,       // value_data = InternedStrings id in val_strings
+    Num = 3,       // value_data = inline i31 or nums_pool index
+    Bool = 4,      // value_data = 0 (false) or 1 (true)
     Null = 5,
+    LazyObject = 6, // value_data = index into lazy_spans; children not parsed yet
+    LazyArray = 7,  // value_data = index into lazy_spans; children not parsed yet
 }
 
 impl NodeKind {
     #[inline]
     pub fn is_container(self) -> bool {
+        // Lazy kinds are NOT containers in the main index sense (0 children there)
         matches!(self, NodeKind::Object | NodeKind::Array)
     }
+
+    #[inline]
+    pub fn is_lazy(self) -> bool {
+        matches!(self, NodeKind::LazyObject | NodeKind::LazyArray)
+    }
+}
+
+/// Byte span within the mmap of an unexpanded lazy node.
+#[derive(Clone, Copy)]
+pub struct LazySpan {
+    pub file_offset: u64,
+    pub byte_len: u64,
+}
+
+/// Materialization info for one lazy node.
+pub struct MatInfo2 {
+    /// Index into ExtraState::sub_indices.
+    pub sub_idx: usize,
+    /// Sub-node IDs (within sub_indices[sub_idx]) for the direct children of the lazy node.
+    pub child_sub_ids: Vec<u32>,
+}
+
+/// Dynamic state accumulated as the user expands lazy nodes on-demand.
+pub struct ExtraState {
+    /// = main nodes.len() at end of from_file; global IDs for extra nodes start here.
+    pub base: u32,
+    /// Sub-indices from lazy expansions (one per materialization call).
+    pub sub_indices: Vec<Arc<JsonIndex>>,
+    /// lazy_node_id → MatInfo2
+    pub mat: HashMap<u32, MatInfo2>,
+    /// Maps global_extra_id → parent_global_id (the lazy node that was expanded,
+    /// or another extra node for deeper nesting).
+    pub extra_parent: HashMap<u32, u32>,
+    /// Key override for extra nodes whose key can't be stored in the sub-index
+    /// (e.g. the element index within a lazy array for search results).
+    pub extra_key_override: HashMap<u32, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +328,9 @@ impl Node {
             2 => NodeKind::Str,
             3 => NodeKind::Num,
             4 => NodeKind::Bool,
+            5 => NodeKind::Null,
+            6 => NodeKind::LazyObject,
+            7 => NodeKind::LazyArray,
             _ => NodeKind::Null,
         }
     }
@@ -568,8 +590,14 @@ struct StreamCtx {
     val_strings: InternedStrings,
     nums_pool: Vec<f64>, // f64 pool: NodeKind::Num → nums_pool[value_data]
     /// Maximum bytes to store per string value (0 = unlimited).
-    /// Set to VERY_LARGE_FILE_STR_MAX_BYTES for files over the threshold.
     str_max_bytes: usize,
+    // ---- Lazy mode fields (active when lazy_depth > 0) ----
+    lazy_spans: Vec<LazySpan>,
+    lazy_child_counts: Vec<u16>,
+    /// Base pointer of the mmap as usize (0 if lazy mode disabled).
+    mmap_base: usize,
+    /// Depth threshold: containers at depth >= lazy_depth become lazy nodes (0 = disabled).
+    lazy_depth: u32,
 }
 
 impl StreamCtx {
@@ -597,6 +625,10 @@ impl StreamCtx {
             val_strings: InternedStrings::with_capacity(val_n, str_bytes),
             nums_pool: Vec::with_capacity(num_cap),
             str_max_bytes: 0,
+            lazy_spans: Vec::new(),
+            lazy_child_counts: Vec::new(),
+            mmap_base: 0,
+            lazy_depth: 0,
         }
     }
 
@@ -634,6 +666,34 @@ impl StreamCtx {
         }
         id
     }
+
+    /// Allocates a lazy container node (LazyObject or LazyArray).
+    /// `span_id` = index into lazy_spans for this node's raw bytes.
+    /// The parent MUST be a normal container (Object/Array) already allocated.
+    fn alloc_lazy(&mut self, kind: NodeKind, key: Option<NodeKey>, span_id: u32, parent: u32) -> u32 {
+        debug_assert!(kind.is_lazy());
+        let id = self.nodes.len() as u32;
+        self.nodes.push(Node {
+            ktype: Node::make_ktype(kind, key),
+            value_data: span_id,
+        });
+        let delta = id - parent;
+        if delta < u8::MAX as u32 {
+            self.parent_deltas.push(delta as u8);
+        } else {
+            self.parent_deltas.push(u8::MAX);
+            self.parent_overflow_ids.push(id);
+            self.parent_overflow_values.push(parent);
+        }
+        // Update parent's children count
+        let parent_node = &self.nodes[parent as usize];
+        debug_assert!(parent_node.kind().is_container());
+        let children = &mut self.container_children[parent_node.value_data as usize];
+        *children = children.saturating_add(1);
+        // Lazy node contributes 0 to parent's subtree_len for DFS traversal purposes —
+        // it is treated as a leaf in the main index (subtree_len = 0).
+        id
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -662,6 +722,7 @@ struct ValSeed {
     ctx: StreamCtxPtr<'static>,
     parent: u32,
     key: Option<NodeKey>,
+    depth: u32,
 }
 
 impl<'de> DeserializeSeed<'de> for ValSeed {
@@ -671,6 +732,7 @@ impl<'de> DeserializeSeed<'de> for ValSeed {
             ctx: self.ctx,
             parent: self.parent,
             key: self.key,
+            depth: self.depth,
         })
     }
 }
@@ -679,6 +741,7 @@ struct ValVisitor {
     ctx: StreamCtxPtr<'static>,
     parent: u32,
     key: Option<NodeKey>,
+    depth: u32,
 }
 
 impl<'de> Visitor<'de> for ValVisitor {
@@ -768,13 +831,53 @@ impl<'de> Visitor<'de> for ValVisitor {
         let id = self
             .ctx
             .with_mut(|ctx| ctx.alloc(NodeKind::Object, self.key, 0, self.parent));
+        let use_lazy = self.ctx.with_mut(|ctx| ctx.lazy_depth > 0 && self.depth + 1 >= ctx.lazy_depth);
         while let Some(key_str) = map.next_key::<Cow<'de, str>>()? {
             let kid = self.ctx.with_mut(|ctx| ctx.keys.intern(&key_str));
-            map.next_value_seed(ValSeed {
-                ctx: self.ctx,
-                parent: id,
-                key: Some(NodeKey::String(kid)),
-            })?;
+            if use_lazy {
+                // Consume value as raw LazyValue
+                let raw_val = map.next_value::<sonic_rs::LazyValue>()
+                    .map_err(|e| de::Error::custom(e.to_string()))?;
+                let raw_bytes = raw_val.as_raw_str().as_bytes();
+                match raw_bytes.first().copied() {
+                    Some(b'{') | Some(b'[') => {
+                        let is_obj = raw_bytes[0] == b'{';
+                        let kind = if is_obj { NodeKind::LazyObject } else { NodeKind::LazyArray };
+                        let placeholder_count = estimate_children_count(raw_bytes);
+                        self.ctx.with_mut(|ctx| {
+                            let mmap_base = ctx.mmap_base;
+                            let file_offset = raw_bytes.as_ptr() as u64 - mmap_base as u64;
+                            let byte_len = raw_bytes.len() as u64;
+                            let span_id = ctx.lazy_spans.len() as u32;
+                            ctx.lazy_spans.push(LazySpan { file_offset, byte_len });
+                            ctx.lazy_child_counts.push(placeholder_count);
+                            ctx.alloc_lazy(kind, Some(NodeKey::String(kid)), span_id, id);
+                        });
+                    }
+                    _ => {
+                        // Scalar at lazy depth: re-parse from raw bytes via ValSeed
+                        let mut sub_de = sonic_rs::Deserializer::from_slice(raw_bytes);
+                        ValSeed {
+                            ctx: self.ctx,
+                            parent: id,
+                            key: Some(NodeKey::String(kid)),
+                            depth: self.depth + 1,
+                        }.deserialize(&mut sub_de)
+                            .map_err(|e| de::Error::custom(e.to_string()))?;
+                    }
+                }
+                // No subtree_len update needed for lazy children (they count as 0-len)
+                // But we need to update the parent's subtree contribution for this child.
+                // Lazy nodes are leaves in main index: subtree_len contribution = 1 (just themselves).
+                // This is handled below after the loop via nodes.len() - id - 1.
+            } else {
+                map.next_value_seed(ValSeed {
+                    ctx: self.ctx,
+                    parent: id,
+                    key: Some(NodeKey::String(kid)),
+                    depth: self.depth + 1,
+                })?;
+            }
         }
         // Set subtree_len AFTER all children are allocated
         self.ctx.with_mut(|ctx| {
@@ -787,6 +890,7 @@ impl<'de> Visitor<'de> for ValVisitor {
         let id = self
             .ctx
             .with_mut(|ctx| ctx.alloc(NodeKind::Array, self.key, 0, self.parent));
+        let use_lazy = self.ctx.with_mut(|ctx| ctx.lazy_depth > 0 && self.depth + 1 >= ctx.lazy_depth);
         let mut index = 0usize;
         loop {
             if index >= KEY_DATA_MASK as usize {
@@ -794,15 +898,50 @@ impl<'de> Visitor<'de> for ValVisitor {
                     "array index exceeds inline storage capacity",
                 ));
             }
-            if seq
-                .next_element_seed(ValSeed {
-                    ctx: self.ctx,
-                    parent: id,
-                    key: Some(NodeKey::ArrayIndex(index as u32)),
-                })?
-                .is_none()
-            {
-                break;
+            if use_lazy {
+                let raw_opt = seq.next_element::<sonic_rs::LazyValue>()
+                    .map_err(|e| de::Error::custom(e.to_string()))?;
+                let Some(lazy) = raw_opt else { break };
+                let raw_bytes = lazy.as_raw_str().as_bytes();
+                match raw_bytes.first().copied() {
+                    Some(b'{') | Some(b'[') => {
+                        let is_obj = raw_bytes[0] == b'{';
+                        let kind = if is_obj { NodeKind::LazyObject } else { NodeKind::LazyArray };
+                        let placeholder_count = estimate_children_count(raw_bytes);
+                        self.ctx.with_mut(|ctx| {
+                            let mmap_base = ctx.mmap_base;
+                            let file_offset = raw_bytes.as_ptr() as u64 - mmap_base as u64;
+                            let byte_len = raw_bytes.len() as u64;
+                            let span_id = ctx.lazy_spans.len() as u32;
+                            ctx.lazy_spans.push(LazySpan { file_offset, byte_len });
+                            ctx.lazy_child_counts.push(placeholder_count);
+                            ctx.alloc_lazy(kind, Some(NodeKey::ArrayIndex(index as u32)), span_id, id);
+                        });
+                    }
+                    _ => {
+                        // Scalar: re-parse from raw bytes via ValSeed
+                        let mut sub_de = sonic_rs::Deserializer::from_slice(raw_bytes);
+                        ValSeed {
+                            ctx: self.ctx,
+                            parent: id,
+                            key: Some(NodeKey::ArrayIndex(index as u32)),
+                            depth: self.depth + 1,
+                        }.deserialize(&mut sub_de)
+                            .map_err(|e| de::Error::custom(e.to_string()))?;
+                    }
+                }
+            } else {
+                if seq
+                    .next_element_seed(ValSeed {
+                        ctx: self.ctx,
+                        parent: id,
+                        key: Some(NodeKey::ArrayIndex(index as u32)),
+                        depth: self.depth + 1,
+                    })?
+                    .is_none()
+                {
+                    break;
+                }
             }
             index += 1;
         }
@@ -813,6 +952,404 @@ impl<'de> Visitor<'de> for ValVisitor {
         });
         Ok(id)
     }
+}
+
+/// Quick estimate of the number of direct children in a JSON container byte slice.
+/// Returns min(count, 65535). Returns 0 for empty containers.
+/// Returns 0 if the container is empty, 1 if it has any children.
+/// O(n) worst-case but stops at the first non-whitespace byte after the opening bracket,
+/// so in practice it's O(1) for non-empty containers (the common case).
+/// We deliberately avoid a full comma-count scan (which would double the I/O cost
+/// for large files) — the exact count is revealed when the user expands the node.
+fn estimate_children_count(bytes: &[u8]) -> u16 {
+    if bytes.len() <= 2 {
+        return 0;
+    }
+    // Look for any non-whitespace byte between the outer brackets.
+    for &b in &bytes[1..bytes.len() - 1] {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' => continue,
+            _ => return 1,
+        }
+    }
+    0
+}
+
+// ── Custom byte-level JSON scanners ──────────────────────────────────────────
+
+/// One entry at the top level of a JSON object or array.
+struct TopLevelEntry {
+    key: String,       // empty for array roots
+    value_start: usize,
+    value_end: usize,
+    is_container: bool,
+    is_array: bool,
+}
+
+/// Scan to end of a JSON string literal starting at `bytes[start]` (must be `"`).
+/// Returns the index one past the closing `"`.
+#[inline]
+pub fn scan_json_string(bytes: &[u8], start: usize) -> usize {
+    let mut pos = start + 1; // skip opening "
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'\\' => { pos += 2; } // skip escaped char
+            b'"' => { pos += 1; break; }
+            _ => { pos += 1; }
+        }
+    }
+    pos
+}
+
+/// Scan to the end of a JSON value starting at `bytes[start]`.
+/// Returns the index one past the last byte of the value.
+pub fn scan_json_value_end(bytes: &[u8], start: usize) -> usize {
+    let mut pos = start;
+    if pos >= bytes.len() {
+        return pos;
+    }
+    match bytes[pos] {
+        b'{' | b'[' => {
+            let open = bytes[pos];
+            let close = if open == b'{' { b'}' } else { b']' };
+            let mut depth = 1i32;
+            pos += 1;
+            while pos < bytes.len() {
+                match bytes[pos] {
+                    b'"' => { pos = scan_json_string(bytes, pos); }
+                    b if b == open => { depth += 1; pos += 1; }
+                    b if b == close => {
+                        depth -= 1;
+                        pos += 1;
+                        if depth == 0 { break; }
+                    }
+                    _ => { pos += 1; }
+                }
+            }
+        }
+        b'"' => { pos = scan_json_string(bytes, pos); }
+        _ => {
+            // null, true, false, or number
+            while pos < bytes.len()
+                && !matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r'|b','|b']'|b'}')
+            {
+                pos += 1;
+            }
+        }
+    }
+    pos
+}
+
+/// Scan array or object `bytes` to find element byte ranges.
+/// Returns `(elem_start, elem_end)` pairs (exclusive end), skipping first `offset` elements.
+pub fn scan_json_elements(
+    bytes: &[u8],
+    is_array: bool,
+    offset: usize,
+    limit: usize,
+) -> Vec<(usize, usize)> {
+    let mut pos = 0usize;
+    // Skip to opening '[' or '{'
+    while pos < bytes.len() && !matches!(bytes[pos], b'[' | b'{') {
+        pos += 1;
+    }
+    if pos >= bytes.len() {
+        return Vec::new();
+    }
+    pos += 1; // skip the opening bracket
+
+    let mut results = Vec::new();
+    let mut skipped = 0usize;
+
+    loop {
+        // Skip whitespace and commas
+        while pos < bytes.len() && matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r'|b',') {
+            pos += 1;
+        }
+        if pos >= bytes.len() || matches!(bytes[pos], b']' | b'}') {
+            break;
+        }
+
+        let elem_start = pos;
+
+        if !is_array {
+            // Object: skip key
+            if pos < bytes.len() && bytes[pos] == b'"' {
+                pos = scan_json_string(bytes, pos);
+                // Skip whitespace and colon
+                while pos < bytes.len() && matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r'|b':') {
+                    pos += 1;
+                }
+            }
+        }
+
+        // Scan value
+        pos = scan_json_value_end(bytes, pos);
+        let elem_end = pos;
+
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+
+        results.push((elem_start, elem_end));
+        if results.len() >= limit {
+            break;
+        }
+    }
+
+    results
+}
+
+/// Use reverse scan from EOF to find the end position of a container value
+/// that starts at `value_start` with `open_char` (`[` or `{`).
+/// Returns one-past-the-closing-bracket position.
+fn find_value_end_reverse(bytes: &[u8], open_char: u8, value_start: usize) -> usize {
+    let close_char = if open_char == b'[' { b']' } else { b'}' };
+    let mut pos = bytes.len();
+
+    // We need to scan backwards, skipping strings carefully.
+    // Strategy: collect positions of all non-string close_chars from the end.
+    // We track depth by counting open/close brackets (not inside strings).
+    // Since we're going backwards, we start depth=0 and look for the FIRST close we hit
+    // (which is the outermost closing bracket from the end).
+
+    // First skip trailing whitespace from end
+    while pos > value_start && matches!(bytes[pos - 1], b' '|b'\t'|b'\n'|b'\r') {
+        pos -= 1;
+    }
+
+    // The file structure is: ..., "value": <our_value>,...closing_of_root}
+    // We need to find the closing bracket of <our_value>.
+    // Method: scan backwards from end, counting bracket depth.
+    // The root's closing bracket has depth 1 (from root open), and our value's closing
+    // bracket has depth 2 from the end perspective.
+    // Simpler: just count from value_start forward for LARGE values is too slow.
+    // We do reverse scan but must handle strings correctly.
+
+    // Build a simple forward index of string ranges in the last ~64KB to handle
+    // string boundaries correctly in reverse. For values that end near EOF this is fine.
+    // If value is the last thing in the file, last char before root-close is close_char.
+
+    // Simple approach: scan backwards from end, tracking depth.
+    // Strings in reverse: find `"` then scan forward to verify it's a string end.
+    // We approximate by just counting brackets (ignoring strings in reverse).
+    // This works for typical JSON where brackets inside strings are rare.
+
+    let mut depth = 0i32;
+    let mut p = pos;
+    while p > value_start {
+        p -= 1;
+        let b = bytes[p];
+        if b == b'"' {
+            // Skip backwards over a string literal
+            // Find the opening quote by going forward from value_start is too expensive.
+            // Instead: scan backwards counting escape sequences.
+            // The byte before the `"` could be `\` (escaped quote) or not.
+            let mut q = p;
+            loop {
+                if q == 0 { break; }
+                q -= 1;
+                if bytes[q] != b'\\' { break; }
+                // Count consecutive backslashes
+                let mut bs = 0usize;
+                let mut bq = q;
+                while bq > 0 && bytes[bq] == b'\\' { bs += 1; bq -= 1; }
+                if bs % 2 == 1 {
+                    // odd backslashes: this `"` is escaped, keep scanning
+                    p = q;
+                    continue;
+                }
+                break;
+            }
+            // q is at the opening `"` of the string (approximately)
+            continue;
+        }
+        if b == close_char {
+            depth -= 1;
+            if depth == -1 {
+                // This is the matching close for our value
+                return p + 1;
+            }
+        } else if b == open_char {
+            depth += 1;
+        }
+    }
+
+    bytes.len() // fallback: return entire remainder
+}
+
+/// Threshold for "small value" forward scan budget per entry.
+const FAST_SCAN_SMALL_VALUE_THRESHOLD: usize = 2 * 1024 * 1024; // 2 MB
+
+/// Attempt to scan the end of a JSON value starting at `bytes[start]`,
+/// but stop after at most `budget` bytes of forward scanning.
+/// Returns `Some(end_pos)` if the value ends within budget, `None` if the budget is exceeded.
+fn scan_json_value_end_budgeted(bytes: &[u8], start: usize, budget: usize) -> Option<usize> {
+    let limit = (start + budget).min(bytes.len());
+    let slice = &bytes[start..limit];
+    if slice.is_empty() {
+        return Some(start);
+    }
+    match slice[0] {
+        b'{' | b'[' => {
+            let open = slice[0];
+            let close = if open == b'{' { b'}' } else { b']' };
+            let mut depth = 1i32;
+            let mut rel = 1usize; // relative position within slice
+            while rel < slice.len() {
+                match slice[rel] {
+                    b'"' => {
+                        // scan string using the slice
+                        rel = scan_json_string(slice, rel);
+                    }
+                    b if b == open => { depth += 1; rel += 1; }
+                    b if b == close => {
+                        depth -= 1;
+                        rel += 1;
+                        if depth == 0 { return Some(start + rel); }
+                    }
+                    _ => { rel += 1; }
+                }
+            }
+            None // hit budget limit without finding close
+        }
+        b'"' => {
+            let end_rel = scan_json_string(slice, 0);
+            if end_rel <= slice.len() { Some(start + end_rel) } else { None }
+        }
+        _ => {
+            // scalar
+            let mut pos = 0usize;
+            while pos < slice.len()
+                && !matches!(slice[pos], b' '|b'\t'|b'\n'|b'\r'|b','|b']'|b'}')
+            {
+                pos += 1;
+            }
+            if pos < slice.len() || start + pos == bytes.len() {
+                Some(start + pos)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Scan top-level entries of a JSON root object or array.
+/// For small values (< FAST_SCAN_SMALL_VALUE_THRESHOLD) uses forward scan.
+/// For large values uses reverse scan from EOF.
+fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
+    let mut pos = 0usize;
+
+    // Find root bracket
+    while pos < bytes.len() && matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r') {
+        pos += 1;
+    }
+    if pos >= bytes.len() {
+        return Err("empty JSON".to_string());
+    }
+
+    let root_char = bytes[pos];
+    if root_char != b'{' && root_char != b'[' {
+        return Err(format!("expected '{{' or '[' at root, got '{}'", root_char as char));
+    }
+    let is_array_root = root_char == b'[';
+    pos += 1;
+
+    // Find root close position from the end (for reverse scan fallback)
+    // The root's closing bracket is the last non-whitespace byte of the file.
+    let mut root_close_pos = bytes.len();
+    while root_close_pos > 0 && matches!(bytes[root_close_pos - 1], b' '|b'\t'|b'\n'|b'\r') {
+        root_close_pos -= 1;
+    }
+    // root_close_pos now points one past the root's closing bracket
+
+    let mut entries: Vec<TopLevelEntry> = Vec::new();
+    let mut array_idx = 0usize;
+
+    loop {
+        // Skip whitespace/commas
+        while pos < bytes.len() && matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r'|b',') {
+            pos += 1;
+        }
+        if pos >= bytes.len() || matches!(bytes[pos], b']' | b'}') {
+            break;
+        }
+
+        let key = if is_array_root {
+            let k = array_idx.to_string();
+            array_idx += 1;
+            k
+        } else {
+            // Read key string
+            if bytes[pos] != b'"' {
+                return Err(format!("expected '\"' for key at pos {pos}"));
+            }
+            let key_start = pos + 1;
+            pos = scan_json_string(bytes, pos);
+            let key_end = pos - 1;
+            let key_raw = bytes.get(key_start..key_end).unwrap_or(b"");
+            String::from_utf8_lossy(key_raw).into_owned()
+        };
+
+        if !is_array_root {
+            // Skip whitespace and colon
+            while pos < bytes.len() && matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r'|b':') {
+                pos += 1;
+            }
+        }
+
+        // Record value start
+        let value_start = pos;
+        if pos >= bytes.len() {
+            break;
+        }
+
+        let first_byte = bytes[pos];
+        let is_container = matches!(first_byte, b'{' | b'[');
+        let is_array_val = first_byte == b'[';
+
+        // Try fast forward scan with budget
+        let value_end = match scan_json_value_end_budgeted(bytes, value_start, FAST_SCAN_SMALL_VALUE_THRESHOLD) {
+            Some(end) => {
+                // Forward scan succeeded within budget
+                end
+            }
+            None => {
+                // Value is large — this is likely the last top-level entry.
+                // Use reverse scan to find value_end from EOF.
+                // We know the structure: value ends before root's closing bracket,
+                // possibly followed by whitespace and other entries.
+                // For the common case (large value is the last one), the end is
+                // just before the root's closing bracket.
+                //
+                // Use find_value_end_reverse to be precise.
+                let end = find_value_end_reverse(bytes, first_byte, value_start);
+                // After this large value we assume no more entries (common case).
+                // If there ARE more, they'll be missed — acceptable for now.
+                entries.push(TopLevelEntry {
+                    key,
+                    value_start,
+                    value_end: end,
+                    is_container,
+                    is_array: is_array_val,
+                });
+                break;
+            }
+        };
+
+        pos = value_end;
+
+        entries.push(TopLevelEntry {
+            key,
+            value_start,
+            value_end,
+            is_container,
+            is_array: is_array_val,
+        });
+    }
+
+    Ok(entries)
 }
 
 /// Finalizes the JsonIndex: trivial finish since subtree_len is already set during streaming.
@@ -829,6 +1366,10 @@ fn finish_index(ctx: StreamCtx) -> JsonIndex {
         mut val_strings,
         mut nums_pool,
         str_max_bytes: _,
+        lazy_spans,
+        lazy_child_counts,
+        mmap_base: _,
+        lazy_depth: _,
     } = ctx;
 
     // Shrink all Vecs to exact length, releasing over-allocated capacity.
@@ -849,6 +1390,8 @@ fn finish_index(ctx: StreamCtx) -> JsonIndex {
     shrink_vec_if_wasteful(&mut container_subtrees);
     shrink_vec_if_wasteful(&mut container_children);
 
+    let base = nodes.len() as u32;
+
     JsonIndex {
         nodes,
         parent_deltas,
@@ -860,11 +1403,21 @@ fn finish_index(ctx: StreamCtx) -> JsonIndex {
         val_strings,
         nums_pool,
         root: 0,
+        lazy_spans,
+        lazy_child_counts,
+        source_file: None, // set by from_file after parsing for large files
+        extra: Mutex::new(ExtraState {
+            base,
+            sub_indices: Vec::new(),
+            mat: HashMap::new(),
+            extra_parent: HashMap::new(),
+            extra_key_override: HashMap::new(),
+        }),
     }
 }
 
 fn parse_streaming<'de, D: de::Deserializer<'de>>(de: D) -> Result<JsonIndex, D::Error> {
-    parse_streaming_with_cap(de, 0, 0, 0)
+    parse_streaming_with_cap(de, 0, 0, 0, 0, 0)
 }
 
 fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(
@@ -872,15 +1425,20 @@ fn parse_streaming_with_cap<'de, D: de::Deserializer<'de>>(
     node_cap: usize,
     str_bytes: usize,
     str_max_bytes: usize,
+    lazy_depth: u32,
+    mmap_base: usize,
 ) -> Result<JsonIndex, D::Error> {
     let mut ctx = StreamCtx::with_capacity(node_cap, str_bytes);
     ctx.str_max_bytes = str_max_bytes;
+    ctx.lazy_depth = lazy_depth;
+    ctx.mmap_base = mmap_base;
     let ctx_ptr = StreamCtxPtr::new(&mut ctx);
     let ctx_ptr: StreamCtxPtr<'static> = unsafe { std::mem::transmute(ctx_ptr) };
     de.deserialize_any(ValVisitor {
         ctx: ctx_ptr,
         parent: u32::MAX,
         key: None,
+        depth: 0,
     })?;
     Ok(finish_index(ctx))
 }
@@ -899,6 +1457,16 @@ pub struct JsonIndex {
     pub val_strings: InternedStrings, // compact interned string-value pool
     pub nums_pool: Vec<f64>,          // numeric values: NodeKind::Num(idx) → nums_pool[idx]
     pub root: u32,
+    /// Byte spans (within mmap) for lazy nodes; indexed by node.value_data.
+    pub lazy_spans: Vec<LazySpan>,
+    /// Estimated child count for each lazy span (for UI preview).
+    pub lazy_child_counts: Vec<u16>,
+    /// File path kept for on-demand lazy expansion (None for small files or in-memory parse).
+    /// The mmap is NOT kept alive after initial parse — re-opened per expansion to avoid
+    /// holding the entire 4+ GB file resident in RAM.
+    pub source_file: Option<String>,
+    /// Dynamic state for materialized lazy nodes.
+    pub extra: Mutex<ExtraState>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -967,6 +1535,8 @@ impl JsonIndex {
     fn children_len_for_node(&self, node: &Node) -> u32 {
         if node.kind().is_container() {
             self.container_children[node.value_data as usize] as u32
+        } else if node.kind().is_lazy() {
+            self.lazy_child_counts[node.value_data as usize] as u32
         } else {
             0
         }
@@ -977,6 +1547,7 @@ impl JsonIndex {
         if node.kind().is_container() {
             self.container_subtrees[node.value_data as usize]
         } else {
+            // Lazy nodes and leaves have subtree_len = 0 in the main index
             0
         }
     }
@@ -994,6 +1565,440 @@ impl JsonIndex {
     #[inline]
     pub fn has_children(&self, id: u32) -> bool {
         self.children_len(id) != 0
+    }
+
+    // ---- Lazy expansion API ----
+
+    /// Returns true if `id` refers to an extra (post-materialization) node.
+    #[inline]
+    pub fn is_extra_id(&self, id: u32) -> bool {
+        let extra = self.extra.lock().unwrap();
+        id >= extra.base
+    }
+
+    /// Parses the raw mmap bytes for a lazy node and stores its children in ExtraState.
+    /// No-op if already materialized.
+    pub fn materialize_lazy_node(&self, node_id: u32) -> Result<(), String> {
+        let node = &self.nodes[node_id as usize];
+        debug_assert!(node.kind().is_lazy(), "materialize_lazy_node called on non-lazy node");
+
+        // Check already materialized (fast path without sub-parse)
+        {
+            let extra = self.extra.lock().unwrap();
+            if extra.mat.contains_key(&node_id) {
+                return Ok(());
+            }
+        }
+
+        let span_id = node.value_data as usize;
+        let span = self.lazy_spans[span_id];
+
+        // Re-open and mmap the source file just for this expansion, then drop it.
+        // This avoids keeping the entire file resident in RAM between expansions.
+        let file_path = self.source_file.as_deref()
+            .ok_or_else(|| "source_file not set for lazy expansion".to_string())?;
+        let file = File::open(file_path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        let start = span.file_offset as usize;
+        let end = start + span.byte_len as usize;
+        let raw = &mmap[start..end];
+
+        // Parse sub-index (no lazy mode for sub-parse — individual rows are small)
+        let sub_index = Arc::new(JsonIndex::from_slice(raw)?);
+        let sub_root = sub_index.root;
+
+        let mut extra = self.extra.lock().unwrap();
+
+        // Double-check after acquiring lock
+        if extra.mat.contains_key(&node_id) {
+            return Ok(());
+        }
+
+        let base = extra.base;
+        let sub_idx = extra.sub_indices.len();
+
+        // Collect direct children of sub_index root
+        let child_sub_ids: Vec<u32> = sub_index.children_iter(sub_root).collect();
+
+        // Register global IDs for direct children in extra_parent
+        for (i, &sub_id) in child_sub_ids.iter().enumerate() {
+            let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
+            extra.extra_parent.insert(global_id, node_id);
+            // Also register grandchildren (children of containers within sub_index)
+            // so parent_of_any works transitively for path building.
+            let sub_node = &sub_index.nodes[sub_id as usize];
+            if sub_node.kind().is_container() {
+                Self::register_sub_descendants(
+                    &sub_index, sub_id, global_id, sub_idx, base, &mut extra.extra_parent,
+                );
+            }
+            let _ = i; // suppress unused warning
+        }
+
+        extra.sub_indices.push(sub_index);
+        extra.mat.insert(node_id, MatInfo2 { sub_idx, child_sub_ids });
+
+        Ok(())
+    }
+
+    /// Recursively registers extra_parent entries for sub-descendants.
+    fn register_sub_descendants(
+        sub_index: &JsonIndex,
+        container_sub_id: u32,
+        parent_global_id: u32,
+        sub_idx: usize,
+        base: u32,
+        extra_parent: &mut HashMap<u32, u32>,
+    ) {
+        for child_sub_id in sub_index.children_iter(container_sub_id) {
+            let child_global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + child_sub_id;
+            extra_parent.insert(child_global_id, parent_global_id);
+            let child_node = &sub_index.nodes[child_sub_id as usize];
+            if child_node.kind().is_container() {
+                Self::register_sub_descendants(
+                    sub_index, child_sub_id, child_global_id, sub_idx, base, extra_parent,
+                );
+            }
+        }
+    }
+
+    /// Returns direct children of any node (main, lazy, or extra).
+    /// For lazy nodes: materializes on demand.
+    /// For extra nodes: returns their sub-children mapped to global IDs.
+    pub fn get_children_any(&self, id: u32) -> Result<Vec<u32>, String> {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+
+        if id < base {
+            let node = &self.nodes[id as usize];
+            if node.kind().is_lazy() {
+                let span_id = node.value_data as usize;
+                let is_large = span_id < self.lazy_spans.len()
+                    && self.lazy_spans[span_id].byte_len >= LAZY_PAGINATE_THRESHOLD;
+                if is_large {
+                    // Use paginated scanner for large spans — avoids reading full span
+                    return self.get_lazy_children_page(id, 0, EXPAND_SUBTREE_INLINE_PAGE);
+                }
+                self.materialize_lazy_node(id)?;
+                let extra = self.extra.lock().unwrap();
+                if let Some(mat) = extra.mat.get(&id) {
+                    let sub_idx = mat.sub_idx;
+                    let global_ids: Vec<u32> = mat.child_sub_ids.iter()
+                        .map(|&sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
+                        .collect();
+                    return Ok(global_ids);
+                }
+                return Ok(Vec::new());
+            }
+            // Normal main-index container
+            if node.kind().is_container() {
+                return Ok(self.get_children_slice(id));
+            }
+            return Ok(Vec::new());
+        }
+
+        // Extra node: look up its sub-index
+        let extra = self.extra.lock().unwrap();
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+
+        if sub_idx >= extra.sub_indices.len() {
+            return Ok(Vec::new());
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        drop(extra);
+
+        let sub_node = &sub_index.nodes[sub_id as usize];
+        if !sub_node.kind().is_container() {
+            return Ok(Vec::new());
+        }
+        let child_ids: Vec<u32> = sub_index.children_iter(sub_id)
+            .map(|csub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + csub_id)
+            .collect();
+        Ok(child_ids)
+    }
+
+    /// Returns the parent of any node (main, lazy, or extra).
+    pub fn parent_of_any(&self, id: u32) -> Option<u32> {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if id < base {
+            return self.parent_of(id);
+        }
+        let extra = self.extra.lock().unwrap();
+        extra.extra_parent.get(&id).copied()
+    }
+
+    /// Returns children count for any node (main, lazy, or extra).
+    pub fn children_count_any(&self, id: u32) -> u32 {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if id < base {
+            return self.children_len(id);
+        }
+        let extra = self.extra.lock().unwrap();
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        if sub_idx >= extra.sub_indices.len() {
+            return 0;
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        drop(extra);
+        sub_index.children_len(sub_id)
+    }
+
+    /// Returns true if this is a lazy node with a large span (>= LAZY_PAGINATE_THRESHOLD).
+    /// For such nodes the exact child count is unknown without a full scan.
+    pub fn is_large_lazy(&self, id: u32) -> bool {
+        let node = &self.nodes[id as usize];
+        if !node.kind().is_lazy() {
+            return false;
+        }
+        let span_id = node.value_data as usize;
+        span_id < self.lazy_spans.len()
+            && self.lazy_spans[span_id].byte_len >= LAZY_PAGINATE_THRESHOLD
+    }
+
+    /// Returns node kind and key for any node (main or extra).
+    pub fn node_kind_any(&self, id: u32) -> NodeKind {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if id < base {
+            return self.nodes[id as usize].kind();
+        }
+        let extra = self.extra.lock().unwrap();
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        if sub_idx >= extra.sub_indices.len() {
+            return NodeKind::Null;
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        drop(extra);
+        sub_index.nodes[sub_id as usize].kind()
+    }
+
+    /// Returns raw JSON for a node. For lazy nodes reads directly from mmap.
+    /// For extra nodes, rebuilds from the sub-index.
+    pub fn get_raw_any(&self, id: u32) -> String {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if id < base {
+            let node = &self.nodes[id as usize];
+            if node.kind().is_lazy() {
+                // Re-open the source file to read just this lazy span.
+                if let Some(ref path) = self.source_file {
+                    let span_id = node.value_data as usize;
+                    if span_id < self.lazy_spans.len() {
+                        let span = self.lazy_spans[span_id];
+                        let start = span.file_offset as usize;
+                        let end = start + span.byte_len as usize;
+                        if let Ok(file) = File::open(path) {
+                            if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
+                                if end <= mmap.len() {
+                                    if let Ok(s) = std::str::from_utf8(&mmap[start..end]) {
+                                        return s.to_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return "null".to_string();
+            }
+            return self.build_raw(id);
+        }
+
+        // Extra node: rebuild from sub-index
+        let extra = self.extra.lock().unwrap();
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        if sub_idx >= extra.sub_indices.len() {
+            return "null".to_string();
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        drop(extra);
+        sub_index.build_raw(sub_id)
+    }
+
+    /// Returns path string for any node (main or extra).
+    pub fn get_path_any(&self, node_id: u32) -> String {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if node_id < base {
+            return self.get_path(node_id);
+        }
+
+        // Collect key segments by walking parent_of_any
+        let mut segments: Vec<String> = Vec::with_capacity(16);
+        let mut current = node_id;
+        loop {
+            let key_str = self.key_string_any(current);
+            if let Some(k) = key_str {
+                segments.push(k);
+            }
+            match self.parent_of_any(current) {
+                None => break,
+                Some(p) => current = p,
+            }
+        }
+        segments.reverse();
+        if segments.is_empty() {
+            "$".to_string()
+        } else {
+            let mut out = String::with_capacity(segments.iter().map(|s| s.len() + 1).sum::<usize>() + 2);
+            out.push('$');
+            for seg in segments {
+                out.push('.');
+                out.push_str(&seg);
+            }
+            out
+        }
+    }
+
+    /// Returns the key string for any node (main or extra).
+    pub fn key_string_any(&self, id: u32) -> Option<String> {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if id < base {
+            let node = &self.nodes[id as usize];
+            return match node.key()? {
+                NodeKey::String(kid) => Some(self.keys.get(kid).to_string()),
+                NodeKey::ArrayIndex(idx) => Some(idx.to_string()),
+            };
+        }
+        let extra = self.extra.lock().unwrap();
+        // Check key override first (set e.g. for elements materialized from lazy spans during search).
+        if let Some(k) = extra.extra_key_override.get(&id) {
+            return Some(k.clone());
+        }
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        if sub_idx >= extra.sub_indices.len() {
+            return None;
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        drop(extra);
+        let node = &sub_index.nodes[sub_id as usize];
+        match node.key()? {
+            NodeKey::String(kid) => Some(sub_index.keys.get(kid).to_string()),
+            NodeKey::ArrayIndex(idx) => Some(idx.to_string()),
+        }
+    }
+
+    /// Returns a value preview string for any node (main or extra).
+    pub fn value_preview_any(&self, id: u32) -> String {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if id < base {
+            let node = &self.nodes[id as usize];
+            let kind = node.kind();
+            if kind.is_lazy() {
+                let span_id = node.value_data as usize;
+                let count = if span_id < self.lazy_child_counts.len() {
+                    self.lazy_child_counts[span_id] as usize
+                } else {
+                    0
+                };
+                return if kind == NodeKind::LazyObject {
+                    if count == 0 { "{}".to_string() } else { format!("{{{} keys}}", count) }
+                } else {
+                    if count == 0 { "[]".to_string() } else { format!("[{} items]", count) }
+                };
+            }
+            // Delegate to existing method via a temporary node ref
+            let children_len = self.children_len(id) as usize;
+            return match kind {
+                NodeKind::Object => {
+                    if children_len == 0 { "{}".to_string() } else { format!("{{{} keys}}", children_len) }
+                }
+                NodeKind::Array => {
+                    if children_len == 0 { "[]".to_string() } else { format!("[{} items]", children_len) }
+                }
+                NodeKind::Str => {
+                    let s = self.str_val_of_node(node);
+                    let truncated = &s[..s.char_indices().nth(80).map(|(i,_)| i).unwrap_or(s.len())];
+                    if truncated.len() < s.len() {
+                        format!("\"{}…\"", truncated)
+                    } else {
+                        format!("\"{}\"", s)
+                    }
+                }
+                NodeKind::Num => self.number_to_string(id),
+                NodeKind::Bool => if node.value_data != 0 { "true".to_string() } else { "false".to_string() },
+                NodeKind::Null => "null".to_string(),
+                _ => String::new(),
+            };
+        }
+
+        let extra = self.extra.lock().unwrap();
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        if sub_idx >= extra.sub_indices.len() {
+            return "null".to_string();
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        drop(extra);
+
+        let node = &sub_index.nodes[sub_id as usize];
+        let children_len = sub_index.children_len(sub_id) as usize;
+        match node.kind() {
+            NodeKind::Object => {
+                if children_len == 0 { "{}".to_string() } else { format!("{{{} keys}}", children_len) }
+            }
+            NodeKind::Array => {
+                if children_len == 0 { "[]".to_string() } else { format!("[{} items]", children_len) }
+            }
+            NodeKind::Str => {
+                let s = sub_index.str_val_of_node(node);
+                let truncated = &s[..s.char_indices().nth(80).map(|(i,_)| i).unwrap_or(s.len())];
+                if truncated.len() < s.len() {
+                    format!("\"{}…\"", truncated)
+                } else {
+                    format!("\"{}\"", s)
+                }
+            }
+            NodeKind::Num => sub_index.number_to_string(sub_id),
+            NodeKind::Bool => if node.value_data != 0 { "true".to_string() } else { "false".to_string() },
+            NodeKind::Null => "null".to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Returns the value_type string for any node (main or extra).
+    pub fn value_type_any(&self, id: u32) -> &'static str {
+        let kind = self.node_kind_any(id);
+        match kind {
+            NodeKind::Object => "object",
+            NodeKind::Array => "array",
+            NodeKind::Str => "string",
+            NodeKind::Num => "number",
+            NodeKind::Bool => "boolean",
+            NodeKind::Null => "null",
+            NodeKind::LazyObject => "object",
+            NodeKind::LazyArray => "array",
+        }
     }
 
     #[inline]
@@ -1180,51 +2185,176 @@ impl JsonIndex {
     /// The mapped file must not be modified externally while this function runs.
     /// This is the standard documented caveat for memory-mapped I/O.
     pub fn from_file(path: &str) -> Result<Self, String> {
-        #[cfg(not(windows))]
-        let file = File::open(path).map_err(|e| e.to_string())?;
-
-        // On Windows use FILE_FLAG_SEQUENTIAL_SCAN (0x0800_0000) so the OS
-        // prefetches pages ahead of the sequential SIMD scan — equivalent to
-        // MADV_SEQUENTIAL on Unix.
-        #[cfg(windows)]
-        let file = {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
-                .open(path)
-                .map_err(|e| e.to_string())?
-        };
-
-        let file_size = file.metadata().map_err(|e| e.to_string())?.len();
+        let file_size = std::fs::metadata(path)
+            .map(|m| m.len())
+            .map_err(|e| e.to_string())?;
 
         if file_size == 0 {
             return Err("file is empty".to_string());
         }
 
-        let (node_cap, str_bytes) = capacity_hints(file_size);
+        Self::from_file_fast_lazy(path, file_size)
+    }
 
-        // Map the file read-only for SIMD-accelerated parsing.
-        // SAFETY: we only read; the file must not be modified while mapped.
+    // ── Fast load helpers (forward+reverse byte scan) ─────────────────────────
+
+    /// Modify `from_file` to use the fast path for very large files.
+    /// Fast load for large files: reads only ~kilobytes total to build the lazy structure.
+    /// Uses custom forward+reverse scan to find top-level value spans without sonic-rs.
+    fn from_file_fast_lazy(path: &str, _file_size: u64) -> Result<Self, String> {
+        let file = File::open(path).map_err(|e| e.to_string())?;
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
-        #[cfg(unix)]
-        let _ = mmap.advise(memmap2::Advice::Sequential);
+        let bytes = &mmap[..];
 
-        let str_max = if file_size >= VERY_LARGE_FILE_THRESHOLD_BYTES {
-            VERY_LARGE_FILE_STR_MAX_BYTES
-        } else {
-            0
-        };
-        let mut de = sonic_rs::Deserializer::from_slice(&mmap[..]);
-        let result = parse_streaming_with_cap(&mut de, node_cap, str_bytes, str_max)
-            .map_err(|e| e.to_string());
+        let entries = scan_top_level_entries(bytes)?;
 
-        // Drop the mmap immediately: releases the 1 GB of virtual address space
-        // and the pages brought into RAM by the sequential scan.  All string
-        // values have been interned into the compact val_strings pool.
+        // Determine root kind (object vs array)
+        let mut root_start = 0usize;
+        while root_start < bytes.len() && matches!(bytes[root_start], b' '|b'\t'|b'\n'|b'\r') {
+            root_start += 1;
+        }
+        let is_array_root = root_start < bytes.len() && bytes[root_start] == b'[';
+
+        let mut ctx = StreamCtx::with_capacity(entries.len() + 2, 0);
+
+        let root_kind = if is_array_root { NodeKind::Array } else { NodeKind::Object };
+        let root_id = ctx.alloc(root_kind, None, 0, u32::MAX);
+
+        for (i, entry) in entries.iter().enumerate() {
+            let key = if is_array_root {
+                Some(NodeKey::ArrayIndex(i as u32))
+            } else {
+                let kid = ctx.keys.intern(&entry.key);
+                Some(NodeKey::String(kid))
+            };
+
+            if entry.is_container {
+                let kind = if entry.is_array { NodeKind::LazyArray } else { NodeKind::LazyObject };
+                let span_id = ctx.lazy_spans.len() as u32;
+                let byte_len = (entry.value_end - entry.value_start) as u64;
+                ctx.lazy_spans.push(LazySpan {
+                    file_offset: entry.value_start as u64,
+                    byte_len,
+                });
+                // Estimate children: 1 if non-empty, 0 if empty
+                let placeholder: u16 = if byte_len > 2 { 1 } else { 0 };
+                ctx.lazy_child_counts.push(placeholder);
+                ctx.alloc_lazy(kind, key, span_id, root_id);
+            } else {
+                // Small scalar value: parse inline using sonic-rs
+                let raw = &bytes[entry.value_start..entry.value_end];
+                let mut sub_de = sonic_rs::Deserializer::from_slice(raw);
+                let ctx_ptr = StreamCtxPtr::new(&mut ctx);
+                let ctx_ptr: StreamCtxPtr<'static> = unsafe { std::mem::transmute(ctx_ptr) };
+                let _ = ValSeed {
+                    ctx: ctx_ptr,
+                    parent: root_id,
+                    key,
+                    depth: 1,
+                }.deserialize(&mut sub_de)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        // Set root subtree_len
+        let meta_id = ctx.nodes[root_id as usize].value_data as usize;
+        ctx.container_subtrees[meta_id] = ctx.nodes.len() as u32 - root_id - 1;
+        ctx.container_children[meta_id] = entries.len().min(u16::MAX as usize) as u16;
+
         drop(mmap);
-        result
+        drop(file);
+
+        let mut index = finish_index(ctx);
+        index.source_file = Some(path.to_string());
+        Ok(index)
+    }
+
+    /// Returns direct children global IDs for elements [offset..offset+limit] within a lazy
+    /// container node, using a custom byte scanner. For small lazy nodes (< LAZY_PAGINATE_THRESHOLD)
+    /// falls back to full materialization.
+    pub fn get_lazy_children_page(
+        &self,
+        node_id: u32,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<u32>, String> {
+        let node = &self.nodes[node_id as usize];
+        debug_assert!(node.kind().is_lazy());
+
+        let span_id = node.value_data as usize;
+        let span = self.lazy_spans[span_id];
+
+        // For small lazy spans, use full materialization (fast enough)
+        if span.byte_len < LAZY_PAGINATE_THRESHOLD {
+            self.materialize_lazy_node(node_id)?;
+            let extra = self.extra.lock().unwrap();
+            let base = extra.base;
+            if let Some(mat) = extra.mat.get(&node_id) {
+                let sub_idx = mat.sub_idx;
+                let global_ids: Vec<u32> = mat.child_sub_ids.iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|&sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
+                    .collect();
+                return Ok(global_ids);
+            }
+            return Ok(Vec::new());
+        }
+
+        // Large lazy span: use custom byte scanner for pagination
+        let path = self.source_file.as_deref().ok_or("no source file for lazy expansion")?;
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        let start = span.file_offset as usize;
+        let end = (span.file_offset + span.byte_len) as usize;
+        let raw = &mmap[start..end];
+        let is_array = node.kind() == NodeKind::LazyArray;
+
+        let elements = scan_json_elements(raw, is_array, offset, limit);
+        if elements.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build a wrapper JSON string for these elements and parse as a sub-index
+        let total_bytes: usize = elements.iter().map(|(s, e)| e - s).sum::<usize>()
+            + elements.len().saturating_sub(1) // commas
+            + 2; // brackets
+        let mut wrapper = String::with_capacity(total_bytes);
+        wrapper.push(if is_array { '[' } else { '{' });
+        for (i, (elem_start, elem_end)) in elements.iter().enumerate() {
+            if i > 0 { wrapper.push(','); }
+            let elem_bytes = &raw[*elem_start..*elem_end];
+            match std::str::from_utf8(elem_bytes) {
+                Ok(s) => wrapper.push_str(s),
+                Err(_) => wrapper.push_str("null"),
+            }
+        }
+        wrapper.push(if is_array { ']' } else { '}' });
+        drop(mmap);
+
+        let sub_index = Arc::new(JsonIndex::from_str(&wrapper)?);
+        let sub_root = sub_index.root;
+        let child_sub_ids: Vec<u32> = sub_index.children_iter(sub_root).collect();
+
+        let mut extra = self.extra.lock().unwrap();
+        let base = extra.base;
+        let sub_idx = extra.sub_indices.len();
+
+        let mut child_ids = Vec::with_capacity(child_sub_ids.len());
+        for &sub_id in &child_sub_ids {
+            let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
+            extra.extra_parent.insert(global_id, node_id);
+            let sub_node = &sub_index.nodes[sub_id as usize];
+            if sub_node.kind().is_container() {
+                Self::register_sub_descendants(
+                    &sub_index, sub_id, global_id, sub_idx, base, &mut extra.extra_parent,
+                );
+            }
+            child_ids.push(global_id);
+        }
+        extra.sub_indices.push(sub_index);
+
+        Ok(child_ids)
     }
 
     /// Truly streaming parsing: reads from disk in chunks without buffering in RAM.
@@ -1234,25 +2364,44 @@ impl JsonIndex {
     }
 
     pub fn expanded_visible_count(&self) -> usize {
-        // root.subtree_len = total descendants. We show all except root itself.
-        self.subtree_len(self.root) as usize
+        // main index count + all materialized sub-index descendant counts.
+        let main_count = self.subtree_len(self.root) as usize;
+        let extra = self.extra.lock().unwrap();
+        let sub_count: usize = extra
+            .sub_indices
+            .iter()
+            .map(|si| si.subtree_len(si.root) as usize)
+            .sum();
+        main_count + sub_count
     }
 
+    /// DFS preorder traversal for the flat table view.
+    /// Supports both main-index nodes and materialized sub-index nodes (lazy expansion).
     pub fn get_expanded_slice(&self, offset: usize, limit: usize) -> Vec<VisibleSliceRow> {
         if limit == 0 {
             return Vec::new();
         }
 
+        // Tracks whether a frame is navigating the main index or a materialized sub-index.
+        #[derive(Clone, Copy)]
+        enum Src {
+            Main,
+            Sub(usize), // index into extra.sub_indices
+        }
+
         struct Frame {
-            next_child_id: u32,
+            src: Src,
+            next_child_id: u32, // local ID within the relevant index
             remaining: u32,
             depth: usize,
         }
 
+        let extra = self.extra.lock().unwrap();
         let mut stack: Vec<Frame> = Vec::new();
         let root_children_len = self.children_len(self.root);
         if root_children_len > 0 {
             stack.push(Frame {
+                src: Src::Main,
                 next_child_id: self.root + 1,
                 remaining: root_children_len,
                 depth: 0,
@@ -1262,54 +2411,153 @@ impl JsonIndex {
         let mut skipped = 0usize;
         let mut rows = Vec::with_capacity(limit.min(1024));
 
-        'outer: while let Some(frame) = stack.last_mut() {
-            if frame.remaining == 0 {
-                stack.pop();
-                continue;
+        'outer: loop {
+            // Pop exhausted frames
+            loop {
+                match stack.last() {
+                    None => break 'outer,
+                    Some(f) if f.remaining > 0 => break,
+                    _ => {
+                        stack.pop();
+                    }
+                }
             }
 
-            let child_id = frame.next_child_id;
-            let depth = frame.depth;
-            let child_subtree_len = self.subtree_len(child_id);
-            let child_children_len = self.children_len(child_id);
-
-            // Advance frame to next sibling
-            frame.next_child_id = child_id + 1 + child_subtree_len;
-            frame.remaining -= 1;
+            // Extract frame info and advance the frame pointer. The scoped block releases
+            // the mutable borrow of `stack` before we push new frames below.
+            let (local_cid, depth, src, child_subtree_len, child_children_len, global_id) = {
+                let f = stack.last_mut().unwrap();
+                let lcid = f.next_child_id;
+                let depth = f.depth;
+                let src = f.src;
+                let (st, cl, gid) = match src {
+                    Src::Main => {
+                        let st = self.subtree_len(lcid);
+                        let cl = self.children_len(lcid);
+                        f.next_child_id = lcid + 1 + st;
+                        f.remaining -= 1;
+                        (st, cl, lcid)
+                    }
+                    Src::Sub(si_idx) => {
+                        let si = &extra.sub_indices[si_idx];
+                        let st = si.subtree_len(lcid);
+                        let cl = si.children_len(lcid);
+                        f.next_child_id = lcid + 1 + st;
+                        f.remaining -= 1;
+                        let gid =
+                            extra.base + (si_idx as u32) * SUB_INDEX_ID_RANGE + lcid;
+                        (st, cl, gid)
+                    }
+                };
+                (lcid, depth, src, st, cl, gid)
+            }; // mutable borrow of stack released here
 
             if skipped < offset {
-                let subtree_size = child_subtree_len as usize + 1; // this node + descendants
+                // For lazy main-index nodes: the effective subtree size must include
+                // materialized sub-index descendants, not just the lazy node placeholder
+                // (which has subtree_len=0 in the main index).
+                let subtree_size = match src {
+                    Src::Main if self.nodes[local_cid as usize].kind().is_lazy() => {
+                        if let Some(mat) = extra.mat.get(&local_cid) {
+                            let si = &extra.sub_indices[mat.sub_idx];
+                            1 + si.subtree_len(si.root) as usize
+                        } else {
+                            1
+                        }
+                    }
+                    _ => child_subtree_len as usize + 1,
+                };
                 if skipped + subtree_size <= offset {
-                    // Skip entire subtree in O(1)
                     skipped += subtree_size;
                     continue;
                 }
-                // Enter the subtree to find the offset
                 skipped += 1;
-                if child_children_len > 0 {
-                    stack.push(Frame {
-                        next_child_id: child_id + 1,
-                        remaining: child_children_len,
-                        depth: depth + 1,
-                    });
+                // Push children to continue scanning into the skipped subtree
+                match src {
+                    Src::Main => {
+                        let node = &self.nodes[local_cid as usize];
+                        if node.kind().is_lazy() {
+                            if let Some(mat) = extra.mat.get(&local_cid) {
+                                let si_idx = mat.sub_idx;
+                                let si = &extra.sub_indices[si_idx];
+                                let cl = si.children_len(si.root);
+                                if cl > 0 {
+                                    stack.push(Frame {
+                                        src: Src::Sub(si_idx),
+                                        next_child_id: si.root + 1,
+                                        remaining: cl,
+                                        depth: depth + 1,
+                                    });
+                                }
+                            }
+                        } else if child_children_len > 0 {
+                            stack.push(Frame {
+                                src: Src::Main,
+                                next_child_id: local_cid + 1,
+                                remaining: child_children_len,
+                                depth: depth + 1,
+                            });
+                        }
+                    }
+                    Src::Sub(si_idx) => {
+                        if child_children_len > 0 {
+                            stack.push(Frame {
+                                src: Src::Sub(si_idx),
+                                next_child_id: local_cid + 1,
+                                remaining: child_children_len,
+                                depth: depth + 1,
+                            });
+                        }
+                    }
                 }
                 continue;
             }
 
             rows.push(VisibleSliceRow {
-                id: child_id,
+                id: global_id,
                 depth,
             });
             if rows.len() >= limit {
                 break 'outer;
             }
 
-            if child_children_len > 0 {
-                stack.push(Frame {
-                    next_child_id: child_id + 1,
-                    remaining: child_children_len,
-                    depth: depth + 1,
-                });
+            // Push children frame
+            match src {
+                Src::Main => {
+                    let node = &self.nodes[local_cid as usize];
+                    if node.kind().is_lazy() {
+                        if let Some(mat) = extra.mat.get(&local_cid) {
+                            let si_idx = mat.sub_idx;
+                            let si = &extra.sub_indices[si_idx];
+                            let cl = si.children_len(si.root);
+                            if cl > 0 {
+                                stack.push(Frame {
+                                    src: Src::Sub(si_idx),
+                                    next_child_id: si.root + 1,
+                                    remaining: cl,
+                                    depth: depth + 1,
+                                });
+                            }
+                        }
+                    } else if child_children_len > 0 {
+                        stack.push(Frame {
+                            src: Src::Main,
+                            next_child_id: local_cid + 1,
+                            remaining: child_children_len,
+                            depth: depth + 1,
+                        });
+                    }
+                }
+                Src::Sub(si_idx) => {
+                    if child_children_len > 0 {
+                        stack.push(Frame {
+                            src: Src::Sub(si_idx),
+                            next_child_id: local_cid + 1,
+                            remaining: child_children_len,
+                            depth: depth + 1,
+                        });
+                    }
+                }
             }
         }
 
@@ -1317,7 +2565,15 @@ impl JsonIndex {
     }
 
     /// Costruisce la rappresentazione JSON raw di un nodo, iterativamente (no ricorsione).
+    /// For lazy nodes, returns the raw mmap bytes directly.
     pub fn build_raw(&self, start_id: u32) -> String {
+        // Fast path for lazy nodes: return mmap bytes directly
+        if start_id < self.nodes.len() as u32 {
+            let node = &self.nodes[start_id as usize];
+            if node.kind().is_lazy() {
+                return self.get_raw_any(start_id);
+            }
+        }
         // Forward DFS using an explicit stack of frames.
         // Each frame tracks iteration state over a container's children,
         // eliminating the per-node Vec<u32> allocation of the old approach.
@@ -1380,6 +2636,11 @@ impl JsonIndex {
                 }
                 NodeKind::Null => {
                     out.push_str("null");
+                }
+                NodeKind::LazyObject | NodeKind::LazyArray => {
+                    // Emit raw mmap bytes for this lazy node directly
+                    let lazy_raw = self.get_raw_any(current);
+                    out.push_str(&lazy_raw);
                 }
             }
 
@@ -1523,7 +2784,7 @@ impl JsonIndex {
                 "false"
             }),
             NodeKind::Null => re.is_match("null"),
-            NodeKind::Object | NodeKind::Array => false,
+            NodeKind::Object | NodeKind::Array | NodeKind::LazyObject | NodeKind::LazyArray => false,
         }
     }
 
@@ -1570,7 +2831,7 @@ impl JsonIndex {
                 exact_match,
             ),
             NodeKind::Null => matches_text("null", query, query_lower, case_sensitive, exact_match),
-            NodeKind::Object | NodeKind::Array => false,
+            NodeKind::Object | NodeKind::Array | NodeKind::LazyObject | NodeKind::LazyArray => false,
         }
     }
 
@@ -1705,7 +2966,7 @@ impl JsonIndex {
                                     })
                                     .is_some(),
                                 NodeKind::Null => finder.find(b"null").is_some(),
-                                NodeKind::Object | NodeKind::Array => false,
+                                NodeKind::Object | NodeKind::Array | NodeKind::LazyObject | NodeKind::LazyArray => false,
                             }
                     },
                 );
@@ -1718,7 +2979,7 @@ impl JsonIndex {
                 }
                 if want_values
                     && !want_keys
-                    && matches!(node.kind(), NodeKind::Object | NodeKind::Array)
+                    && matches!(node.kind(), NodeKind::Object | NodeKind::Array | NodeKind::LazyObject | NodeKind::LazyArray)
                 {
                     return false;
                 }
@@ -1956,17 +3217,61 @@ impl JsonIndex {
         };
         let (start_id, scoped_nodes) = self.scoped_nodes(scope_node_id);
 
-        self.collect_matching_ids(start_id, scoped_nodes, max_results, |node_id, node| {
-            node.kind() == NodeKind::Object
-                && compiled_filters.iter().all(|filter| {
-                    self.object_filter_matches(
-                        node_id,
-                        filter,
-                        key_case_sensitive,
-                        value_case_sensitive,
-                    )
-                })
-        })
+        let mut results =
+            self.collect_matching_ids(start_id, scoped_nodes, max_results, |node_id, node| {
+                node.kind() == NodeKind::Object
+                    && compiled_filters.iter().all(|filter| {
+                        self.object_filter_matches(
+                            node_id,
+                            filter,
+                            key_case_sensitive,
+                            value_case_sensitive,
+                        )
+                    })
+            });
+
+        // With always-lazy loading the main index has very few nodes (top-level structure
+        // only). Actual objects live inside lazy spans. Materialize each lazy node in scope
+        // and search its sub-index with the same filters.
+        if results.len() < max_results {
+            let lazy_ids: Vec<u32> = scoped_nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.kind().is_lazy())
+                .map(|(i, _)| start_id + i as u32)
+                .collect();
+
+            for &lazy_id in &lazy_ids {
+                if results.len() >= max_results {
+                    break;
+                }
+                // Materializes if not already done; large nodes return first page only.
+                let _ = self.get_children_any(lazy_id);
+            }
+
+            let extra = self.extra.lock().unwrap();
+            let base = extra.base;
+            for (sub_idx, sub_index) in extra.sub_indices.iter().enumerate() {
+                if results.len() >= max_results {
+                    break;
+                }
+                let remaining = max_results - results.len();
+                // sub_index is a full JsonIndex parsed eagerly — search_objects works on it
+                // directly without entering the lazy branch again (sub-indices have no lazy nodes).
+                let sub_results = sub_index.search_objects(
+                    filters,
+                    key_case_sensitive,
+                    value_case_sensitive,
+                    remaining,
+                    None,
+                );
+                for sub_id in sub_results {
+                    results.push(base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id);
+                }
+            }
+        }
+
+        results
     }
 
     pub fn suggest_property_paths(&self, prefix: &str, limit: usize) -> Vec<String> {
@@ -1981,12 +3286,30 @@ impl JsonIndex {
         };
         let prefix_lower = segment_prefix.to_lowercase();
 
-        let mut suggestions: Vec<&str> = (0..self.keys.len() as u32)
-            .map(|id| self.keys.get(id))
-            .filter(|candidate| {
-                starts_with_case_insensitive(candidate, segment_prefix, &prefix_lower)
-            })
-            .collect();
+        // Collect unique matching keys from the main index and all materialized sub-indices.
+        // With always-lazy loading the main index only contains top-level keys; nested
+        // object keys live inside sub-indices created during lazy node materialization.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let collect = |keys: &InternedStrings, seen: &mut std::collections::HashSet<String>| {
+            for id in 0..keys.len() as u32 {
+                let candidate = keys.get(id);
+                if starts_with_case_insensitive(candidate, segment_prefix, &prefix_lower) {
+                    seen.insert(candidate.to_string());
+                }
+            }
+        };
+
+        collect(&self.keys, &mut seen);
+
+        {
+            let extra = self.extra.lock().unwrap();
+            for sub_index in &extra.sub_indices {
+                collect(&sub_index.keys, &mut seen);
+            }
+        }
+
+        let mut suggestions: Vec<String> = seen.into_iter().collect();
 
         suggestions.sort_unstable_by(|a, b| {
             let a_is_numeric = a.chars().all(|ch| ch.is_ascii_digit());
@@ -1995,13 +3318,13 @@ impl JsonIndex {
                 !a.starts_with(segment_prefix),
                 segment_prefix.is_empty() && a_is_numeric,
                 a.len(),
-                *a,
+                a.as_str(),
             );
             let b_rank = (
                 !b.starts_with(segment_prefix),
                 segment_prefix.is_empty() && b_is_numeric,
                 b.len(),
-                *b,
+                b.as_str(),
             );
             a_rank.cmp(&b_rank)
         });
@@ -2029,6 +3352,157 @@ fn json_escape_into(out: &mut String, s: &str) {
             }
             c => out.push(c),
         }
+    }
+}
+
+// ── Lazy-span streaming search ────────────────────────────────────────────────
+
+impl JsonIndex {
+    /// Searches within a lazy node's raw bytes by streaming through the file.
+    ///
+    /// For each element in the lazy span, uses a fast byte pre-filter (`memmem`) to skip
+    /// elements that cannot possibly match, then parses only the matching elements.
+    /// Matching leaf nodes are materialized as sub-indices with correct path info.
+    ///
+    /// Returns global IDs of matching leaf nodes (usable with `get_path_any` etc.).
+    pub fn search_in_lazy_node(
+        &self,
+        lazy_node_id: u32,
+        query: &str,
+        case_sensitive: bool,
+        exact_match: bool,
+        max_results: usize,
+    ) -> Result<Vec<u32>, String> {
+        let node = &self.nodes[lazy_node_id as usize];
+        if !node.kind().is_lazy() {
+            return Ok(vec![]);
+        }
+        let span_id = node.value_data as usize;
+        if span_id >= self.lazy_spans.len() {
+            return Ok(vec![]);
+        }
+        let span = self.lazy_spans[span_id];
+
+        let file_path = self.source_file.as_deref()
+            .ok_or_else(|| "source_file not set".to_string())?;
+        let file = File::open(file_path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        let span_start = span.file_offset as usize;
+        let span_end = span_start + span.byte_len as usize;
+        let bytes = &mmap[span_start..span_end.min(mmap.len())];
+
+        let is_array = node.kind() == NodeKind::LazyArray;
+        let query_lower = query.to_lowercase();
+        // Byte sequence used for the fast pre-filter
+        let needle: &[u8] = if case_sensitive {
+            query.as_bytes()
+        } else {
+            query_lower.as_bytes()
+        };
+
+        let base = { self.extra.lock().unwrap().base };
+
+        let mut results: Vec<u32> = Vec::new();
+        let mut elem_index: usize = 0;
+        let mut pos = 0usize;
+
+        // Skip to opening '[' or '{'
+        while pos < bytes.len() && !matches!(bytes[pos], b'[' | b'{') {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return Ok(results);
+        }
+        pos += 1;
+
+        loop {
+            // Skip whitespace and commas between elements
+            while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b',') {
+                pos += 1;
+            }
+            if pos >= bytes.len() || matches!(bytes[pos], b']' | b'}') {
+                break;
+            }
+
+            let elem_start = pos;
+
+            // For objects: skip the key part
+            if !is_array && pos < bytes.len() && bytes[pos] == b'"' {
+                pos = scan_json_string(bytes, pos);
+                while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b':') {
+                    pos += 1;
+                }
+            }
+
+            pos = scan_json_value_end(bytes, pos);
+            let elem_end = pos;
+            let elem_bytes = &bytes[elem_start..elem_end];
+
+            // Fast byte pre-filter before parsing
+            let maybe_matches = if case_sensitive {
+                memchr::memmem::find(elem_bytes, needle).is_some()
+            } else {
+                // Lowercase the element bytes for case-insensitive comparison.
+                // Elements are typically small (hundreds of bytes each) so this is fast.
+                let lower: Vec<u8> = elem_bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+                memchr::memmem::find(&lower, needle).is_some()
+            };
+
+            if maybe_matches {
+                if let Ok(sub_index) = JsonIndex::from_slice(elem_bytes) {
+                    let matching_sub: Vec<u32> = sub_index.search(
+                        query,
+                        "both", // search both keys and values within the element
+                        case_sensitive,
+                        false, // no regex in lazy search (pre-filtered already)
+                        exact_match,
+                        max_results.saturating_sub(results.len()),
+                        None,
+                        false,
+                        false,
+                    );
+
+                    if !matching_sub.is_empty() {
+                        let sub_index = Arc::new(sub_index);
+                        let sub_root = sub_index.root;
+                        let mut extra = self.extra.lock().unwrap();
+                        let sub_idx = extra.sub_indices.len();
+                        let root_global = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_root;
+
+                        // Register parent → lazy node and key → element index
+                        extra.extra_parent.insert(root_global, lazy_node_id);
+                        extra.extra_key_override.insert(root_global, elem_index.to_string());
+
+                        // Register all descendants so get_path_any works transitively
+                        Self::register_sub_descendants(
+                            &sub_index,
+                            sub_root,
+                            root_global,
+                            sub_idx,
+                            base,
+                            &mut extra.extra_parent,
+                        );
+
+                        extra.sub_indices.push(sub_index);
+
+                        for sub_id in matching_sub {
+                            let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
+                            results.push(global_id);
+                            if results.len() >= max_results {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            elem_index += 1;
+            if results.len() >= max_results {
+                break;
+            }
+        }
+
+        Ok(results)
     }
 }
 
@@ -2481,6 +3955,180 @@ mod tests {
     }
 
     #[test]
+    fn suggest_property_paths_includes_keys_from_materialized_lazy_nodes() {
+        // Regressione: con always-lazy loading le chiavi degli oggetti dentro i
+        // lazy span non finivano in self.keys → la tendina mostrava solo le chiavi
+        // del top-level e non quelle dei nodi figli materializzati.
+        let json = r#"[{"name":"Alice","age":30,"role":"admin"},{"name":"Bob","age":25,"role":"user"}]"#;
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
+
+        // Materializza il primo figlio del nodo lazy (simula expand-all)
+        let _ = index.get_children_any(lazy_id);
+
+        let suggestions = index.suggest_property_paths("", 20);
+        // Dopo materializzazione, le chiavi degli oggetti figli devono comparire
+        assert!(suggestions.contains(&"name".to_string()),  "manca 'name': {:?}", suggestions);
+        assert!(suggestions.contains(&"age".to_string()),   "manca 'age': {:?}", suggestions);
+        assert!(suggestions.contains(&"role".to_string()),  "manca 'role': {:?}", suggestions);
+    }
+
+    // ── Regressione: search_objects su file lazy non trova nulla ──────────────
+    //
+    // Con always-lazy loading self.nodes ha pochissimi nodi (solo la struttura
+    // top-level). Gli oggetti reali stanno nei sub-index materializzati.
+    // Prima: search_objects scansionava solo self.nodes → zero risultati.
+
+    #[test]
+    fn search_objects_finds_results_in_lazy_loaded_files() {
+        let json = r#"[{"name":"Alice","age":30,"role":"admin"},{"name":"Bob","age":25,"role":"user"},{"name":"Carol","age":35,"role":"admin"}]"#;
+        let (index, _, _tmp) = make_lazy_index_from_json(json);
+
+        let results = index.search_objects(
+            &[ObjectSearchFilter {
+                path: "role".to_string(),
+                operator: ObjectSearchOperator::Equals,
+                value: Some("admin".to_string()),
+                ..Default::default()
+            }],
+            false,
+            false,
+            10,
+            None,
+        );
+        assert_eq!(results.len(), 2, "dovrebbe trovare Alice e Carol: {:?}", results);
+    }
+
+    #[test]
+    fn search_objects_finds_by_multiple_filters_in_lazy_file() {
+        let json = r#"[{"name":"Alice","active":true},{"name":"Bob","active":false},{"name":"Carol","active":true}]"#;
+        let (index, _, _tmp) = make_lazy_index_from_json(json);
+
+        let results = index.search_objects(
+            &[
+                ObjectSearchFilter {
+                    path: "name".to_string(),
+                    operator: ObjectSearchOperator::Contains,
+                    value: Some("a".to_string()),
+                    ..Default::default()
+                },
+                ObjectSearchFilter {
+                    path: "active".to_string(),
+                    operator: ObjectSearchOperator::Exists,
+                    value: None,
+                    ..Default::default()
+                },
+            ],
+            false,
+            false,
+            10,
+            None,
+        );
+        // "Alice" (name contains 'a') e "Carol" (name contains 'a')
+        assert!(results.len() >= 2, "attesi almeno 2 risultati: {:?}", results);
+    }
+
+    // ── get_expanded_slice / expanded_visible_count con lazy loading ──────────
+    //
+    // Con always-lazy loading i nodi reali stanno nei sub-indices materializzati.
+    // Prima di questi fix, get_expanded_slice restituiva solo i nodi del main index
+    // (1-2 nodi lazy) e expanded_visible_count restituiva 1.
+
+    #[test]
+    fn get_expanded_slice_includes_materialized_sub_index_nodes() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        let json = r#"[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"},{"id":3,"name":"Carol"}]"#;
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+
+        // Prima della materializzazione: solo i lazy nodes del main index
+        let count_before = index.expanded_visible_count();
+        // Materializziamo tutti i lazy nodes al top level
+        let root_children = index.get_children_slice(index.root).to_vec();
+        for &child_id in &root_children {
+            if index.nodes[child_id as usize].kind().is_lazy() {
+                let _ = index.get_children_any(child_id);
+            }
+        }
+
+        // Dopo materializzazione: get_expanded_slice deve includere i nodi dei sub-index
+        let slice = index.get_expanded_slice(0, 1000);
+        let count_after = index.expanded_visible_count();
+
+        // Devono esserci almeno i 3 oggetti top-level + i loro campi (id, name × 3)
+        assert!(
+            slice.len() >= 3 + 6,
+            "attesi ≥9 nodi nella slice, trovati {}: {:?}",
+            slice.len(),
+            slice.iter().map(|r| r.id).collect::<Vec<_>>()
+        );
+        assert!(
+            count_after > count_before,
+            "expanded_visible_count deve crescere dopo materializzazione: {} → {}",
+            count_before,
+            count_after
+        );
+        assert_eq!(
+            count_after,
+            slice.len(),
+            "expanded_visible_count deve coincidere con slice.len() dopo materializzazione"
+        );
+    }
+
+    #[test]
+    fn get_expanded_slice_paginate_works_with_lazy_nodes() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        // 10 oggetti con 2 campi ciascuno → 10 lazy obj + 20 sub-fields = 30 nodi visibili
+        let mut json = String::from("[");
+        for i in 0..10 {
+            if i > 0 { json.push(','); }
+            json.push_str(&format!(r#"{{"id":{i},"val":{}}}"#, i * 10));
+        }
+        json.push(']');
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        // Materializza tutti i lazy nodes
+        let root_children = index.get_children_slice(index.root).to_vec();
+        for &child_id in &root_children {
+            if index.nodes[child_id as usize].kind().is_lazy() {
+                let _ = index.get_children_any(child_id);
+            }
+        }
+
+        let all = index.get_expanded_slice(0, 1000);
+        let total = all.len();
+        assert!(total >= 10, "attesi ≥10 nodi, trovati {total}");
+
+        // La paginazione deve restituire lo stesso risultato in ordine
+        let mut paginated: Vec<VisibleSliceRow> = Vec::new();
+        let page_size = 7;
+        let mut offset = 0;
+        loop {
+            let page = index.get_expanded_slice(offset, page_size);
+            if page.is_empty() { break; }
+            offset += page.len();
+            paginated.extend(page);
+            if offset >= total { break; }
+        }
+
+        assert_eq!(
+            all.iter().map(|r| r.id).collect::<Vec<_>>(),
+            paginated.iter().map(|r| r.id).collect::<Vec<_>>(),
+            "la paginazione deve restituire gli stessi nodi nell'ordine corretto"
+        );
+    }
+
+    #[test]
     fn node_id_is_preorder_index() {
         // Il parser streaming alloca in DFS preorder: node_id coincide con l'ordine di visita.
         let index = idx(r#"{"a":{"x":1},"b":2}"#);
@@ -2504,6 +4152,8 @@ mod tests {
             NodeKind::Null => "null",
             NodeKind::Array => "array",
             NodeKind::Object => "object",
+            NodeKind::LazyObject => "lazy-object",
+            NodeKind::LazyArray => "lazy-array",
         };
         let keys: Vec<&str> = children
             .iter()
@@ -2643,5 +4293,213 @@ mod tests {
         assert_eq!(idx2.children_len(users_id), 50);
         // subtree di users = 50 oggetti × 3 nodi ciascuno = 150
         assert_eq!(idx2.subtree_len(users_id), 150);
+    }
+
+    // ── is_large_lazy ────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_large_lazy_false_for_normal_nodes() {
+        // from_str non crea mai lazy node (usa solo from_file)
+        let index = idx(r#"{"data":[1,2,3]}"#);
+        for id in 0..index.nodes.len() as u32 {
+            assert!(
+                !index.is_large_lazy(id),
+                "nessun nodo deve essere large-lazy in un indice da stringa"
+            );
+        }
+    }
+
+    // ── children_count_any ───────────────────────────────────────────────────
+
+    #[test]
+    fn children_count_any_matches_children_len_for_normal_nodes() {
+        let index = idx(r#"{"a":1,"b":2,"c":3}"#);
+        // Per nodi normali i due metodi devono concordare
+        for id in 0..index.nodes.len() as u32 {
+            assert_eq!(
+                index.children_count_any(id),
+                index.children_len(id),
+                "children_count_any != children_len per id={id}"
+            );
+        }
+    }
+
+    #[test]
+    fn children_count_any_zero_for_leaf_nodes() {
+        let index = idx(r#"{"s":"hello","n":42,"b":true,"null":null}"#);
+        let leaves: Vec<u32> = index.get_children_slice(index.root).to_vec();
+        for id in leaves {
+            assert_eq!(
+                index.children_count_any(id),
+                0,
+                "foglie devono avere count 0"
+            );
+        }
+    }
+
+    // ── get_children_any for normal nodes ────────────────────────────────────
+
+    #[test]
+    fn get_children_any_returns_same_as_children_iter_for_objects() {
+        let index = idx(r#"{"x":1,"y":2,"z":3}"#);
+        let via_iter: Vec<u32> = index.children_iter(index.root).collect();
+        let via_any = index.get_children_any(index.root).expect("get_children_any failed");
+        assert_eq!(via_iter, via_any);
+    }
+
+    #[test]
+    fn get_children_any_returns_same_as_children_iter_for_arrays() {
+        let index = idx(r#"[10,20,30,40,50]"#);
+        let via_iter: Vec<u32> = index.children_iter(index.root).collect();
+        let via_any = index.get_children_any(index.root).expect("get_children_any failed");
+        assert_eq!(via_iter, via_any);
+    }
+
+    #[test]
+    fn get_children_any_empty_for_leaf() {
+        let index = idx(r#""hello""#);
+        let result = index.get_children_any(index.root).expect("get_children_any failed");
+        assert!(result.is_empty());
+    }
+
+    // ── search_in_lazy_node (streaming search) ────────────────────────────────
+    //
+    // `from_str` non crea lazy node (solo `from_file`), quindi per
+    // testare search_in_lazy_node usiamo un file temporaneo e `from_file`.
+    // Il file è abbastanza piccolo da essere parsato eagerly, ma il metodo
+    // accetta qualsiasi nodo lazy — lo creiamo manualmente iniettandone uno.
+
+    /// Crea un JsonIndex con un lazy span artificiale che punta a un file temp.
+    /// Utile per testare `search_in_lazy_node` indipendentemente dalla soglia 512MB.
+    fn make_lazy_index_from_json(json: &str) -> (JsonIndex, u32, tempfile::NamedTempFile) {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        // Scrive il JSON in un file temp
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        // Crea un indice "vuoto" con source_file impostato
+        // e inietta manualmente un nodo LazyArray che copre l'intero file.
+        let mut index = idx("[]"); // indice base minimo
+        index.source_file = Some(tmp.path().to_str().unwrap().to_string());
+
+        // Aggiungi lo span che copre tutto il file
+        let file_len = json.len() as u64;
+        index.lazy_spans.push(LazySpan { file_offset: 0, byte_len: file_len });
+        index.lazy_child_counts.push(1);
+
+        // Trasforma il root node in LazyArray con ktype corretto (NO_KEY nelle bits basse)
+        let span_idx = (index.lazy_spans.len() - 1) as u32;
+        index.nodes[index.root as usize].ktype = Node::make_ktype(NodeKind::LazyArray, None);
+        index.nodes[index.root as usize].value_data = span_idx;
+
+        let root_id = index.root;
+        (index, root_id, tmp)
+    }
+
+    #[test]
+    fn search_in_lazy_node_finds_matching_elements() {
+        let json = r#"[{"name":"Alice","age":30},{"name":"Bob","age":25},{"name":"Charlie","age":30}]"#;
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
+
+        let results = index.search_in_lazy_node(lazy_id, "Alice", true, false, 10)
+            .expect("search failed");
+        assert_eq!(results.len(), 1, "deve trovare solo Alice");
+        let path = index.get_path_any(results[0]);
+        assert!(path.contains("0"), "path deve contenere l'indice 0: {}", path);
+    }
+
+    #[test]
+    fn search_in_lazy_node_case_insensitive() {
+        let json = r#"[{"city":"Rome"},{"city":"ROME"},{"city":"Milan"}]"#;
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
+
+        let results = index.search_in_lazy_node(lazy_id, "rome", false, false, 10)
+            .expect("search failed");
+        assert_eq!(results.len(), 2, "deve trovare Rome e ROME case-insensitive");
+    }
+
+    #[test]
+    fn search_in_lazy_node_returns_empty_when_no_match() {
+        let json = r#"[{"a":"foo"},{"a":"bar"}]"#;
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
+
+        let results = index.search_in_lazy_node(lazy_id, "xyz", true, false, 10)
+            .expect("search failed");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_in_lazy_node_respects_max_results() {
+        let items: Vec<String> = (0..20).map(|i| format!(r#"{{"v":"match{}"}}"#, i)).collect();
+        let json = format!("[{}]", items.join(","));
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(&json);
+
+        let results = index.search_in_lazy_node(lazy_id, "match", true, false, 5)
+            .expect("search failed");
+        assert_eq!(results.len(), 5);
+    }
+
+    #[test]
+    fn search_in_lazy_node_path_contains_element_index() {
+        let json = r#"[{"x":1},{"x":2},{"target":"found"},{"x":4}]"#;
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
+
+        let results = index.search_in_lazy_node(lazy_id, "found", true, false, 10)
+            .expect("search failed");
+        assert_eq!(results.len(), 1);
+        let path = index.get_path_any(results[0]);
+        // Path should encode element index 2 (third element, 0-based)
+        assert!(path.contains("2"), "path dovrebbe contenere indice '2': {}", path);
+    }
+
+    // ── Regressione: expand_subtree su nodi lazy non deve crashare ─────────────
+    //
+    // Bug: `has_children(extra_id)` accedeva a `self.nodes[extra_id as usize]`
+    // senza verificare che extra_id < nodes.len(). I figli di nodi lazy
+    // materializzati hanno ID extra (>= base) molto grandi → out-of-bounds.
+
+    #[test]
+    fn get_children_any_recursive_on_lazy_node_does_not_panic() {
+        // Simula expand-all: chiama get_children_any ricorsivamente
+        // partendo da un nodo lazy materializzato.
+        // Prima era un crash (abort) in produzione.
+        let json = r#"[{"a":1,"b":2},{"c":3},{"d":{"nested":true}}]"#;
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
+
+        // Prima espansione: figli del nodo lazy (extra IDs)
+        let children = index.get_children_any(lazy_id)
+            .expect("prima espansione fallita");
+        assert!(!children.is_empty(), "il nodo lazy deve avere figli");
+
+        // Seconda espansione: figli degli extra node (simula BFS di expand_subtree)
+        for child_id in &children {
+            let grandchildren = index.get_children_any(*child_id)
+                .expect("espansione extra node fallita");
+            // Per ogni nipote, verifica che get_children_any non panichi
+            for gc_id in &grandchildren {
+                let _ = index.get_children_any(*gc_id);
+            }
+        }
+    }
+
+    #[test]
+    fn get_children_any_on_extra_leaf_returns_empty() {
+        // I figli scalari di un nodo lazy materializzato devono restituire []
+        // senza panic (prima crashava via has_children → nodes[extra_id]).
+        let json = r#"[1, "hello", true, null]"#;
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
+
+        let children = index.get_children_any(lazy_id)
+            .expect("espansione lazy fallita");
+        assert_eq!(children.len(), 4);
+
+        for child_id in children {
+            let grandchildren = index.get_children_any(child_id)
+                .expect("get_children_any su foglia extra non deve fallire");
+            assert!(grandchildren.is_empty(), "scalare non ha figli: id={}", child_id);
+        }
     }
 }

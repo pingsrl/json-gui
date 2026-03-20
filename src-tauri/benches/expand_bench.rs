@@ -61,17 +61,20 @@ fn nested_array_json(n: usize) -> String {
 fn bfs_collect_all_dtos(index: &JsonIndex) -> Vec<(u32, Vec<NodeDtoSimple>)> {
     let mut result = Vec::new();
     let mut queue = VecDeque::new();
-    for child_id in index.children_iter(index.root) {
-        queue.push_back(child_id);
+    if let Ok(roots) = index.get_children_any(index.root) {
+        for child_id in roots {
+            queue.push_back(child_id);
+        }
     }
     while let Some(node_id) = queue.pop_front() {
-        if !index.has_children(node_id) {
-            continue;
-        }
-        let mut children = Vec::with_capacity(index.children_len(node_id) as usize);
-        for child_id in index.children_iter(node_id) {
-            queue.push_back(child_id);
-            children.push(node_to_dto_simple(index, child_id));
+        let children_ids = match index.get_children_any(node_id) {
+            Ok(ids) if !ids.is_empty() => ids,
+            _ => continue,
+        };
+        let mut children = Vec::with_capacity(children_ids.len());
+        for child_id in &children_ids {
+            queue.push_back(*child_id);
+            children.push(node_to_dto_simple(index, *child_id));
         }
         result.push((node_id, children));
     }
@@ -130,6 +133,8 @@ fn node_to_dto_simple(index: &JsonIndex, id: u32) -> NodeDtoSimple {
             },
         ),
         NodeKind::Null => ("null", Cow::Borrowed("null")),
+        NodeKind::LazyObject => ("object", Cow::Borrowed("{…}")),
+        NodeKind::LazyArray => ("array", Cow::Borrowed("[…]")),
     };
     NodeDtoSimple {
         id,
@@ -357,18 +362,20 @@ fn bench_real_file(c: &mut Criterion) {
         b.iter(|| {
             let mut count = 0u64;
             let mut queue = VecDeque::new();
-            for child_id in index.get_children_slice(index.root) {
-                queue.push_back(child_id);
+            if let Ok(roots) = index.get_children_any(index.root) {
+                for child_id in roots {
+                    queue.push_back(child_id);
+                }
             }
             while let Some(node_id) = queue.pop_front() {
-                let children_slice = index.get_children_slice(node_id);
-                if children_slice.is_empty() {
-                    continue;
-                }
-                for child_id in &children_slice {
+                let children = match index.get_children_any(node_id) {
+                    Ok(ids) if !ids.is_empty() => ids,
+                    _ => continue,
+                };
+                for child_id in &children {
                     queue.push_back(*child_id);
                 }
-                count += children_slice.len() as u64;
+                count += children.len() as u64;
             }
             black_box(count)
         });

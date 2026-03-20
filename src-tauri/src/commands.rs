@@ -2,6 +2,7 @@ use crate::json_index::{
     JsonIndex, NodeKey, NodeKind, ObjectSearchFilter as IndexObjectSearchFilter,
     ObjectSearchOperator, VisibleSliceRow,
 };
+// LazyObject and LazyArray are part of NodeKind, accessed via pattern matching
 use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -186,8 +187,8 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
 /// 0=object, 1=array, 2=string, 3=number, 4=boolean, 5=null
 fn node_type_byte(kind: NodeKind) -> u8 {
     match kind {
-        NodeKind::Object => 0,
-        NodeKind::Array => 1,
+        NodeKind::Object | NodeKind::LazyObject => 0,
+        NodeKind::Array | NodeKind::LazyArray => 1,
         NodeKind::Str => 2,
         NodeKind::Num => 3,
         NodeKind::Bool => 4,
@@ -196,6 +197,14 @@ fn node_type_byte(kind: NodeKind) -> u8 {
 }
 
 fn node_key_string(index: &JsonIndex, node_id: u32) -> Option<String> {
+    // For extra nodes (id >= base), delegate to key_string_any
+    {
+        let extra = index.extra.lock().unwrap();
+        if node_id >= extra.base {
+            drop(extra);
+            return index.key_string_any(node_id);
+        }
+    }
     match index.nodes[node_id as usize].key()? {
         NodeKey::String(kid) => Some(index.keys.get(kid).to_string()),
         NodeKey::ArrayIndex(idx) => Some(idx.to_string()),
@@ -205,6 +214,15 @@ fn node_key_string(index: &JsonIndex, node_id: u32) -> Option<String> {
 /// Text preview of a node's value, shared by node_to_dto and the compact
 /// format of get_expanded_slice.
 fn node_value_preview(index: &JsonIndex, id: u32) -> Cow<'static, str> {
+    // For extra nodes or when id could be out of main nodes range, use value_preview_any
+    let is_extra = {
+        let extra = index.extra.lock().unwrap();
+        id >= extra.base
+    };
+    if is_extra {
+        return Cow::Owned(index.value_preview_any(id));
+    }
+
     let node = &index.nodes[id as usize];
     let children_len = index.children_len(id) as usize;
     match node.kind() {
@@ -217,6 +235,24 @@ fn node_value_preview(index: &JsonIndex, id: u32) -> Cow<'static, str> {
         }
         NodeKind::Array => {
             if children_len == 0 {
+                Cow::Borrowed("[]")
+            } else {
+                Cow::Owned(format!("[{} items]", children_len))
+            }
+        }
+        NodeKind::LazyObject => {
+            if index.is_large_lazy(id) {
+                Cow::Borrowed("{…}")
+            } else if children_len == 0 {
+                Cow::Borrowed("{}")
+            } else {
+                Cow::Owned(format!("{{{} keys}}", children_len))
+            }
+        }
+        NodeKind::LazyArray => {
+            if index.is_large_lazy(id) {
+                Cow::Borrowed("[…]")
+            } else if children_len == 0 {
                 Cow::Borrowed("[]")
             } else {
                 Cow::Owned(format!("[{} items]", children_len))
@@ -244,6 +280,22 @@ fn node_value_preview(index: &JsonIndex, id: u32) -> Cow<'static, str> {
 }
 
 fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
+    // For extra nodes, use the any-methods
+    let is_extra = {
+        let extra = index.extra.lock().unwrap();
+        id >= extra.base
+    };
+    if is_extra {
+        return NodeDto {
+            id,
+            parent_id: index.parent_of_any(id),
+            key: node_key_string(index, id),
+            value_type: index.value_type_any(id),
+            value_preview: Cow::Owned(index.value_preview_any(id)),
+            children_count: index.children_count_any(id) as usize,
+        };
+    }
+
     let node = &index.nodes[id as usize];
     let children_len = index.children_len(id) as usize;
     let value_type: &'static str = match node.kind() {
@@ -253,6 +305,15 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
         NodeKind::Num => "number",
         NodeKind::Bool => "boolean",
         NodeKind::Null => "null",
+        NodeKind::LazyObject => "object",
+        NodeKind::LazyArray => "array",
+    };
+    // For large lazy nodes the exact count is unknown: use u32::MAX as sentinel
+    // so the frontend knows to keep loading pages until the server returns an empty page.
+    let children_count = if node.kind().is_lazy() && index.is_large_lazy(id) {
+        u32::MAX as usize
+    } else {
+        children_len
     };
     NodeDto {
         id,
@@ -260,7 +321,7 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
         key: node_key_string(index, id),
         value_type,
         value_preview: node_value_preview(index, id),
-        children_count: children_len,
+        children_count,
     }
 }
 
@@ -313,8 +374,50 @@ pub async fn get_children(
     let idx = state.window_index(webview_window.label());
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
+
+    // Check if this node is lazy or extra — use the any-path
+    let needs_any = {
+        let extra = index.extra.lock().unwrap();
+        if node_id >= extra.base {
+            true
+        } else {
+            index.nodes[node_id as usize].kind().is_lazy()
+        }
+    };
+
+    if needs_any {
+        // For large lazy nodes use paginated scan (avoids full materialization)
+        let is_large_lazy = {
+            let extra = index.extra.lock().unwrap();
+            if node_id < extra.base {
+                let n = &index.nodes[node_id as usize];
+                if n.kind().is_lazy() {
+                    let span_id = n.value_data as usize;
+                    span_id < index.lazy_spans.len()
+                        && index.lazy_spans[span_id].byte_len as u64
+                            >= crate::json_index::LAZY_PAGINATE_THRESHOLD
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        let child_ids = if is_large_lazy {
+            index.get_lazy_children_page(node_id, 0, EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)?
+        } else {
+            index.get_children_any(node_id)?
+        };
+        let children: Vec<NodeDto> = child_ids.into_iter()
+            .map(|id| node_to_dto(index, id))
+            .collect();
+        return Ok(children);
+    }
+
     let children: Vec<NodeDto> = index
         .children_iter(node_id)
+        .take(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)
         .map(|id| node_to_dto(index, id))
         .collect();
     Ok(children)
@@ -334,6 +437,48 @@ pub async fn get_children_page(
     let idx = state.window_index(webview_window.label());
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
+
+    // Check if this node is lazy or extra — use the any-path
+    let needs_any = {
+        let extra = index.extra.lock().unwrap();
+        if node_id >= extra.base {
+            true
+        } else {
+            index.nodes[node_id as usize].kind().is_lazy()
+        }
+    };
+
+    if needs_any {
+        // For large lazy nodes use paginated scan directly
+        let is_large_lazy = {
+            let extra = index.extra.lock().unwrap();
+            if node_id < extra.base {
+                let n = &index.nodes[node_id as usize];
+                if n.kind().is_lazy() {
+                    let span_id = n.value_data as usize;
+                    span_id < index.lazy_spans.len()
+                        && index.lazy_spans[span_id].byte_len as u64
+                            >= crate::json_index::LAZY_PAGINATE_THRESHOLD
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        let child_ids = if is_large_lazy {
+            index.get_lazy_children_page(node_id, offset, limit)?
+        } else {
+            let all = index.get_children_any(node_id)?;
+            all.into_iter().skip(offset).take(limit).collect()
+        };
+        let children: Vec<NodeDto> = child_ids.into_iter()
+            .map(|id| node_to_dto(index, id))
+            .collect();
+        return Ok(children);
+    }
+
     let children: Vec<NodeDto> = index
         .children_iter(node_id)
         .skip(offset)
@@ -459,7 +604,10 @@ pub async fn expand_subtree(
         let parent_id = queue[qi];
         qi += 1;
 
-        let children_ids = index.get_children_slice(parent_id);
+        let children_ids = match index.get_children_any(parent_id) {
+            Ok(ids) => ids,
+            Err(_) => continue,
+        };
         if children_ids.is_empty() {
             continue;
         }
@@ -468,19 +616,19 @@ pub async fn expand_subtree(
         if remaining_budget == 0 {
             break;
         }
-        let visible_children_ids = &children_ids[..children_ids
+        let visible_len = children_ids
             .len()
             .min(remaining_budget)
-            .min(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)];
-        total_nodes += visible_children_ids.len();
+            .min(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT);
+        total_nodes += visible_len;
 
-        for &child_id in visible_children_ids {
-            if total_nodes < limit && index.has_children(child_id) {
+        for &child_id in &children_ids[..visible_len] {
+            if total_nodes < limit {
                 queue.push(child_id);
             }
         }
 
-        let children: Vec<NodeDto> = visible_children_ids
+        let children: Vec<NodeDto> = children_ids[..visible_len]
             .iter()
             .map(|&id| node_to_dto(index, id))
             .collect();
@@ -499,7 +647,7 @@ pub async fn get_path(
     let idx = state.window_index(webview_window.label());
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
-    Ok(index.get_path(node_id))
+    Ok(index.get_path_any(node_id))
 }
 
 #[tauri::command]
@@ -511,7 +659,7 @@ pub async fn search(
     let idx = state.window_index(webview_window.label());
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
-    let results = index.search(
+    let mut results = index.search(
         &query.text,
         &query.target,
         query.case_sensitive,
@@ -522,9 +670,61 @@ pub async fn search(
         query.multiline,
         query.dot_all,
     );
+
+    // Also search inside lazy spans (not covered by the main index).
+    // Only when not regex (streaming search uses plain text matching internally).
+    if !query.regex && results.len() < query.max_results {
+        let remaining = query.max_results.saturating_sub(results.len());
+        // Determine which lazy nodes are in scope
+        let scope_node_id = query.path.as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .and_then(|p| index.resolve_path(p));
+
+        for (id, node) in index.nodes.iter().enumerate() {
+            if !node.kind().is_lazy() {
+                continue;
+            }
+            // If a scope path was given, only search lazy nodes that are descendants of it
+            if let Some(scope_id) = scope_node_id {
+                if (id as u32) != scope_id && index.parent_of(id as u32) != Some(scope_id) {
+                    continue;
+                }
+            }
+            if let Ok(lazy_results) = index.search_in_lazy_node(
+                id as u32,
+                &query.text,
+                query.case_sensitive,
+                query.exact_match,
+                remaining.saturating_sub(results.len()),
+            ) {
+                results.extend(lazy_results);
+            }
+            if results.len() >= query.max_results {
+                break;
+            }
+        }
+    }
+
+    let base = { index.extra.lock().unwrap().base };
     let dtos: Vec<SearchResult> = results
         .into_iter()
         .map(|id| {
+            // For extra nodes (materialized from lazy spans), use the any-methods
+            if id >= base {
+                let value_preview = index.value_preview_any(id);
+                let path = index.get_path_any(id);
+                let key = index.key_string_any(id);
+                return SearchResult {
+                    node_id: id,
+                    file_order: id,
+                    path,
+                    key,
+                    value_preview,
+                    kind: "node",
+                    match_preview: None,
+                };
+            }
             let node = &index.nodes[id as usize];
             let value_preview = match node.kind() {
                 NodeKind::Str => format!(
@@ -536,6 +736,8 @@ pub async fn search(
                 NodeKind::Null => "null".to_string(),
                 NodeKind::Object => "[object]".to_string(),
                 NodeKind::Array => "[array]".to_string(),
+                NodeKind::LazyObject => "[object]".to_string(),
+                NodeKind::LazyArray => "[array]".to_string(),
             };
             SearchResult {
                 node_id: id,
@@ -621,21 +823,32 @@ pub async fn search_objects(
         query.max_results,
         query.path.as_deref(),
     );
+    let base = { index.extra.lock().unwrap().base };
     let dtos = ids
         .into_iter()
         .map(|id| {
-            let children_len = index.children_len(id) as usize;
-            // Inline value_preview for objects: avoids building a full NodeDto
-            let value_preview = if children_len == 0 {
-                "{}".to_string()
+            let (path, key, value_preview) = if id >= base {
+                let count = index.children_count_any(id) as usize;
+                let preview = if count == 0 {
+                    "{}".to_string()
+                } else {
+                    format!("{{{} keys}}", count)
+                };
+                (index.get_path_any(id), index.key_string_any(id), preview)
             } else {
-                format!("{{{} keys}}", children_len)
+                let count = index.children_len(id) as usize;
+                let preview = if count == 0 {
+                    "{}".to_string()
+                } else {
+                    format!("{{{} keys}}", count)
+                };
+                (index.get_path(id), node_key_string(index, id), preview)
             };
             SearchResult {
                 node_id: id,
                 file_order: id,
-                path: index.get_path(id),
-                key: node_key_string(index, id),
+                path,
+                key,
                 value_preview,
                 kind: "object",
                 match_preview: Some(Arc::clone(&match_preview)),
@@ -674,7 +887,7 @@ pub async fn expand_to(
     let mut chain: Vec<u32> = Vec::new();
     let mut current = node_id;
     loop {
-        match index.parent_of(current) {
+        match index.parent_of_any(current) {
             None => break,
             Some(p) => {
                 chain.push(p);
@@ -687,15 +900,20 @@ pub async fn expand_to(
     let expansions: Vec<(u32, Vec<NodeDto>)> = chain
         .into_iter()
         .map(|ancestor_id| {
+            // get_children_any handles main, lazy, and extra nodes correctly.
+            // On error (e.g. parse failure), return empty children rather than
+            // falling back to children_iter which is invalid for lazy/extra nodes.
             let children = index
-                .children_iter(ancestor_id)
-                .map(|child_id| node_to_dto(index, child_id))
+                .get_children_any(ancestor_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| node_to_dto(index, id))
                 .collect();
             (ancestor_id, children)
         })
         .collect();
 
-    let path = index.get_path(node_id);
+    let path = index.get_path_any(node_id);
 
     Ok(ExpandToResult { expansions, path })
 }
@@ -728,41 +946,39 @@ pub async fn get_expanded_slice(
 
     // Local key pool for this slice: avoids repeating the same string
     // for every node that shares a field name (e.g. "id", "name", …).
+    // Uses a HashMap for O(1) dedup — necessary because extra-node IDs can't
+    // be compared via NodeKey (which encodes main-index key-pool indices).
     let mut key_pool: Vec<String> = Vec::new();
-    let mut key_pool_ids: Vec<NodeKey> = Vec::new();
+    let mut key_pool_map: HashMap<String, i32> = HashMap::new();
 
     let mut rows = Vec::with_capacity(slice.len());
     for VisibleSliceRow { id, depth } in slice {
-        let node = &index.nodes[id as usize];
-
-        let key_idx: i32 = match node.key() {
+        let key_idx: i32 = match node_key_string(index, id) {
             None => -1,
-            Some(key) => {
-                // linear search on the local pool (usually < 200 entries → cache-friendly)
-                match key_pool_ids.iter().position(|&k| k == key) {
-                    Some(pos) => pos as i32,
-                    None => {
-                        let pos = key_pool.len() as i32;
-                        key_pool.push(node_key_string(index, id).unwrap_or_default());
-                        key_pool_ids.push(key);
-                        pos
-                    }
+            Some(k) => match key_pool_map.get(&k).copied() {
+                Some(pos) => pos,
+                None => {
+                    let pos = key_pool.len() as i32;
+                    key_pool_map.insert(k.clone(), pos);
+                    key_pool.push(k);
+                    pos
                 }
-            }
+            },
         };
 
-        let parent_id_i32 = match index.parent_of(id) {
+        let parent_id_i32 = match index.parent_of_any(id) {
             None => -1i32,
             Some(p) => p as i32,
         };
 
+        let kind = index.node_kind_any(id);
         rows.push((
             id,
             parent_id_i32,
             key_idx,
-            node_type_byte(node.kind()),
+            node_type_byte(kind),
             node_value_preview(index, id).into_owned(),
-            index.children_len(id),
+            index.children_count_any(id),
             depth as u32,
         ));
     }
@@ -784,7 +1000,7 @@ pub async fn get_raw(
     let idx = state.window_index(webview_window.label());
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
-    Ok(index.build_raw(node_id))
+    Ok(index.get_raw_any(node_id))
 }
 
 /// Opens the subtree of `node_id` in a new window as an independent JSON document.
@@ -801,7 +1017,7 @@ pub async fn open_in_new_window(
         let idx = state.window_index(webview_window.label());
         let guard = idx.read().unwrap();
         let index = guard.as_ref().ok_or("Nessun file aperto")?;
-        index.build_raw(node_id)
+        index.get_raw_any(node_id)
     };
 
     let label = format!(

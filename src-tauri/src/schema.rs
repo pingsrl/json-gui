@@ -45,6 +45,9 @@ fn infer_node(index: &JsonIndex, id: u32) -> Schema {
                 .collect();
             Schema::Obj(fields)
         }
+        // Lazy nodes: treat as opaque object/array without recursing
+        NodeKind::LazyObject => Schema::Obj(Vec::new()),
+        NodeKind::LazyArray => Schema::Arr(Box::new(Schema::Any)),
     }
 }
 

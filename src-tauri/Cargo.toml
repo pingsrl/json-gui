@@ -11,6 +11,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "json-gui"
 path = "src/main.rs"
 
+[[bin]]
+name = "jgbench"
+path = "src/bin/jgbench.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -22,6 +26,7 @@ rayon = "1"
 regex = "1"
 memmap2 = "0.9"
 memchr = "2"
+
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["sync", "time"] }
 tauri-plugin-dialog = "2"
@@ -43,6 +48,7 @@ harness = false
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

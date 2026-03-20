@@ -15,6 +15,10 @@ import {
   findVisibleNodeIndex,
   insertVisibleChildren,
   sortSearchResults,
+  decoratePagedChildren,
+  makeLoadMoreNode,
+  UNKNOWN_COUNT_SENTINEL,
+  LARGE_NODE_PAGE_SIZE,
 } from './store'
 import type { NodeDto, SearchResult, VNode } from './store'
 
@@ -311,5 +315,94 @@ describe('sortSearchResults', () => {
     const sorted = sortSearchResults(results, 'title', 'relevance')
 
     expect(sorted.map((r) => r.node_id)).toEqual([2, 1])
+  })
+})
+
+// ── decoratePagedChildren ─────────────────────────────────────────────────────
+
+describe('decoratePagedChildren — conteggio noto', () => {
+  it('non aggiunge load-more se tutti i figli sono già presenti', () => {
+    const parent = makeNode(1, 'p', 'array', 3)
+    const children = [makeNode(10, '0'), makeNode(11, '1'), makeNode(12, '2')]
+    const result = decoratePagedChildren(parent, children, 0)
+    expect(result).toHaveLength(3)
+    expect(result.every((n) => !n.synthetic_kind)).toBe(true)
+  })
+
+  it('aggiunge load-more se ci sono altri figli da caricare', () => {
+    const parent = makeNode(1, 'p', 'array', 5)
+    const children = [makeNode(10, '0'), makeNode(11, '1'), makeNode(12, '2')]
+    const result = decoratePagedChildren(parent, children, 0)
+    expect(result).toHaveLength(4)
+    expect(result[3].synthetic_kind).toBe('load-more')
+    expect(result[3].next_offset).toBe(3)
+    expect(result[3].remaining_count).toBe(2)
+  })
+
+  it('il testo load-more mostra il numero di rimanenti', () => {
+    const parent = makeNode(1, 'p', 'array', 10)
+    const children = Array.from({ length: 3 }, (_, i) => makeNode(10 + i, String(i)))
+    const result = decoratePagedChildren(parent, children, 0)
+    const loadMore = result.find((n) => n.synthetic_kind === 'load-more')!
+    expect(loadMore.value_preview).toContain('7')
+    expect(loadMore.value_preview).toContain('remaining')
+  })
+})
+
+describe('decoratePagedChildren — conteggio sconosciuto (lazy grande)', () => {
+  const makeUnknownParent = () => makeNode(1, 'data', 'array', UNKNOWN_COUNT_SENTINEL)
+
+  it('aggiunge load-more quando la pagina è piena', () => {
+    const parent = makeUnknownParent()
+    const children = Array.from({ length: LARGE_NODE_PAGE_SIZE }, (_, i) => makeNode(100 + i, String(i)))
+    const result = decoratePagedChildren(parent, children, 0, LARGE_NODE_PAGE_SIZE)
+    expect(result).toHaveLength(LARGE_NODE_PAGE_SIZE + 1)
+    const loadMore = result[result.length - 1]
+    expect(loadMore.synthetic_kind).toBe('load-more')
+    expect(loadMore.next_offset).toBe(LARGE_NODE_PAGE_SIZE)
+    // Nessun "remaining" numerico nel testo
+    expect(loadMore.value_preview).not.toContain('remaining')
+    expect(loadMore.value_preview).toContain('…')
+  })
+
+  it('non aggiunge load-more quando la pagina è parziale (fine array)', () => {
+    const parent = makeUnknownParent()
+    const children = Array.from({ length: 42 }, (_, i) => makeNode(100 + i, String(i)))
+    const result = decoratePagedChildren(parent, children, 0, LARGE_NODE_PAGE_SIZE)
+    expect(result).toHaveLength(42)
+    expect(result.every((n) => !n.synthetic_kind)).toBe(true)
+  })
+
+  it('load-more usa offset corretto dopo la prima pagina', () => {
+    const parent = makeUnknownParent()
+    const children = Array.from({ length: LARGE_NODE_PAGE_SIZE }, (_, i) => makeNode(200 + i, String(i)))
+    const result = decoratePagedChildren(parent, children, LARGE_NODE_PAGE_SIZE, LARGE_NODE_PAGE_SIZE)
+    const loadMore = result[result.length - 1]
+    expect(loadMore.next_offset).toBe(LARGE_NODE_PAGE_SIZE * 2)
+  })
+})
+
+// ── makeLoadMoreNode ──────────────────────────────────────────────────────────
+
+describe('makeLoadMoreNode', () => {
+  it('conteggio noto: mostra "N remaining"', () => {
+    const node = makeLoadMoreNode(1, 100, 250)
+    expect(node.value_preview).toContain('remaining')
+    expect(node.remaining_count).toBe(150)
+    expect(node.next_offset).toBe(100)
+  })
+
+  it('conteggio sconosciuto: mostra "…" senza remaining numerico', () => {
+    const node = makeLoadMoreNode(1, 1000, UNKNOWN_COUNT_SENTINEL)
+    expect(node.value_preview).toContain('…')
+    expect(node.value_preview).not.toContain('remaining')
+    expect(node.remaining_count).toBeUndefined()
+  })
+
+  it('è sempre un nodo sintetico con children_count 0', () => {
+    const node = makeLoadMoreNode(5, 0, 100)
+    expect(node.synthetic_kind).toBe('load-more')
+    expect(node.children_count).toBe(0)
+    expect(node.parent_node_id).toBe(5)
   })
 })

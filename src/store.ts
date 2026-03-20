@@ -68,7 +68,7 @@ export interface OperationMetrics {
 
 const MAX_RECENT = 5;
 const MAX_CHILDREN_CACHE = 2000;
-const LARGE_NODE_PAGE_SIZE = 1000;
+export const LARGE_NODE_PAGE_SIZE = 1000;
 const MAX_SAFE_EXPAND_NODES = 50_000;
 
 // Cache LRU semplice (FIFO con limite) per i figli già caricati
@@ -110,23 +110,26 @@ function isLoadMoreNode(node: NodeDto): boolean {
   return node.synthetic_kind === "load-more";
 }
 
-function makeLoadMoreNode(
+export function makeLoadMoreNode(
   parentId: number,
   nextOffset: number,
   totalCount: number
 ): NodeDto {
-  const remaining = Math.max(totalCount - nextOffset, 0);
-  const batch = Math.min(LARGE_NODE_PAGE_SIZE, remaining);
+  const isUnknown = totalCount >= UNKNOWN_COUNT_SENTINEL;
+  const batch = LARGE_NODE_PAGE_SIZE;
+  const preview = isUnknown
+    ? `Load ${batch.toLocaleString()} more items…`
+    : `Load ${Math.min(batch, Math.max(totalCount - nextOffset, 0)).toLocaleString()} more items (${Math.max(totalCount - nextOffset, 0).toLocaleString()} remaining)`;
   return {
     id: nextSyntheticNodeId--,
     key: null,
     value_type: "load-more",
-    value_preview: `Load ${batch.toLocaleString()} more items (${remaining.toLocaleString()} remaining)`,
+    value_preview: preview,
     children_count: 0,
     synthetic_kind: "load-more",
     parent_node_id: parentId,
     next_offset: nextOffset,
-    remaining_count: remaining
+    remaining_count: isUnknown ? undefined : Math.max(totalCount - nextOffset, 0)
   };
 }
 
@@ -134,8 +137,18 @@ function getRealChildren(children: NodeDto[]): NodeDto[] {
   return children.filter((child) => !child.synthetic_kind);
 }
 
-function decoratePagedChildren(parentNode: NodeDto, children: NodeDto[], offset: number): NodeDto[] {
+// Sentinel returned by the backend for lazy nodes with unknown (large) child count.
+export const UNKNOWN_COUNT_SENTINEL = 0xffffffff; // u32::MAX
+
+export function decoratePagedChildren(parentNode: NodeDto, children: NodeDto[], offset: number, pageSize?: number): NodeDto[] {
   const nextOffset = offset + children.length;
+  const isUnknown = parentNode.children_count >= UNKNOWN_COUNT_SENTINEL;
+  if (isUnknown) {
+    // Stop when we got fewer than a full page (i.e. we've hit the end)
+    const limit = pageSize ?? LARGE_NODE_PAGE_SIZE;
+    if (children.length < limit) return children;
+    return [...children, makeLoadMoreNode(parentNode.id, nextOffset, UNKNOWN_COUNT_SENTINEL)];
+  }
   if (nextOffset >= parentNode.children_count) {
     return children;
   }
@@ -169,7 +182,9 @@ function maybeDecoratePartialChildren(
   parentNode: NodeDto | null,
   children: NodeDto[]
 ): NodeDto[] {
-  if (!parentNode || parentNode.children_count <= children.length) {
+  if (!parentNode) return children;
+  const isUnknown = parentNode.children_count >= UNKNOWN_COUNT_SENTINEL;
+  if (!isUnknown && parentNode.children_count <= children.length) {
     return children;
   }
   return decoratePagedChildren(parentNode, children, 0);
