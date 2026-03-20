@@ -962,6 +962,142 @@ struct CompiledPathSegment {
     array_index: Option<u32>,
 }
 
+// ---- Parallel parse helpers ----
+
+/// Advances past ASCII whitespace; returns `None` if end of input.
+fn skip_ws(bytes: &[u8], mut i: usize) -> Option<usize> {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    if i < bytes.len() { Some(i) } else { None }
+}
+
+/// Skips a JSON string starting AFTER the opening `"`. Returns index after closing `"`.
+fn skip_json_str(bytes: &[u8], mut i: usize) -> Option<usize> {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Skips a complete JSON value starting at `i`. Returns index after the value.
+fn skip_json_value(bytes: &[u8], mut i: usize) -> Option<usize> {
+    i = skip_ws(bytes, i)?;
+    match bytes[i] {
+        b'"' => skip_json_str(bytes, i + 1),
+        b'{' | b'[' => {
+            let open = bytes[i];
+            let close = if open == b'{' { b'}' } else { b']' };
+            let mut depth = 1usize;
+            i += 1;
+            let mut in_str = false;
+            while i < bytes.len() && depth > 0 {
+                match bytes[i] {
+                    b'\\' if in_str => i += 1,
+                    b'"' => in_str = !in_str,
+                    b if !in_str && b == open => depth += 1,
+                    b if !in_str && b == close => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            if depth == 0 { Some(i) } else { None }
+        }
+        _ => {
+            // number, boolean, null — scan until delimiter
+            while i < bytes.len()
+                && !matches!(bytes[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n')
+            {
+                i += 1;
+            }
+            Some(i)
+        }
+    }
+}
+
+/// Locates the main JSON array in the file.
+/// Returns `(pre, array_start, array_end, post)` as byte-index ranges into `bytes`.
+/// Supports:
+///   - Root is `[...]`
+///   - Root is `{"key": [...], ...}` (first array value in the object)
+fn find_main_array(bytes: &[u8]) -> Option<(&[u8], usize, usize, &[u8])> {
+    let first = skip_ws(bytes, 0)?;
+    if bytes[first] == b'[' {
+        // Root IS the array; find closing `]`
+        let end = skip_json_value(bytes, first)?;
+        return Some((&bytes[..first], first, end, &bytes[end..]));
+    }
+    if bytes[first] != b'{' {
+        return None;
+    }
+    // Root is an object — find the first array-valued key
+    let mut i = first + 1;
+    loop {
+        i = skip_ws(bytes, i)?;
+        if bytes[i] == b'}' {
+            return None;
+        }
+        if bytes[i] != b'"' {
+            return None;
+        }
+        i = skip_json_str(bytes, i + 1)?;
+        i = skip_ws(bytes, i)?;
+        if i >= bytes.len() || bytes[i] != b':' {
+            return None;
+        }
+        i += 1;
+        let val_start = skip_ws(bytes, i)?;
+        if bytes[val_start] == b'[' {
+            let val_end = skip_json_value(bytes, val_start)?;
+            return Some((&bytes[..val_start], val_start, val_end, &bytes[val_end..]));
+        }
+        // Skip this value
+        i = skip_json_value(bytes, val_start)?;
+        i = skip_ws(bytes, i)?;
+        if i >= bytes.len() {
+            return None;
+        }
+        if bytes[i] == b',' {
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+}
+
+/// Returns `(start, end)` byte ranges of each top-level element within a `[...]` slice.
+/// `array_bytes[0]` must be `[`.
+fn scan_array_elements(array_bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut i = 1usize; // skip opening '['
+    loop {
+        // skip whitespace and check for end
+        let Some(j) = skip_ws(array_bytes, i) else { break };
+        if array_bytes[j] == b']' {
+            break;
+        }
+        // skip a complete element
+        let end = match skip_json_value(array_bytes, j) {
+            Some(e) => e,
+            None => break,
+        };
+        ranges.push(j..end);
+        i = end;
+        // skip optional comma
+        let Some(k) = skip_ws(array_bytes, i) else { break };
+        if array_bytes[k] == b',' {
+            i = k + 1;
+        } else {
+            break;
+        }
+    }
+    ranges
+}
+
 impl JsonIndex {
     #[inline]
     fn children_len_for_node(&self, node: &Node) -> u32 {
@@ -1169,6 +1305,291 @@ impl JsonIndex {
         parse_streaming(&mut de).map_err(|e| e.to_string())
     }
 
+    /// Parallel array element parsing: splits the main array across rayon threads,
+    /// parses each chunk independently, then merges by offsetting node IDs.
+    /// Falls back silently to sequential parse if the structure is not supported.
+    fn try_parallel_from_bytes(
+        bytes: &[u8],
+        node_cap: usize,
+        str_bytes: usize,
+        str_max: usize,
+    ) -> Option<Result<JsonIndex, String>> {
+        const MIN_ELEMENTS: usize = 200;
+
+        // Locate the main JSON array: root is `[...]` or `{"key":[...]}`
+        let (pre, array_start, array_end, post) = find_main_array(bytes)?;
+
+        let array_bytes = &bytes[array_start..array_end]; // includes '[' and ']'
+
+        // Collect element byte ranges inside the array
+        let elem_ranges = scan_array_elements(array_bytes);
+        if elem_ranges.len() < MIN_ELEMENTS {
+            return None;
+        }
+
+        // Number of threads capped at element count
+        let n_threads = rayon::current_num_threads().min(elem_ranges.len());
+        let chunk_size = (elem_ranges.len() + n_threads - 1) / n_threads;
+
+        // Each thread gets a JSON array `[elem_i, ..., elem_j]` to parse.
+        // element bytes per chunk = sum of element byte lengths + separating commas + 2 brackets
+        let per_chunk_nodes = (node_cap / n_threads).max(1024);
+        let per_chunk_str = (str_bytes / n_threads).max(4096);
+
+        let sub_results: Vec<Result<JsonIndex, String>> = elem_ranges
+            .chunks(chunk_size)
+            .map(|chunk_ranges| {
+                // Build a synthetic `[elem1,elem2,...]` buffer for this chunk
+                let total_bytes: usize = chunk_ranges
+                    .iter()
+                    .map(|r| r.end - r.start)
+                    .sum::<usize>()
+                    + chunk_ranges.len() // commas
+                    + 2; // `[` and `]`
+                let mut buf = Vec::with_capacity(total_bytes);
+                buf.push(b'[');
+                for (i, r) in chunk_ranges.iter().enumerate() {
+                    if i > 0 {
+                        buf.push(b',');
+                    }
+                    buf.extend_from_slice(&array_bytes[r.start..r.end]);
+                }
+                buf.push(b']');
+                let mut de = sonic_rs::Deserializer::from_slice(&buf);
+                parse_streaming_with_cap(&mut de, per_chunk_nodes, per_chunk_str, str_max)
+                    .map_err(|e| e.to_string())
+            })
+            .collect();
+
+        // Merge sub-indices -------------------------------------------------------
+        // Outer skeleton: parse the file with an empty array in place of the main one.
+        // e.g.  {"configurazione":[]}   or   []
+        let mut skeleton_buf = Vec::with_capacity(pre.len() + 2 + post.len());
+        skeleton_buf.extend_from_slice(pre);
+        skeleton_buf.extend_from_slice(b"[]");
+        skeleton_buf.extend_from_slice(post);
+        let mut skeleton = {
+            let mut de = sonic_rs::Deserializer::from_slice(&skeleton_buf);
+            match parse_streaming_with_cap(&mut de, 16, 4096, 0) {
+                Ok(idx) => idx,
+                Err(e) => return Some(Err(e.to_string())),
+            }
+        };
+
+        // Collect sub-indices (bail out on any error)
+        let mut sub_indices = Vec::with_capacity(sub_results.len());
+        for r in sub_results {
+            match r {
+                Ok(idx) => sub_indices.push(idx),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // Find the array node in the skeleton (it's the last node with kind=Array)
+        let array_node_id = skeleton
+            .nodes
+            .iter()
+            .rposition(|n| n.kind() == NodeKind::Array)
+            .unwrap_or(0) as u32;
+
+        // Accumulate merged vecs from the skeleton then all sub-indices
+        let total_nodes: usize = skeleton.nodes.len()
+            + sub_indices.iter().map(|s| s.nodes.len()).sum::<usize>();
+        let mut nodes = Vec::with_capacity(total_nodes);
+        let mut parent_deltas = Vec::with_capacity(total_nodes);
+        let mut parent_overflow_ids: Vec<u32> = Vec::new();
+        let mut parent_overflow_values: Vec<u32> = Vec::new();
+
+        // Copy skeleton nodes
+        nodes.extend_from_slice(&skeleton.nodes);
+        parent_deltas.extend_from_slice(&skeleton.parent_deltas);
+        parent_overflow_ids.extend_from_slice(&skeleton.parent_overflow_ids);
+        parent_overflow_values.extend_from_slice(&skeleton.parent_overflow_values);
+
+        let mut base_offset = skeleton.nodes.len() as u32;
+        let mut total_element_count: u32 = 0;
+        let mut array_subtree_len: u32 = 0;
+
+        for sub in &sub_indices {
+            // The sub-index root (id=0) is a synthetic Array wrapper; its children
+            // are the actual elements. We skip the synthetic root and append its
+            // children (ids 1..N) with shifted IDs.
+            //
+            // The top-level elements (direct children of the synthetic root, delta=1)
+            // become direct children of array_node_id in the merged index.
+            let sub_node_count = sub.nodes.len() as u32;
+            let sub_children = sub.children_len(0);
+            total_element_count += sub_children;
+            array_subtree_len += sub_node_count - 1; // exclude synthetic root
+
+            for local_id in 1..sub_node_count {
+                let node = sub.nodes[local_id as usize].clone();
+                let merged_id = base_offset + local_id - 1; // -1 because we skip local root
+                nodes.push(node);
+
+                let orig_delta = sub.parent_deltas[local_id as usize];
+
+                // If this node's parent was the synthetic array root (delta points to id 0):
+                // remap its parent to array_node_id
+                if orig_delta != 0 {
+                    let local_parent = local_id - orig_delta as u32;
+                    if local_parent == 0 {
+                        // Parent is the synthetic root → remap to array_node_id
+                        let dist = merged_id - array_node_id;
+                        if dist < u8::MAX as u32 {
+                            parent_deltas.push(dist as u8);
+                        } else {
+                            parent_deltas.push(u8::MAX);
+                            parent_overflow_ids.push(merged_id);
+                            parent_overflow_values.push(array_node_id);
+                        }
+                    } else {
+                        // Relative delta unchanged (shift cancels in subtraction)
+                        parent_deltas.push(orig_delta);
+                    }
+                } else {
+                    // This is the synthetic root itself — should have been skipped
+                    parent_deltas.push(0);
+                }
+            }
+
+            // Remap overflow entries that don't reference local root
+            for (i, &oid) in sub.parent_overflow_ids.iter().enumerate() {
+                if oid == 0 {
+                    continue; // synthetic root, already handled above
+                }
+                let merged_child = base_offset + oid - 1;
+                let local_parent = sub.parent_overflow_values[i];
+                let merged_parent = if local_parent == 0 {
+                    array_node_id
+                } else {
+                    base_offset + local_parent - 1
+                };
+                parent_overflow_ids.push(merged_child);
+                parent_overflow_values.push(merged_parent);
+            }
+
+            base_offset += sub_node_count - 1;
+        }
+
+        // Sort overflow tables (binary_search requires sorted order)
+        let mut overflow_pairs: Vec<(u32, u32)> = parent_overflow_ids
+            .into_iter()
+            .zip(parent_overflow_values)
+            .collect();
+        overflow_pairs.sort_unstable_by_key(|&(id, _)| id);
+        let (sorted_overflow_ids, sorted_overflow_values): (Vec<u32>, Vec<u32>) =
+            overflow_pairs.into_iter().unzip();
+
+        // Patch the skeleton array node's container metadata
+        if let Some(meta_id) = (array_node_id < skeleton.nodes.len() as u32)
+            .then(|| skeleton.nodes[array_node_id as usize].value_data as usize)
+        {
+            if meta_id < skeleton.container_subtrees.len() {
+                skeleton.container_subtrees[meta_id] = array_subtree_len;
+            }
+            if meta_id < skeleton.container_children.len() {
+                skeleton.container_children[meta_id] =
+                    total_element_count.min(u16::MAX as u32) as u16;
+            }
+        }
+
+        // Merge container meta from sub-indices
+        let mut container_subtrees = skeleton.container_subtrees;
+        let mut container_children = skeleton.container_children;
+        for sub in &sub_indices {
+            // skip the first entry (synthetic root array meta)
+            let skip = 1;
+            container_subtrees.extend_from_slice(
+                sub.container_subtrees.get(skip..).unwrap_or(&[]),
+            );
+            container_children.extend_from_slice(
+                sub.container_children.get(skip..).unwrap_or(&[]),
+            );
+        }
+
+        // Merge string pools: re-intern all sub-index strings into skeleton pools
+        // so IDs are consistent across the merged index.
+        // Keys pool: keys from sub-indices need to be remapped into skeleton.keys
+        // val_strings pool: same for values.
+        //
+        // This merge is the most complex part. For correctness we remap each
+        // sub-index's string IDs via a translation table built during the merge.
+        // We do it sequentially here because InternedStrings is not thread-safe.
+        let mut merged_keys = skeleton.keys;
+        let mut merged_vals = skeleton.val_strings;
+        let mut merged_nums = skeleton.nums_pool;
+
+        // We need to update node ktype (key string id) and value_data (val string id)
+        // in the merged nodes. Build per-sub-index remap tables.
+        let skeleton_node_count = skeleton.nodes.len();
+        let mut merged_node_idx = skeleton_node_count;
+
+        for sub in &sub_indices {
+            // Build key ID remap: sub_key_id → merged_key_id
+            let key_remap: Vec<u32> = (0..sub.keys.len())
+                .map(|id| merged_keys.intern(sub.keys.get(id as u32)))
+                .collect();
+
+            // Build val string ID remap
+            let val_remap: Vec<u32> = (0..sub.val_strings.len())
+                .map(|id| merged_vals.intern(sub.val_strings.get(id as u32)))
+                .collect();
+
+            // Build nums remap
+            let nums_base = merged_nums.len() as u32;
+
+            // Remap nodes (skipping local id 0 = synthetic root)
+            for local_id in 1..sub.nodes.len() {
+                let node = &mut nodes[merged_node_idx];
+                let kind = node.kind();
+
+                // Remap key
+                if let Some(NodeKey::String(kid)) = node.key() {
+                    let new_kid = key_remap[kid as usize];
+                    // Preserve the kind bits and array-index flag, replace key id
+                    node.ktype = (node.ktype & !0x0FFF_FFFF) | (new_kid & 0x0FFF_FFFF);
+                }
+
+                // Remap value_data
+                match kind {
+                    NodeKind::Str => {
+                        node.value_data = val_remap[node.value_data as usize];
+                    }
+                    NodeKind::Num => {
+                        // Inline nums: no remap needed
+                        // Pool nums: remap index
+                        if (node.value_data & INLINE_NUM_FLAG) == 0 {
+                            node.value_data += nums_base;
+                        }
+                    }
+                    _ => {}
+                }
+
+                merged_node_idx += 1;
+            }
+
+            // Append nums pool
+            merged_nums.extend_from_slice(&sub.nums_pool);
+        }
+
+        // Release val_strings hash table (no longer needed post-parse)
+        merged_vals.release_lookup_index();
+
+        Some(Ok(JsonIndex {
+            nodes,
+            parent_deltas,
+            parent_overflow_ids: sorted_overflow_ids,
+            parent_overflow_values: sorted_overflow_values,
+            container_subtrees,
+            container_children,
+            keys: merged_keys,
+            val_strings: merged_vals,
+            nums_pool: merged_nums,
+            root: 0,
+        }))
+    }
+
     /// Loads from file via mmap + sonic-rs (SIMD parsing).
     ///
     /// The file is memory-mapped read-only for the duration of parsing: the OS
@@ -1216,6 +1637,16 @@ impl JsonIndex {
         } else {
             0
         };
+
+        // Try parallel array parse first (gives ~N_threads× speedup on arrays).
+        // Falls back to sequential if the file structure is not supported.
+        if let Some(result) =
+            Self::try_parallel_from_bytes(&mmap[..], node_cap, str_bytes, str_max)
+        {
+            drop(mmap);
+            return result;
+        }
+
         let mut de = sonic_rs::Deserializer::from_slice(&mmap[..]);
         let result = parse_streaming_with_cap(&mut de, node_cap, str_bytes, str_max)
             .map_err(|e| e.to_string());
