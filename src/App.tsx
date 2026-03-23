@@ -95,11 +95,12 @@ export default function App() {
   }, [openFile]);
 
   // Carica subtree pre-caricato (finestra aperta via "Apri in nuova finestra")
+  // get_pending_content restituisce il path del file temp, non il contenuto raw.
   useEffect(() => {
-    invoke<string | null>("get_pending_content").then((content) => {
-      if (content) openFromString(content);
+    invoke<string | null>("get_pending_content").then((path) => {
+      if (path) openFile(path);
     });
-  }, [openFromString]);
+  }, [openFile]);
 
   // Apri file via "Apri con" / double-click (macOS RunEvent::Opened)
   useEffect(() => {

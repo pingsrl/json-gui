@@ -270,7 +270,7 @@ const INLINE_NUM_MASK: u32 = 0x7FFF_FFFF;
 const INLINE_I31_MIN: i64 = -(1 << 30);
 const INLINE_I31_MAX: i64 = (1 << 30) - 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeKey {
     String(u32),
     ArrayIndex(u32),

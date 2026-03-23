@@ -128,6 +128,7 @@ pub fn run() {
             windows: RwLock::new(HashMap::new()),
             initial_path: std::sync::Mutex::new(None),
             pending_content: std::sync::Mutex::new(HashMap::new()),
+            pending_temp_files: std::sync::Mutex::new(std::collections::HashSet::new()),
             runtime_monitor: std::sync::Mutex::new(commands::RuntimeMonitor::new()),
         })
         .setup(|app| {

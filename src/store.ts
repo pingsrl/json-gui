@@ -1,6 +1,31 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 
+// Compact expand_subtree response from Rust backend.
+// Each row: [id, parent_id_i32, key_idx, type_byte, preview, children_count]
+interface CompactExpandSubtreeResult {
+  key_pool: string[];
+  expansions: [number, [number, number, number, number, string, number][]][];
+}
+
+const COMPACT_TYPE_NAMES = ["object", "array", "string", "number", "boolean", "null"] as const;
+
+function decodeCompactExpansions(
+  result: CompactExpandSubtreeResult
+): [number, NodeDto[]][] {
+  const { key_pool, expansions } = result;
+  return expansions.map(([parentId, rows]) => {
+    const children: NodeDto[] = rows.map(([id, , key_idx, type_byte, preview, children_count]) => ({
+      id,
+      key: key_idx >= 0 ? key_pool[key_idx] : null,
+      value_type: COMPACT_TYPE_NAMES[type_byte] ?? "null",
+      value_preview: preview,
+      children_count,
+    }));
+    return [parentId, children];
+  });
+}
+
 export interface NodeDto {
   id: number;
   key: string | null;
@@ -1009,10 +1034,11 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     const startedAtMs = performance.now();
     set({ loading: true });
     try {
-      const expansions = await invoke<[number, NodeDto[]][]>("expand_subtree", {
+      const raw = await invoke<CompactExpandSubtreeResult>("expand_subtree", {
         nodeId: rootNode.id,
         maxNodes: MAX_SAFE_EXPAND_NODES
       });
+      const expansions = decodeCompactExpansions(raw);
       const next = new Map<number, NodeDto[]>();
       for (const [parentId, children] of expansions) {
         const parentNode =
@@ -1037,10 +1063,11 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     const startedAtMs = performance.now();
     try {
       const { expandedNodes, rootChildren } = get();
-      const expansions = await invoke<[number, NodeDto[]][]>("expand_subtree", {
+      const raw = await invoke<CompactExpandSubtreeResult>("expand_subtree", {
         nodeId,
         maxNodes: MAX_SAFE_EXPAND_NODES
       });
+      const expansions = decodeCompactExpansions(raw);
       const next = new Map(expandedNodes);
       for (const [parentId, children] of expansions) {
         const parentNode = getKnownNode(parentId, rootChildren);

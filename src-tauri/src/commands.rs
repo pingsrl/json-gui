@@ -5,7 +5,7 @@ use crate::json_index::{
 use crate::schema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tauri::{Emitter, Manager, State, WindowEvent};
@@ -16,9 +16,11 @@ pub struct AppState {
     /// allowing concurrent reads (search, get_children, …) on the same window.
     pub windows: RwLock<HashMap<String, Arc<RwLock<Option<JsonIndex>>>>>,
     pub initial_path: std::sync::Mutex<Option<String>>,
-    /// Raw JSON pre-loaded for a window opened via "Open in new window".
+    /// Temp file path pre-loaded for a window opened via "Open in new window".
     /// Key = window label; consumed exactly once by get_pending_content.
     pub pending_content: std::sync::Mutex<HashMap<String, String>>,
+    /// Paths of temp files written by open_in_new_window; deleted by open_file after parsing.
+    pub pending_temp_files: std::sync::Mutex<HashSet<String>>,
     pub runtime_monitor: Mutex<RuntimeMonitor>,
 }
 
@@ -42,7 +44,10 @@ impl AppState {
     /// Removes the index associated with a window (called on window destruction).
     pub fn remove_window(&self, label: &str) {
         self.windows.write().unwrap().remove(label);
-        self.pending_content.lock().unwrap().remove(label);
+        if let Some(path) = self.pending_content.lock().unwrap().remove(label) {
+            self.pending_temp_files.lock().unwrap().remove(&path);
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -278,9 +283,20 @@ pub async fn open_file(
         let _ = webview_window.emit("parse-progress", 0u8);
     }
 
+    // If this path is a temp file (written by open_in_new_window), delete it after parsing.
+    let tmp_to_delete = if state.pending_temp_files.lock().unwrap().remove(&path) {
+        Some(path.clone())
+    } else {
+        None
+    };
+
     let index = tauri::async_runtime::spawn_blocking(move || JsonIndex::from_file(&path))
         .await
         .map_err(|e| e.to_string())??;
+
+    if let Some(tmp) = tmp_to_delete {
+        let _ = std::fs::remove_file(&tmp);
+    }
 
     if size_bytes as u64 > PROGRESS_EVENT_THRESHOLD {
         let _ = webview_window.emit("parse-progress", 100u8);
@@ -444,13 +460,16 @@ pub async fn expand_subtree(
     max_nodes: Option<u32>,
     state: State<'_, AppState>,
     webview_window: tauri::WebviewWindow,
-) -> Result<Vec<(u32, Vec<NodeDto>)>, String> {
+) -> Result<CompactExpandSubtreeResult, String> {
     let idx = state.window_index(webview_window.label());
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
     let limit = max_nodes.unwrap_or(50_000) as usize;
-    let mut result: Vec<(u32, Vec<NodeDto>)> = Vec::new();
+    // Shared key pool across all expansions: deduplicates keys like "id", "name" globally.
+    let mut key_pool: Vec<String> = Vec::new();
+    let mut key_map: HashMap<NodeKey, i32> = HashMap::new();
+    let mut result: Vec<(u32, Vec<(u32, i32, i32, u8, String, u32)>)> = Vec::new();
     let mut queue: Vec<u32> = vec![node_id];
     let mut qi = 0;
     let mut total_nodes: usize = 0;
@@ -459,8 +478,8 @@ pub async fn expand_subtree(
         let parent_id = queue[qi];
         qi += 1;
 
-        let children_ids = index.get_children_slice(parent_id);
-        if children_ids.is_empty() {
+        let n_children = index.children_len(parent_id) as usize;
+        if n_children == 0 {
             continue;
         }
 
@@ -468,26 +487,51 @@ pub async fn expand_subtree(
         if remaining_budget == 0 {
             break;
         }
-        let visible_children_ids = &children_ids[..children_ids
-            .len()
+        let cap = n_children
             .min(remaining_budget)
-            .min(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)];
-        total_nodes += visible_children_ids.len();
+            .min(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT);
 
-        for &child_id in visible_children_ids {
-            if total_nodes < limit && index.has_children(child_id) {
+        // children_iter is zero-alloc (no Vec<u32> per parent).
+        let mut children_rows: Vec<(u32, i32, i32, u8, String, u32)> =
+            Vec::with_capacity(cap);
+        for id in index.children_iter(parent_id).take(cap) {
+            let node = &index.nodes[id as usize];
+            let key_idx: i32 = match node.key() {
+                None => -1,
+                Some(key) => *key_map.entry(key).or_insert_with(|| {
+                    let pos = key_pool.len() as i32;
+                    key_pool.push(node_key_string(index, id).unwrap_or_default());
+                    pos
+                }),
+            };
+            let parent_i32 = match index.parent_of(id) {
+                None => -1i32,
+                Some(p) => p as i32,
+            };
+            let n_ch = index.children_len(id);
+            children_rows.push((
+                id,
+                parent_i32,
+                key_idx,
+                node_type_byte(node.kind()),
+                node_value_preview(index, id).into_owned(),
+                n_ch,
+            ));
+        }
+
+        total_nodes += children_rows.len();
+        for &(child_id, _, _, _, _, n_ch) in &children_rows {
+            if total_nodes < limit && n_ch > 0 {
                 queue.push(child_id);
             }
         }
-
-        let children: Vec<NodeDto> = visible_children_ids
-            .iter()
-            .map(|&id| node_to_dto(index, id))
-            .collect();
-        result.push((parent_id, children));
+        result.push((parent_id, children_rows));
     }
 
-    Ok(result)
+    Ok(CompactExpandSubtreeResult {
+        key_pool,
+        expansions: result,
+    })
 }
 
 #[tauri::command]
@@ -714,6 +758,16 @@ pub struct CompactExpandedSliceResult {
     pub rows: Vec<(u32, i32, i32, u8, String, u32, u32)>,
 }
 
+/// Compact format for expand_subtree.
+/// Saves ~4-5x IPC payload vs Vec<(u32, Vec<NodeDto>)> with named fields.
+/// Each child row: (id, parent_id_i32, key_idx, type_byte, preview, children_count)
+/// key_idx indexes into the shared key_pool (-1 = no key).
+#[derive(Serialize)]
+pub struct CompactExpandSubtreeResult {
+    pub key_pool: Vec<String>,
+    pub expansions: Vec<(u32, Vec<(u32, i32, i32, u8, String, u32)>)>,
+}
+
 #[tauri::command]
 pub async fn get_expanded_slice(
     offset: usize,
@@ -729,7 +783,7 @@ pub async fn get_expanded_slice(
     // Local key pool for this slice: avoids repeating the same string
     // for every node that shares a field name (e.g. "id", "name", …).
     let mut key_pool: Vec<String> = Vec::new();
-    let mut key_pool_ids: Vec<NodeKey> = Vec::new();
+    let mut key_map: HashMap<NodeKey, i32> = HashMap::new();
 
     let mut rows = Vec::with_capacity(slice.len());
     for VisibleSliceRow { id, depth } in slice {
@@ -737,18 +791,11 @@ pub async fn get_expanded_slice(
 
         let key_idx: i32 = match node.key() {
             None => -1,
-            Some(key) => {
-                // linear search on the local pool (usually < 200 entries → cache-friendly)
-                match key_pool_ids.iter().position(|&k| k == key) {
-                    Some(pos) => pos as i32,
-                    None => {
-                        let pos = key_pool.len() as i32;
-                        key_pool.push(node_key_string(index, id).unwrap_or_default());
-                        key_pool_ids.push(key);
-                        pos
-                    }
-                }
-            }
+            Some(key) => *key_map.entry(key).or_insert_with(|| {
+                let pos = key_pool.len() as i32;
+                key_pool.push(node_key_string(index, id).unwrap_or_default());
+                pos
+            }),
         };
 
         let parent_id_i32 = match index.parent_of(id) {
@@ -812,11 +859,22 @@ pub async fn open_in_new_window(
             .as_millis()
     );
 
+    // Write to a temp file instead of holding the raw JSON string in RAM.
+    // For large subtrees this avoids keeping hundreds of MB in the process heap.
+    let tmp_path = std::env::temp_dir().join(format!("jgui_{label}.json"));
+    std::fs::write(&tmp_path, raw.as_bytes()).map_err(|e| e.to_string())?;
+    drop(raw); // release the string immediately after writing
+    let path_str = tmp_path.to_string_lossy().into_owned();
+    state
+        .pending_temp_files
+        .lock()
+        .unwrap()
+        .insert(path_str.clone());
     state
         .pending_content
         .lock()
         .unwrap()
-        .insert(label.clone(), raw);
+        .insert(label.clone(), path_str);
 
     let new_window =
         tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
