@@ -13,7 +13,10 @@
     "test:coverage": "vitest run --coverage",
     "bench": "cd src-tauri && cargo bench",
     "bench:real": "cd src-tauri && cargo bench -- real_file",
-    "bench:frontend": "node --experimental-strip-types src/bench/perf.mts"
+    "bench:frontend": "node --experimental-strip-types src/bench/perf.mts",
+    "test:e2e": "tauri-wd --port 4444 & sleep 2 && cd tests/e2e/wdio && npm test; kill %1 2>/dev/null; true",
+    "test:e2e:build": "cd src-tauri && cargo build && cd .. && npm run test:e2e",
+    "test:e2e:setup": "cd tests/e2e/wdio && npm install"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.13.23",
