@@ -173,6 +173,12 @@ pub struct ObjectSearchQuery {
 pub struct ExpandToResult {
     pub expansions: Vec<(u32, Vec<NodeDto>)>,
     pub path: String,
+    /// Canonical node ID of the target. May differ from the input `node_id` when the
+    /// input came from `search_in_lazy_node`, which stores matching nodes in temporary
+    /// per-element sub-indices whose IDs conflict with the canonical sub-index created
+    /// by `materialize_lazy_node`. `expand_to` resolves the mismatch by re-matching
+    /// each chain step via key comparison against the canonical children.
+    pub resolved_node_id: u32,
 }
 
 /// Safely truncates a UTF-8 string to at most `max_chars` characters.
@@ -328,6 +334,33 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
 const PROGRESS_EVENT_THRESHOLD: u64 = 200 * 1024 * 1024; // 200 MB
 const EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT: usize = 1_000;
 
+/// How to fetch children for a given node.
+enum ChildrenMode {
+    /// Regular indexed node — use `children_iter`.
+    Normal,
+    /// Lazy or extra node with known/small count — use `get_children_any`.
+    AnyPath,
+    /// Large lazy node — use `get_lazy_children_page` for paginated streaming.
+    PagedLazy,
+}
+
+/// Classify `node_id` to determine which child-fetching strategy to use.
+fn children_mode(index: &JsonIndex, node_id: u32) -> ChildrenMode {
+    let extra_base = { index.extra.lock().unwrap().base };
+    if node_id >= extra_base {
+        return ChildrenMode::AnyPath;
+    }
+    if !index.nodes[node_id as usize].kind().is_lazy() {
+        return ChildrenMode::Normal;
+    }
+    // is_large_lazy is safe here: node_id < extra_base guarantees a main-index node
+    if index.is_large_lazy(node_id) {
+        ChildrenMode::PagedLazy
+    } else {
+        ChildrenMode::AnyPath
+    }
+}
+
 #[tauri::command]
 pub async fn open_file(
     path: String,
@@ -375,52 +408,20 @@ pub async fn get_children(
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
-    // Check if this node is lazy or extra — use the any-path
-    let needs_any = {
-        let extra = index.extra.lock().unwrap();
-        if node_id >= extra.base {
-            true
-        } else {
-            index.nodes[node_id as usize].kind().is_lazy()
+    let child_ids = match children_mode(index, node_id) {
+        ChildrenMode::Normal => {
+            return Ok(index
+                .children_iter(node_id)
+                .take(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)
+                .map(|id| node_to_dto(index, id))
+                .collect());
+        }
+        ChildrenMode::AnyPath => index.get_children_any(node_id)?,
+        ChildrenMode::PagedLazy => {
+            index.get_lazy_children_page(node_id, 0, EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)?
         }
     };
-
-    if needs_any {
-        // For large lazy nodes use paginated scan (avoids full materialization)
-        let is_large_lazy = {
-            let extra = index.extra.lock().unwrap();
-            if node_id < extra.base {
-                let n = &index.nodes[node_id as usize];
-                if n.kind().is_lazy() {
-                    let span_id = n.value_data as usize;
-                    span_id < index.lazy_spans.len()
-                        && index.lazy_spans[span_id].byte_len as u64
-                            >= crate::json_index::LAZY_PAGINATE_THRESHOLD
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-
-        let child_ids = if is_large_lazy {
-            index.get_lazy_children_page(node_id, 0, EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)?
-        } else {
-            index.get_children_any(node_id)?
-        };
-        let children: Vec<NodeDto> = child_ids.into_iter()
-            .map(|id| node_to_dto(index, id))
-            .collect();
-        return Ok(children);
-    }
-
-    let children: Vec<NodeDto> = index
-        .children_iter(node_id)
-        .take(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)
-        .map(|id| node_to_dto(index, id))
-        .collect();
-    Ok(children)
+    Ok(child_ids.into_iter().map(|id| node_to_dto(index, id)).collect())
 }
 
 #[tauri::command]
@@ -438,54 +439,22 @@ pub async fn get_children_page(
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
-    // Check if this node is lazy or extra — use the any-path
-    let needs_any = {
-        let extra = index.extra.lock().unwrap();
-        if node_id >= extra.base {
-            true
-        } else {
-            index.nodes[node_id as usize].kind().is_lazy()
+    let child_ids = match children_mode(index, node_id) {
+        ChildrenMode::Normal => {
+            return Ok(index
+                .children_iter(node_id)
+                .skip(offset)
+                .take(limit)
+                .map(|id| node_to_dto(index, id))
+                .collect());
         }
-    };
-
-    if needs_any {
-        // For large lazy nodes use paginated scan directly
-        let is_large_lazy = {
-            let extra = index.extra.lock().unwrap();
-            if node_id < extra.base {
-                let n = &index.nodes[node_id as usize];
-                if n.kind().is_lazy() {
-                    let span_id = n.value_data as usize;
-                    span_id < index.lazy_spans.len()
-                        && index.lazy_spans[span_id].byte_len as u64
-                            >= crate::json_index::LAZY_PAGINATE_THRESHOLD
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-
-        let child_ids = if is_large_lazy {
-            index.get_lazy_children_page(node_id, offset, limit)?
-        } else {
+        ChildrenMode::AnyPath => {
             let all = index.get_children_any(node_id)?;
             all.into_iter().skip(offset).take(limit).collect()
-        };
-        let children: Vec<NodeDto> = child_ids.into_iter()
-            .map(|id| node_to_dto(index, id))
-            .collect();
-        return Ok(children);
-    }
-
-    let children: Vec<NodeDto> = index
-        .children_iter(node_id)
-        .skip(offset)
-        .take(limit)
-        .map(|id| node_to_dto(index, id))
-        .collect();
-    Ok(children)
+        }
+        ChildrenMode::PagedLazy => index.get_lazy_children_page(node_id, offset, limit)?,
+    };
+    Ok(child_ids.into_iter().map(|id| node_to_dto(index, id)).collect())
 }
 
 #[tauri::command]
@@ -579,23 +548,12 @@ fn read_runtime_sample() -> Result<RuntimeSample, String> {
     })
 }
 
-/// Recursively expands the subtree rooted at `node_id`.
-/// Returns a list of (parent_id, children) pairs for every node that has children
-/// in the subtree. Capped at `max_nodes` total nodes (default 50_000) to
-/// avoid excessive IPC on very large subtrees.
-#[tauri::command]
-pub async fn expand_subtree(
-    node_id: u32,
-    max_nodes: Option<u32>,
-    state: State<'_, AppState>,
-    webview_window: tauri::WebviewWindow,
-) -> Result<Vec<(u32, Vec<NodeDto>)>, String> {
-    let idx = state.window_index(webview_window.label());
-    let guard = idx.read().unwrap();
-    let index = guard.as_ref().ok_or("Nessun file aperto")?;
-
-    let limit = max_nodes.unwrap_or(50_000) as usize;
-    let mut result: Vec<(u32, Vec<NodeDto>)> = Vec::new();
+/// Core BFS shared by `expand_subtree` and `expand_subtree_streaming`.
+/// Calls `on_pair(parent_id, children)` for every node that has children.
+fn bfs_expand<F>(index: &JsonIndex, node_id: u32, limit: usize, mut on_pair: F)
+where
+    F: FnMut(u32, Vec<NodeDto>),
+{
     let mut queue: Vec<u32> = vec![node_id];
     let mut qi = 0;
     let mut total_nodes: usize = 0;
@@ -632,10 +590,67 @@ pub async fn expand_subtree(
             .iter()
             .map(|&id| node_to_dto(index, id))
             .collect();
-        result.push((parent_id, children));
+        on_pair(parent_id, children);
     }
+}
 
+/// Recursively expands the subtree rooted at `node_id`.
+/// Returns a list of (parent_id, children) pairs. Capped at `max_nodes` (default 50_000).
+#[tauri::command]
+pub async fn expand_subtree(
+    node_id: u32,
+    max_nodes: Option<u32>,
+    state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
+) -> Result<Vec<(u32, Vec<NodeDto>)>, String> {
+    let idx = state.window_index(webview_window.label());
+    let guard = idx.read().unwrap();
+    let index = guard.as_ref().ok_or("Nessun file aperto")?;
+
+    let mut result: Vec<(u32, Vec<NodeDto>)> = Vec::new();
+    bfs_expand(index, node_id, max_nodes.unwrap_or(50_000) as usize, |parent_id, children| {
+        result.push((parent_id, children));
+    });
     Ok(result)
+}
+
+/// Numero di espansioni (parent, children) per evento "expand-batch".
+const EXPAND_STREAMING_BATCH: usize = 200;
+
+/// Variante streaming di `expand_subtree`: emette eventi Tauri "expand-batch" ogni
+/// `EXPAND_STREAMING_BATCH` pair e "expand-done" al termine.
+#[tauri::command]
+pub async fn expand_subtree_streaming(
+    node_id: u32,
+    max_nodes: Option<u32>,
+    state: State<'_, AppState>,
+    webview_window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    let idx = state.window_index(webview_window.label());
+    let window = webview_window.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = idx.read().unwrap();
+        let index = guard.as_ref().ok_or("Nessun file aperto")?;
+
+        let mut batch: Vec<(u32, Vec<NodeDto>)> = Vec::with_capacity(EXPAND_STREAMING_BATCH);
+        bfs_expand(index, node_id, max_nodes.unwrap_or(50_000) as usize, |parent_id, children| {
+            batch.push((parent_id, children));
+            if batch.len() >= EXPAND_STREAMING_BATCH {
+                let _ = window.emit("expand-batch", std::mem::take(&mut batch));
+            }
+        });
+
+        if !batch.is_empty() {
+            let _ = window.emit("expand-batch", batch);
+        }
+        let _ = window.emit("expand-done", ());
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -884,38 +899,81 @@ pub async fn expand_to(
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
-    let mut chain: Vec<u32> = Vec::new();
+    // Walk the parent chain using the original (possibly search-registered) IDs.
+    let mut search_chain: Vec<u32> = Vec::new();
     let mut current = node_id;
     loop {
         match index.parent_of_any(current) {
             None => break,
             Some(p) => {
-                chain.push(p);
+                search_chain.push(p);
                 current = p;
             }
         }
     }
-    chain.reverse(); // from root toward the direct parent
+    search_chain.reverse(); // root → ... → direct parent
 
-    let expansions: Vec<(u32, Vec<NodeDto>)> = chain
-        .into_iter()
-        .map(|ancestor_id| {
-            // get_children_any handles main, lazy, and extra nodes correctly.
-            // On error (e.g. parse failure), return empty children rather than
-            // falling back to children_iter which is invalid for lazy/extra nodes.
-            let children = index
-                .get_children_any(ancestor_id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|id| node_to_dto(index, id))
-                .collect();
-            (ancestor_id, children)
-        })
-        .collect();
+    // Build expansions, resolving canonical IDs along the way.
+    //
+    // `search_in_lazy_node` creates per-element sub-indices whose IDs are
+    // incompatible with the canonical sub-index produced by
+    // `materialize_lazy_node`. When the frontend later calls `get_children_any`
+    // for the same lazy parent it gets a *different* sub-index, so the
+    // search-registered child IDs never appear in the tree's expanded map and
+    // the selected node can't be scrolled into view.
+    //
+    // Fix: at each step, if the expected child ID (from the search chain) is
+    // not present in the canonical children, we match it by key (array index or
+    // object key) and substitute the canonical ID.  The final canonical ID is
+    // returned as `resolved_node_id` for the frontend to use.
+    let mut expansions: Vec<(u32, Vec<NodeDto>)> = Vec::with_capacity(search_chain.len());
+    let mut canonical_ancestor: Option<u32> = None;
+    let mut resolved_node_id = node_id;
 
-    let path = index.get_path_any(node_id);
+    let n = search_chain.len();
+    for i in 0..n {
+        // Use the canonical ancestor if we remapped in a previous step.
+        let ancestor_id = canonical_ancestor.unwrap_or(search_chain[i]);
 
-    Ok(ExpandToResult { expansions, path })
+        // The next expected node going toward the target (original/search ID).
+        let search_next = if i + 1 < n { search_chain[i + 1] } else { node_id };
+
+        let children_ids = index.get_children_any(ancestor_id).unwrap_or_default();
+        let children: Vec<NodeDto> = children_ids
+            .iter()
+            .map(|&id| node_to_dto(index, id))
+            .collect();
+        expansions.push((ancestor_id, children));
+
+        // Resolve the canonical ID for the next step.
+        if children_ids.contains(&search_next) {
+            // Already canonical — no remapping needed.
+            canonical_ancestor = Some(search_next);
+            resolved_node_id = search_next;
+        } else {
+            // ID mismatch: find the canonical child whose key matches the
+            // search-registered node's key (array index or object field name).
+            let search_key = node_key_string(index, search_next);
+            let resolved = search_key.and_then(|key| {
+                children_ids
+                    .iter()
+                    .find(|&&cid| node_key_string(index, cid).map_or(false, |k| k == key))
+                    .copied()
+            });
+            canonical_ancestor = resolved;
+            if let Some(canonical) = resolved {
+                resolved_node_id = canonical;
+            }
+        }
+    }
+
+    let path = index.get_path_any(resolved_node_id);
+
+    Ok(ExpandToResult {
+        expansions,
+        path,
+        resolved_node_id,
+    })
 }
 
 /// Compact format for get_expanded_slice: tuples instead of JSON objects with repeated

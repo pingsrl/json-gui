@@ -294,6 +294,7 @@ pub fn run() {
             commands::get_children_page,
             commands::get_runtime_stats,
             commands::expand_subtree,
+            commands::expand_subtree_streaming,
             commands::get_path,
             commands::search,
             commands::search_objects,

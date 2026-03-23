@@ -585,7 +585,7 @@ struct StreamCtx {
     parent_overflow_ids: Vec<u32>,
     parent_overflow_values: Vec<u32>,
     container_subtrees: Vec<u32>,
-    container_children: Vec<u16>,
+    container_children: Vec<u32>,
     keys: InternedStrings,
     val_strings: InternedStrings,
     nums_pool: Vec<f64>, // f64 pool: NodeKind::Num → nums_pool[value_data]
@@ -993,7 +993,7 @@ pub fn scan_json_string(bytes: &[u8], start: usize) -> usize {
     let mut pos = start + 1; // skip opening "
     while pos < bytes.len() {
         match bytes[pos] {
-            b'\\' => { pos += 2; } // skip escaped char
+            b'\\' => { pos = (pos + 2).min(bytes.len()); } // skip escaped char (clamp to avoid OOB)
             b'"' => { pos += 1; break; }
             _ => { pos += 1; }
         }
@@ -1309,32 +1309,15 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
         let is_container = matches!(first_byte, b'{' | b'[');
         let is_array_val = first_byte == b'[';
 
-        // Try fast forward scan with budget
+        // Try fast forward scan with budget; fall back to full scan for large values.
+        // We must NOT break here even for large values — there may be more entries after this one.
         let value_end = match scan_json_value_end_budgeted(bytes, value_start, FAST_SCAN_SMALL_VALUE_THRESHOLD) {
-            Some(end) => {
-                // Forward scan succeeded within budget
-                end
-            }
+            Some(end) => end,
             None => {
-                // Value is large — this is likely the last top-level entry.
-                // Use reverse scan to find value_end from EOF.
-                // We know the structure: value ends before root's closing bracket,
-                // possibly followed by whitespace and other entries.
-                // For the common case (large value is the last one), the end is
-                // just before the root's closing bracket.
-                //
-                // Use find_value_end_reverse to be precise.
-                let end = find_value_end_reverse(bytes, first_byte, value_start);
-                // After this large value we assume no more entries (common case).
-                // If there ARE more, they'll be missed — acceptable for now.
-                entries.push(TopLevelEntry {
-                    key,
-                    value_start,
-                    value_end: end,
-                    is_container,
-                    is_array: is_array_val,
-                });
-                break;
+                // Value exceeds quick-scan budget — do a full (unbounded) forward scan.
+                let remaining = bytes.len().saturating_sub(value_start);
+                scan_json_value_end_budgeted(bytes, value_start, remaining)
+                    .unwrap_or_else(|| find_value_end_reverse(bytes, first_byte, value_start))
             }
         };
 
@@ -1452,7 +1435,7 @@ pub struct JsonIndex {
     pub parent_overflow_ids: Vec<u32>,
     pub parent_overflow_values: Vec<u32>,
     pub container_subtrees: Vec<u32>, // subtree_len per container (same index as container_meta)
-    pub container_children: Vec<u16>, // children_len per container (capped at 65535)
+    pub container_children: Vec<u32>, // children_len per container
     pub keys: InternedStrings,
     pub val_strings: InternedStrings, // compact interned string-value pool
     pub nums_pool: Vec<f64>,          // numeric values: NodeKind::Num(idx) → nums_pool[idx]
@@ -1534,7 +1517,7 @@ impl JsonIndex {
     #[inline]
     fn children_len_for_node(&self, node: &Node) -> u32 {
         if node.kind().is_container() {
-            self.container_children[node.value_data as usize] as u32
+            self.container_children[node.value_data as usize]
         } else if node.kind().is_lazy() {
             self.lazy_child_counts[node.value_data as usize] as u32
         } else {
@@ -2066,7 +2049,7 @@ impl JsonIndex {
                 + self.parent_overflow_ids.capacity() * std::mem::size_of::<u32>()
                 + self.parent_overflow_values.capacity() * std::mem::size_of::<u32>(),
             container_meta: self.container_subtrees.capacity() * std::mem::size_of::<u32>()
-                + self.container_children.capacity() * std::mem::size_of::<u16>(),
+                + self.container_children.capacity() * std::mem::size_of::<u32>(),
             keys: self.keys.heap_bytes_estimate(),
             val_strings: self.val_strings.heap_bytes_estimate(),
             nums_pool: self.nums_pool.capacity() * std::mem::size_of::<f64>(),
@@ -2087,10 +2070,9 @@ impl JsonIndex {
         if delta != u8::MAX {
             return Some(id - delta as u32);
         }
-        let overflow_idx = self
-            .parent_overflow_ids
-            .binary_search(&id)
-            .expect("parent overflow entry missing");
+        let Ok(overflow_idx) = self.parent_overflow_ids.binary_search(&id) else {
+            return None; // dati inconsistenti — degrada senza crash
+        };
         Some(self.parent_overflow_values[overflow_idx])
     }
 
@@ -2259,7 +2241,7 @@ impl JsonIndex {
         // Set root subtree_len
         let meta_id = ctx.nodes[root_id as usize].value_data as usize;
         ctx.container_subtrees[meta_id] = ctx.nodes.len() as u32 - root_id - 1;
-        ctx.container_children[meta_id] = entries.len().min(u16::MAX as usize) as u16;
+        ctx.container_children[meta_id] = entries.len() as u32;
 
         drop(mmap);
         drop(file);
@@ -2307,7 +2289,7 @@ impl JsonIndex {
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
         let start = span.file_offset as usize;
         let end = (span.file_offset + span.byte_len) as usize;
-        let raw = &mmap[start..end];
+        let raw = &mmap[start..end.min(mmap.len())];
         let is_array = node.kind() == NodeKind::LazyArray;
 
         let elements = scan_json_elements(raw, is_array, offset, limit);
@@ -2315,21 +2297,31 @@ impl JsonIndex {
             return Ok(Vec::new());
         }
 
-        // Build a wrapper JSON string for these elements and parse as a sub-index
+        // Build a wrapper JSON string for these elements and parse as a sub-index.
+        // For arrays we use an object wrapper with keys = offset+i so that array
+        // indices in the sub-index reflect the correct global position (e.g. page 2
+        // at offset=1000 gets keys "1000", "1001", … instead of "0", "1", …).
+        // For objects the keys are already embedded in the raw bytes.
         let total_bytes: usize = elements.iter().map(|(s, e)| e - s).sum::<usize>()
             + elements.len().saturating_sub(1) // commas
             + 2; // brackets
         let mut wrapper = String::with_capacity(total_bytes);
-        wrapper.push(if is_array { '[' } else { '{' });
+        wrapper.push('{');
         for (i, (elem_start, elem_end)) in elements.iter().enumerate() {
             if i > 0 { wrapper.push(','); }
+            if is_array {
+                // Explicit numeric key so the sub-index stores the correct global index.
+                wrapper.push('"');
+                wrapper.push_str(&(offset + i).to_string());
+                wrapper.push_str("\":");
+            }
             let elem_bytes = &raw[*elem_start..*elem_end];
             match std::str::from_utf8(elem_bytes) {
                 Ok(s) => wrapper.push_str(s),
                 Err(_) => wrapper.push_str("null"),
             }
         }
-        wrapper.push(if is_array { ']' } else { '}' });
+        wrapper.push('}');
         drop(mmap);
 
         let sub_index = Arc::new(JsonIndex::from_str(&wrapper)?);
@@ -3424,27 +3416,34 @@ impl JsonIndex {
                 break;
             }
 
-            let elem_start = pos;
+            let outer_start = pos;
 
-            // For objects: skip the key part
+            // For objects: skip the key part (advance pos to value start).
+            // `outer_start` covers key+value for the pre-filter;
+            // `value_start` covers only the value for JSON parsing.
             if !is_array && pos < bytes.len() && bytes[pos] == b'"' {
                 pos = scan_json_string(bytes, pos);
                 while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b':') {
                     pos += 1;
                 }
             }
+            let value_start = pos;
 
             pos = scan_json_value_end(bytes, pos);
-            let elem_end = pos;
-            let elem_bytes = &bytes[elem_start..elem_end];
+            let elem_end = pos.min(bytes.len());
+
+            // Pre-filter on full element bytes (key+value for objects) to avoid false negatives.
+            let full_elem = &bytes[outer_start..elem_end];
+            // Parse only the value bytes (valid JSON for both arrays and objects).
+            let elem_bytes = &bytes[value_start..elem_end];
 
             // Fast byte pre-filter before parsing
             let maybe_matches = if case_sensitive {
-                memchr::memmem::find(elem_bytes, needle).is_some()
+                memchr::memmem::find(full_elem, needle).is_some()
             } else {
                 // Lowercase the element bytes for case-insensitive comparison.
                 // Elements are typically small (hundreds of bytes each) so this is fast.
-                let lower: Vec<u8> = elem_bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+                let lower: Vec<u8> = full_elem.iter().map(|b| b.to_ascii_lowercase()).collect();
                 memchr::memmem::find(&lower, needle).is_some()
             };
 
@@ -4455,6 +4454,43 @@ mod tests {
         assert!(path.contains("2"), "path dovrebbe contenere indice '2': {}", path);
     }
 
+    #[test]
+    fn search_in_lazy_object_finds_values_not_just_keys() {
+        // Bug: per nodi LazyObject, elem_bytes includeva "chiave": valore,
+        // quindi from_slice parsava solo la chiave e ignorava il valore.
+        // Ora elem_bytes contiene solo il valore → i match nei valori vengono trovati.
+        let json = r#"{"state":"ARIZ","region":"West","capital":"Phoenix"}"#;
+        // Usa un LazyArray che contiene un oggetto (per testare il caso is_array=false
+        // nel ciclo interno dell'oggetto che stiamo scansionando).
+        // In realtà search_in_lazy_node è chiamato su un nodo lazy il cui span è un
+        // oggetto o array — usiamo un array di oggetti per il test standard.
+        let json_arr = r#"[{"state":"ARIZ","region":"West"},{"state":"CA","region":"West"}]"#;
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(json_arr);
+
+        let results = index.search_in_lazy_node(lazy_id, "ARIZ", true, false, 10)
+            .expect("search failed");
+        assert_eq!(results.len(), 1, "deve trovare 1 risultato per ARIZ");
+    }
+
+    #[test]
+    fn search_in_lazy_object_node_finds_values() {
+        // Testa che i valori dentro un LazyObject siano cercati correttamente.
+        // Prima del fix, from_slice riceveva '"state": "ARIZ"' (key+value),
+        // parsava solo la stringa "state" e non trovava "ARIZ".
+        let json = r#"{"us":{"state":"ARIZ"},"ca":{"state":"BC"}}"#;
+        let (mut index, lazy_id, tmp) = make_lazy_index_from_json(json);
+        // Il nodo lazy è un LazyArray che wrappa l'intero JSON come array.
+        // Per testare LazyObject usiamo direttamente un oggetto come span.
+        // Modifica il nodo root in LazyObject per simulare un oggetto lazy.
+        index.nodes[lazy_id as usize].ktype = Node::make_ktype(NodeKind::LazyObject, None);
+
+        let results = index.search_in_lazy_node(lazy_id, "ARIZ", true, false, 10)
+            .expect("search failed");
+        // Con il fix, trova "ARIZ" nel valore dell'elemento "us"
+        assert!(!results.is_empty(), "deve trovare ARIZ nel valore di un LazyObject");
+        let _ = tmp; // mantieni il file temp vivo
+    }
+
     // ── Regressione: expand_subtree su nodi lazy non deve crashare ─────────────
     //
     // Bug: `has_children(extra_id)` accedeva a `self.nodes[extra_id as usize]`
@@ -4501,5 +4537,33 @@ mod tests {
                 .expect("get_children_any su foglia extra non deve fallire");
             assert!(grandchildren.is_empty(), "scalare non ha figli: id={}", child_id);
         }
+    }
+
+    // ── scan_top_level_entries: large entries must not stop the scan ──────────
+
+    #[test]
+    fn large_top_level_entry_followed_by_more_entries_all_indexed() {
+        use std::io::Write;
+        // Build an array where the first element's JSON value exceeds the fast-scan
+        // budget (FAST_SCAN_SMALL_VALUE_THRESHOLD). Before the fix, the scanner
+        // would break after this entry and miss subsequent ones.
+        let large_str = "x".repeat(FAST_SCAN_SMALL_VALUE_THRESHOLD + 256);
+        let json = format!("[{{\"data\": \"{large_str}\"}}, {{\"id\": 42}}, 99]");
+
+        let path = std::env::temp_dir().join("jgtest_large_entry_regression.json");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(json.as_bytes()).unwrap();
+        }
+        let index = JsonIndex::from_file(path.to_str().unwrap())
+            .expect("from_file must succeed");
+        std::fs::remove_file(&path).ok();
+
+        // Root array must contain all 3 entries, not just the first large one.
+        assert_eq!(
+            index.children_len(index.root),
+            3,
+            "tutti e 3 gli elementi devono essere indicizzati"
+        );
     }
 }

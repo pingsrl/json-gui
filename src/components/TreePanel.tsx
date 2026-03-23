@@ -24,7 +24,8 @@ export const TreePanel: FC = () => {
     expandAll,
     collapseAll,
     toggleNode,
-    setFocusedNode
+    setFocusedNode,
+    loadMoreChildren
   } = useJsonStore();
   const { t } = useI18n();
   const treeRef = useRef<HTMLDivElement>(null);
@@ -63,6 +64,28 @@ export const TreePanel: FC = () => {
       ),
     [rootChildren, expandedNodes, sliceStart, sliceEnd, subtreeSizeMap]
   );
+  // Auto-trigger load-more when a synthetic load-more node enters the viewport.
+  // This makes large arrays feel like infinite scroll — no explicit button click needed.
+  const autoLoadInFlight = useRef(new Set<string>());
+  useEffect(() => {
+    for (const vn of visibleSlice) {
+      if (
+        vn.node.synthetic_kind === "load-more" &&
+        vn.node.parent_node_id !== undefined &&
+        vn.node.next_offset !== undefined
+      ) {
+        const key = `${vn.node.parent_node_id}:${vn.node.next_offset}`;
+        if (!autoLoadInFlight.current.has(key)) {
+          autoLoadInFlight.current.add(key);
+          void loadMoreChildren(vn.node.parent_node_id, vn.node.next_offset).finally(() => {
+            autoLoadInFlight.current.delete(key);
+          });
+        }
+        break; // one at a time to avoid flooding
+      }
+    }
+  }, [visibleSlice, loadMoreChildren]);
+
   const focusedIndexRef = useRef<{ nodeId: number | null; index: number }>({
     nodeId: null,
     index: -1

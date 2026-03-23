@@ -2,6 +2,7 @@
 name = "json-gui"
 version = "1.0.0"
 edition = "2024"
+default-run = "json-gui"
 
 [lib]
 name = "json_gui_lib"

@@ -406,3 +406,133 @@ describe('makeLoadMoreNode', () => {
     expect(node.parent_node_id).toBe(5)
   })
 })
+
+// ── releaseDistantNodes — scroll dopo expand-all ──────────────────────────────
+//
+// Verifica il comportamento dell'albero quando, dopo expand-all, l'utente
+// sposta la barra di scorrimento a metà: i nodi distanti vengono liberati
+// dalla memoria mentre quelli nel viewport rimangono espansi.
+
+describe('releaseDistantNodes — scroll dopo expand-all', () => {
+  // Albero di test (3 livelli):
+  //   root(1)
+  //     sectionA(10) → [item1(100), item2(101), item3(102)]
+  //     sectionB(11) → [item4(200), item5(201), item6(202)]
+  //     sectionC(12) → [item7(300), item8(301), item9(302)]
+
+  const root = makeNode(1, null, 'object', 3)
+  const sectionA = makeNode(10, 'sectionA', 'array', 3)
+  const sectionB = makeNode(11, 'sectionB', 'array', 3)
+  const sectionC = makeNode(12, 'sectionC', 'array', 3)
+  const item1 = makeNode(100, '0')
+  const item2 = makeNode(101, '1')
+  const item3 = makeNode(102, '2')
+  const item4 = makeNode(200, '0')
+  const item5 = makeNode(201, '1')
+  const item6 = makeNode(202, '2')
+  const item7 = makeNode(300, '0')
+  const item8 = makeNode(301, '1')
+  const item9 = makeNode(302, '2')
+
+  const rootChildren = [sectionA, sectionB, sectionC]
+
+  // Stato dopo expand-all: tutte le sezioni sono espanse
+  function buildFullyExpandedMap(): Map<number, NodeDto[]> {
+    return new Map([
+      [root.id, rootChildren],
+      [sectionA.id, [item1, item2, item3]],
+      [sectionB.id, [item4, item5, item6]],
+      [sectionC.id, [item7, item8, item9]],
+    ])
+  }
+
+  // Simula releaseDistantNodes: rimuove le entry non nel visibleParentIds
+  function releaseDistantNodes(
+    expandedNodes: Map<number, NodeDto[]>,
+    visibleParentIds: ReadonlySet<number>,
+  ): Map<number, NodeDto[]> {
+    const next = new Map(expandedNodes)
+    for (const parentId of next.keys()) {
+      if (!visibleParentIds.has(parentId)) {
+        next.delete(parentId)
+      }
+    }
+    return next
+  }
+
+  it('dopo expand-all mostra tutti i nodi di tutte le sezioni', () => {
+    const expandedNodes = buildFullyExpandedMap()
+    const visible = buildVisibleNodes(rootChildren, expandedNodes)
+    // 3 sezioni + 3 figli per sezione = 12 VNode
+    expect(visible).toHaveLength(12)
+  })
+
+  it('dopo scroll a metà: sectionA e sectionC vengono liberate, sectionB rimane', () => {
+    const expandedNodes = buildFullyExpandedMap()
+
+    // Viewport a metà: solo sectionB è visibile (+ root sempre presente)
+    const visibleParentIds = new Set([root.id, sectionB.id])
+    const afterRelease = releaseDistantNodes(expandedNodes, visibleParentIds)
+
+    // sectionA e sectionC sono state rilasciate
+    expect(afterRelease.has(sectionA.id)).toBe(false)
+    expect(afterRelease.has(sectionC.id)).toBe(false)
+
+    // sectionB è ancora espansa
+    expect(afterRelease.has(sectionB.id)).toBe(true)
+    expect(afterRelease.get(sectionB.id)).toHaveLength(3)
+  })
+
+  it('buildVisibleNodes con nodi rilasciati mostra solo le sezioni non espanse', () => {
+    const expandedNodes = buildFullyExpandedMap()
+    const visibleParentIds = new Set([root.id, sectionB.id])
+    const afterRelease = releaseDistantNodes(expandedNodes, visibleParentIds)
+
+    const visible = buildVisibleNodes(rootChildren, afterRelease)
+    // sectionA: chiusa → 1 nodo; sectionB: aperta → 4 nodi; sectionC: chiusa → 1 nodo
+    expect(visible).toHaveLength(6)
+
+    const ids = visible.map((v) => v.node.id)
+    // sectionA è presente come foglia chiusa
+    expect(ids).toContain(sectionA.id)
+    // i figli di sectionB sono visibili
+    expect(ids).toContain(item4.id)
+    expect(ids).toContain(item5.id)
+    expect(ids).toContain(item6.id)
+    // sectionC è presente come foglia chiusa
+    expect(ids).toContain(sectionC.id)
+    // i figli di sectionA e sectionC non sono visibili
+    expect(ids).not.toContain(item1.id)
+    expect(ids).not.toContain(item9.id)
+  })
+
+  it('dopo la release, il re-expand di sectionA ripristina i suoi figli', () => {
+    const expandedNodes = buildFullyExpandedMap()
+    const visibleParentIds = new Set([root.id, sectionB.id])
+    const afterRelease = releaseDistantNodes(expandedNodes, visibleParentIds)
+
+    // L'utente torna in cima: sectionA viene ri-espansa (simulazione caricamento)
+    const reExpanded = new Map(afterRelease)
+    reExpanded.set(sectionA.id, [item1, item2, item3])
+
+    const visible = buildVisibleNodes(rootChildren, reExpanded)
+    const ids = visible.map((v) => v.node.id)
+    expect(ids).toContain(item1.id)
+    expect(ids).toContain(item2.id)
+    expect(ids).toContain(item3.id)
+  })
+
+  it('getVisibleSlice dopo scroll a metà restituisce solo i nodi della finestra', () => {
+    const expandedNodes = buildFullyExpandedMap()
+    // Preorder DFS con tutte le sezioni espanse (12 nodi totali):
+    // 0:sectionA, 1:item1, 2:item2, 3:item3, 4:sectionB, 5:item4,
+    // 6:item5, 7:item6, 8:sectionC, 9:item7, 10:item8, 11:item9
+    // Scroll a offset 6, limit 4 => item5, item6, sectionC, item7
+    const slice = getVisibleSlice(rootChildren, expandedNodes, 6, 4)
+    expect(slice).toHaveLength(4)
+    expect(slice[0].node.id).toBe(item5.id)   // 201
+    expect(slice[1].node.id).toBe(item6.id)   // 202
+    expect(slice[2].node.id).toBe(sectionC.id) // 12
+    expect(slice[3].node.id).toBe(item7.id)   // 300
+  })
+})

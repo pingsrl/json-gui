@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 export interface NodeDto {
   id: number;
@@ -50,6 +51,8 @@ interface FileInfo {
 interface ExpandToResult {
   expansions: [number, NodeDto[]][];
   path: string;
+  /** Canonical node ID resolved from search-registered IDs (may differ from input). */
+  resolved_node_id: number;
 }
 
 export interface RuntimeStats {
@@ -564,9 +567,17 @@ interface JsonStore {
   setSearchMode: (mode: SearchMode) => void;
   setSearchScopePath: (path: string) => void;
   setSearchSort: (sortMode: SearchSortMode) => void;
+  /** True dopo expand-all, false dopo collapse-all o apertura file. */
+  expandedAll: boolean;
   expandAll: () => Promise<void>;
   expandSubtree: (nodeId: number) => Promise<void>;
   collapseAll: () => void;
+  /**
+   * Libera dalla memoria le espansioni dei nodi non più vicini alla viewport.
+   * Chiamato dal componente di scroll con i parent IDs attualmente visibili
+   * (viewport ± buffer). Riduce l'uso di RAM su file grandi.
+   */
+  releaseDistantNodes: (visibleParentIds: ReadonlySet<number>) => void;
   clearSearch: () => void;
   refreshRuntimeStats: () => Promise<void>;
   showContextMenu: (cm: ContextMenuState) => void;
@@ -596,6 +607,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   searchResults: [],
   searching: false,
   loading: false,
+  expandedAll: false,
   runtimeStats: null,
   lastOperation: null,
   contextMenu: null,
@@ -637,6 +649,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
         rootNode: info.root_node,
         rootChildren,
         expandedNodes,
+        expandedAll: false,
         selectedNodeId: null,
         selectedNode: null,
         selectedNodePath: null,
@@ -686,6 +699,7 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
         rootNode: info.root_node,
         rootChildren,
         expandedNodes,
+        expandedAll: false,
         selectedNodeId: null,
         selectedNode: null,
         selectedNodePath: null,
@@ -990,6 +1004,9 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
     const startedAtMs = performance.now();
     try {
       const result = await invoke<ExpandToResult>("expand_to", { nodeId });
+      // resolved_node_id is the canonical ID (may differ from nodeId when the
+      // search result came from search_in_lazy_node which uses temporary sub-indices).
+      const resolvedId = result.resolved_node_id ?? nodeId;
       const { expandedNodes, rootChildren } = get();
       desiredExpandedState.clear();
       const next = new Map(expandedNodes);
@@ -1001,17 +1018,17 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
           nodeMapCache.set(child.id, child);
         }
       }
-      pathCache.set(nodeId, result.path);
+      pathCache.set(resolvedId, result.path);
 
-      const targetNode = nodeMapCache.get(nodeId) ?? null;
-      const selectedNodeSiblings = findSiblings(nodeId, rootChildren, next);
+      const targetNode = nodeMapCache.get(resolvedId) ?? null;
+      const selectedNodeSiblings = findSiblings(resolvedId, rootChildren, next);
       set({
         expandedNodes: next,
-        selectedNodeId: nodeId,
+        selectedNodeId: resolvedId,
         selectedNode: targetNode,
         selectedNodePath: result.path,
         selectedNodeSiblings,
-        focusedNodeId: nodeId
+        focusedNodeId: resolvedId
       });
     } finally {
       await finishOperationMeasurement("node-navigation", startedAtMs, set, get);
@@ -1021,30 +1038,46 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
   expandAll: async () => {
     const { rootNode, rootChildren } = get();
     if (rootChildren.length === 0 || !rootNode) return;
+
     const startedAtMs = performance.now();
-    set({ loading: true });
+    set({ loading: true, expandedAll: false });
+
+    const next = new Map<number, NodeDto[]>();
+
+    const unlistenBatch = await listen<[number, NodeDto[]][]>(
+      "expand-batch",
+      (event) => {
+        for (const [parentId, children] of event.payload) {
+          const parentNode =
+            parentId === rootNode.id ? rootNode : getKnownNode(parentId, rootChildren);
+          const nextChildren = maybeDecoratePartialChildren(parentNode, children);
+          next.set(parentId, nextChildren);
+          cacheSet(parentId, nextChildren);
+          registerChildren(parentId, children);
+          for (const child of children) nodeMapCache.set(child.id, child);
+        }
+        set({ expandedNodes: new Map(next) });
+      }
+    );
+
+    const unlistenDone = await listen("expand-done", async () => {
+      unlistenBatch();
+      unlistenDone();
+      desiredExpandedState.clear();
+      set({ loading: false, expandedAll: true });
+      await finishOperationMeasurement("expand-all-tree", startedAtMs, set, get);
+    });
+
     try {
-      const expansions = await invoke<[number, NodeDto[]][]>("expand_subtree", {
+      await invoke("expand_subtree_streaming", {
         nodeId: rootNode.id,
         maxNodes: MAX_SAFE_EXPAND_NODES
       });
-      const next = new Map<number, NodeDto[]>();
-      for (const [parentId, children] of expansions) {
-        const parentNode =
-          parentId === rootNode.id ? rootNode : getKnownNode(parentId, rootChildren);
-        const nextChildren = maybeDecoratePartialChildren(parentNode, children);
-        next.set(parentId, nextChildren);
-        cacheSet(parentId, nextChildren);
-        registerChildren(parentId, children);
-        for (const child of children) nodeMapCache.set(child.id, child);
-      }
-      desiredExpandedState.clear();
-      set({ expandedNodes: next });
     } catch (err) {
       console.error("expandAll failed:", err);
-    } finally {
+      unlistenBatch();
+      unlistenDone();
       set({ loading: false });
-      await finishOperationMeasurement("expand-all-tree", startedAtMs, set, get);
     }
   },
 
@@ -1082,7 +1115,23 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       selectedNodeId !== null
         ? findSiblings(selectedNodeId, rootChildren, next)
         : null;
-    set({ expandedNodes: next, selectedNodeSiblings });
+    set({ expandedNodes: next, expandedAll: false, selectedNodeSiblings });
+  },
+
+  releaseDistantNodes: (visibleParentIds: ReadonlySet<number>) => {
+    const { expandedNodes } = get();
+    let changed = false;
+    const next = new Map(expandedNodes);
+    for (const parentId of next.keys()) {
+      if (!visibleParentIds.has(parentId)) {
+        next.delete(parentId);
+        childrenCache.delete(parentId);
+        changed = true;
+      }
+    }
+    if (changed) {
+      set({ expandedNodes: next });
+    }
   },
 
   clearSearch: () =>
