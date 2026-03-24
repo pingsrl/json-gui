@@ -1007,22 +1007,33 @@ export const useJsonStore = create<JsonStore>((set, get) => ({
       // resolved_node_id is the canonical ID (may differ from nodeId when the
       // search result came from search_in_lazy_node which uses temporary sub-indices).
       const resolvedId = result.resolved_node_id ?? nodeId;
-      const { expandedNodes, rootChildren } = get();
+      const { expandedNodes, rootChildren, rootNode } = get();
       desiredExpandedState.clear();
       const next = new Map(expandedNodes);
+      let nextRootChildren = rootChildren;
       for (const [id, children] of result.expansions) {
-        next.set(id, children);
-        cacheSet(id, children);
+        const parentNode =
+          rootNode !== null && id === rootNode.id
+            ? rootNode
+            : getKnownNode(id, nextRootChildren);
+        const nextChildren = maybeDecoratePartialChildren(parentNode, children);
+        cacheSet(id, nextChildren);
         registerChildren(id, children);
-        for (const child of children) {
+        for (const child of nextChildren) {
           nodeMapCache.set(child.id, child);
+        }
+        if (rootNode !== null && id === rootNode.id) {
+          nextRootChildren = nextChildren;
+        } else {
+          next.set(id, nextChildren);
         }
       }
       pathCache.set(resolvedId, result.path);
 
       const targetNode = nodeMapCache.get(resolvedId) ?? null;
-      const selectedNodeSiblings = findSiblings(resolvedId, rootChildren, next);
+      const selectedNodeSiblings = findSiblings(resolvedId, nextRootChildren, next);
       set({
+        rootChildren: nextRootChildren,
         expandedNodes: next,
         selectedNodeId: resolvedId,
         selectedNode: targetNode,

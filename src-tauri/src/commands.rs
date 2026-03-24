@@ -1,6 +1,6 @@
 use crate::json_index::{
     JsonIndex, NodeKey, NodeKind, ObjectSearchFilter as IndexObjectSearchFilter,
-    ObjectSearchOperator, VisibleSliceRow,
+    ObjectSearchOperator, SUB_INDEX_ID_RANGE, VisibleSliceRow,
 };
 // LazyObject and LazyArray are part of NodeKind, accessed via pattern matching
 use crate::schema;
@@ -361,6 +361,111 @@ fn children_mode(index: &JsonIndex, node_id: u32) -> ChildrenMode {
     }
 }
 
+fn extra_scope_context(
+    index: &JsonIndex,
+    node_id: u32,
+) -> Option<(Arc<JsonIndex>, u32, usize, u32)> {
+    let extra = index.extra.lock().unwrap();
+    let base = extra.base;
+    if node_id < base {
+        return None;
+    }
+
+    let inner = node_id - base;
+    let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+    let sub_id = inner % SUB_INDEX_ID_RANGE;
+    let sub_index = Arc::clone(extra.sub_indices.get(sub_idx)?);
+    Some((sub_index, sub_id, sub_idx, base))
+}
+
+fn map_extra_scope_ids(base: u32, sub_idx: usize, ids: Vec<u32>) -> Vec<u32> {
+    ids.into_iter()
+        .map(|sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
+        .collect()
+}
+
+fn is_descendant_of_any(index: &JsonIndex, mut node_id: u32, ancestor_id: u32) -> bool {
+    while let Some(parent_id) = index.parent_of_any(node_id) {
+        if parent_id == ancestor_id {
+            return true;
+        }
+        node_id = parent_id;
+    }
+    false
+}
+
+fn fetch_children_page_ids(
+    index: &JsonIndex,
+    node_id: u32,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<u32>, String> {
+    match children_mode(index, node_id) {
+        ChildrenMode::Normal => Ok(index
+            .children_iter(node_id)
+            .skip(offset)
+            .take(limit)
+            .collect()),
+        ChildrenMode::AnyPath => Ok(index
+            .get_children_any(node_id)?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect()),
+        ChildrenMode::PagedLazy => index.get_lazy_children_page(node_id, offset, limit),
+    }
+}
+
+fn collect_navigation_children_ids(
+    index: &JsonIndex,
+    parent_id: u32,
+    expected_child_key: &str,
+) -> Result<Vec<u32>, String> {
+    let page_size = EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT;
+    let count_hint = index.children_count_any(parent_id) as usize;
+    let is_paged_lazy = matches!(children_mode(index, parent_id), ChildrenMode::PagedLazy);
+    let use_paging = is_paged_lazy || count_hint > page_size;
+
+    if !use_paging {
+        return index.get_children_any(parent_id);
+    }
+
+    let target_offset_hint = expected_child_key.parse::<usize>().ok();
+    let mut collected: Vec<u32> = Vec::new();
+    let mut offset = 0usize;
+
+    loop {
+        let page = fetch_children_page_ids(index, parent_id, offset, page_size)?;
+        if page.is_empty() {
+            break;
+        }
+
+        let found = page.iter().any(|&child_id| {
+            node_key_string(index, child_id).is_some_and(|k| k == expected_child_key)
+        });
+        let page_len = page.len();
+        collected.extend(page);
+        offset += page_len;
+
+        if found {
+            break;
+        }
+        if let Some(target_offset) = target_offset_hint {
+            if offset > target_offset {
+                break;
+            }
+        }
+        if page_len < page_size {
+            break;
+        }
+        if !is_paged_lazy && count_hint > 0 && offset >= count_hint {
+            break;
+        }
+    }
+
+    Ok(collected)
+}
+
 #[tauri::command]
 pub async fn open_file(
     path: String,
@@ -421,7 +526,10 @@ pub async fn get_children(
             index.get_lazy_children_page(node_id, 0, EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT)?
         }
     };
-    Ok(child_ids.into_iter().map(|id| node_to_dto(index, id)).collect())
+    Ok(child_ids
+        .into_iter()
+        .map(|id| node_to_dto(index, id))
+        .collect())
 }
 
 #[tauri::command]
@@ -454,7 +562,10 @@ pub async fn get_children_page(
         }
         ChildrenMode::PagedLazy => index.get_lazy_children_page(node_id, offset, limit)?,
     };
-    Ok(child_ids.into_iter().map(|id| node_to_dto(index, id)).collect())
+    Ok(child_ids
+        .into_iter()
+        .map(|id| node_to_dto(index, id))
+        .collect())
 }
 
 #[tauri::command]
@@ -608,9 +719,14 @@ pub async fn expand_subtree(
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
     let mut result: Vec<(u32, Vec<NodeDto>)> = Vec::new();
-    bfs_expand(index, node_id, max_nodes.unwrap_or(50_000) as usize, |parent_id, children| {
-        result.push((parent_id, children));
-    });
+    bfs_expand(
+        index,
+        node_id,
+        max_nodes.unwrap_or(50_000) as usize,
+        |parent_id, children| {
+            result.push((parent_id, children));
+        },
+    );
     Ok(result)
 }
 
@@ -634,12 +750,17 @@ pub async fn expand_subtree_streaming(
         let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
         let mut batch: Vec<(u32, Vec<NodeDto>)> = Vec::with_capacity(EXPAND_STREAMING_BATCH);
-        bfs_expand(index, node_id, max_nodes.unwrap_or(50_000) as usize, |parent_id, children| {
-            batch.push((parent_id, children));
-            if batch.len() >= EXPAND_STREAMING_BATCH {
-                let _ = window.emit("expand-batch", std::mem::take(&mut batch));
-            }
-        });
+        bfs_expand(
+            index,
+            node_id,
+            max_nodes.unwrap_or(50_000) as usize,
+            |parent_id, children| {
+                batch.push((parent_id, children));
+                if batch.len() >= EXPAND_STREAMING_BATCH {
+                    let _ = window.emit("expand-batch", std::mem::take(&mut batch));
+                }
+            },
+        );
 
         if !batch.is_empty() {
             let _ = window.emit("expand-batch", batch);
@@ -674,52 +795,140 @@ pub async fn search(
     let idx = state.window_index(webview_window.label());
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
-    let mut results = index.search(
-        &query.text,
-        &query.target,
-        query.case_sensitive,
-        query.regex,
-        query.exact_match,
-        query.max_results,
-        query.path.as_deref(),
-        query.multiline,
-        query.dot_all,
-    );
+    let scope_path = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let scope_node_id = scope_path.and_then(|path| index.resolve_path_any(path));
+    if scope_path.is_some() && scope_node_id.is_none() {
+        return Ok(Vec::new());
+    }
 
-    // Also search inside lazy spans (not covered by the main index).
-    // Only when not regex (streaming search uses plain text matching internally).
-    if !query.regex && results.len() < query.max_results {
-        let remaining = query.max_results.saturating_sub(results.len());
-        // Determine which lazy nodes are in scope
-        let scope_node_id = query.path.as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .and_then(|p| index.resolve_path(p));
+    let results = match scope_node_id {
+        Some(scope_id) => {
+            if let Some((sub_index, sub_id, sub_idx, base)) = extra_scope_context(index, scope_id) {
+                let local_path = sub_index.get_path(sub_id);
+                map_extra_scope_ids(
+                    base,
+                    sub_idx,
+                    sub_index.search(
+                        &query.text,
+                        &query.target,
+                        query.case_sensitive,
+                        query.regex,
+                        query.exact_match,
+                        query.max_results,
+                        Some(local_path.as_str()),
+                        query.multiline,
+                        query.dot_all,
+                    ),
+                )
+            } else if index.nodes[scope_id as usize].kind().is_lazy() {
+                index.search_in_lazy_node_with_options(
+                    scope_id,
+                    &query.text,
+                    &query.target,
+                    query.case_sensitive,
+                    query.regex,
+                    query.exact_match,
+                    query.max_results,
+                    query.multiline,
+                    query.dot_all,
+                )?
+            } else {
+                let scope_path = index.get_path(scope_id);
+                let mut scoped_results = index.search(
+                    &query.text,
+                    &query.target,
+                    query.case_sensitive,
+                    query.regex,
+                    query.exact_match,
+                    query.max_results,
+                    Some(scope_path.as_str()),
+                    query.multiline,
+                    query.dot_all,
+                );
 
-        for (id, node) in index.nodes.iter().enumerate() {
-            if !node.kind().is_lazy() {
-                continue;
-            }
-            // If a scope path was given, only search lazy nodes that are descendants of it
-            if let Some(scope_id) = scope_node_id {
-                if (id as u32) != scope_id && index.parent_of(id as u32) != Some(scope_id) {
-                    continue;
+                if scoped_results.len() < query.max_results {
+                    for (id, node) in index.nodes.iter().enumerate() {
+                        if !node.kind().is_lazy() {
+                            continue;
+                        }
+                        let lazy_id = id as u32;
+                        if lazy_id != scope_id && !is_descendant_of_any(index, lazy_id, scope_id) {
+                            continue;
+                        }
+                        let remaining = query.max_results.saturating_sub(scoped_results.len());
+                        if remaining == 0 {
+                            break;
+                        }
+                        if let Ok(lazy_results) = index.search_in_lazy_node_with_options(
+                            lazy_id,
+                            &query.text,
+                            &query.target,
+                            query.case_sensitive,
+                            query.regex,
+                            query.exact_match,
+                            remaining,
+                            query.multiline,
+                            query.dot_all,
+                        ) {
+                            scoped_results.extend(lazy_results);
+                        }
+                        if scoped_results.len() >= query.max_results {
+                            break;
+                        }
+                    }
                 }
-            }
-            if let Ok(lazy_results) = index.search_in_lazy_node(
-                id as u32,
-                &query.text,
-                query.case_sensitive,
-                query.exact_match,
-                remaining.saturating_sub(results.len()),
-            ) {
-                results.extend(lazy_results);
-            }
-            if results.len() >= query.max_results {
-                break;
+
+                scoped_results
             }
         }
-    }
+        None => {
+            let mut unscoped_results = index.search(
+                &query.text,
+                &query.target,
+                query.case_sensitive,
+                query.regex,
+                query.exact_match,
+                query.max_results,
+                None,
+                query.multiline,
+                query.dot_all,
+            );
+
+            if unscoped_results.len() < query.max_results {
+                for (id, node) in index.nodes.iter().enumerate() {
+                    if !node.kind().is_lazy() {
+                        continue;
+                    }
+                    let remaining = query.max_results.saturating_sub(unscoped_results.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    if let Ok(lazy_results) = index.search_in_lazy_node_with_options(
+                        id as u32,
+                        &query.text,
+                        &query.target,
+                        query.case_sensitive,
+                        query.regex,
+                        query.exact_match,
+                        remaining,
+                        query.multiline,
+                        query.dot_all,
+                    ) {
+                        unscoped_results.extend(lazy_results);
+                    }
+                    if unscoped_results.len() >= query.max_results {
+                        break;
+                    }
+                }
+            }
+
+            unscoped_results
+        }
+    };
 
     let base = { index.extra.lock().unwrap().base };
     let dtos: Vec<SearchResult> = results
@@ -742,10 +951,7 @@ pub async fn search(
             }
             let node = &index.nodes[id as usize];
             let value_preview = match node.kind() {
-                NodeKind::Str => format!(
-                    "\"{}\"",
-                    truncate_str(index.str_val_of_node(node), 60)
-                ),
+                NodeKind::Str => format!("\"{}\"", truncate_str(index.str_val_of_node(node), 60)),
                 NodeKind::Num => index.number_to_string(id),
                 NodeKind::Bool => (node.value_data != 0).to_string(),
                 NodeKind::Null => "null".to_string(),
@@ -831,13 +1037,58 @@ pub async fn search_objects(
         .collect::<Result<Vec<_>, String>>()?;
 
     let match_preview: Arc<str> = Arc::from(build_object_match_preview(&query.filters).as_str());
-    let ids = index.search_objects(
-        &filters,
-        query.key_case_sensitive,
-        query.value_case_sensitive,
-        query.max_results,
-        query.path.as_deref(),
-    );
+    let scope_path = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let scope_node_id = scope_path.and_then(|path| index.resolve_path_any(path));
+    if scope_path.is_some() && scope_node_id.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let ids = match scope_node_id {
+        Some(scope_id) => {
+            if let Some((sub_index, sub_id, sub_idx, base)) = extra_scope_context(index, scope_id) {
+                let local_path = sub_index.get_path(sub_id);
+                map_extra_scope_ids(
+                    base,
+                    sub_idx,
+                    sub_index.search_objects(
+                        &filters,
+                        query.key_case_sensitive,
+                        query.value_case_sensitive,
+                        query.max_results,
+                        Some(local_path.as_str()),
+                    ),
+                )
+            } else if index.nodes[scope_id as usize].kind().is_lazy() {
+                index.search_objects_in_lazy_node(
+                    scope_id,
+                    &filters,
+                    query.key_case_sensitive,
+                    query.value_case_sensitive,
+                    query.max_results,
+                )?
+            } else {
+                let scope_path = index.get_path(scope_id);
+                index.search_objects(
+                    &filters,
+                    query.key_case_sensitive,
+                    query.value_case_sensitive,
+                    query.max_results,
+                    Some(scope_path.as_str()),
+                )
+            }
+        }
+        None => index.search_objects(
+            &filters,
+            query.key_case_sensitive,
+            query.value_case_sensitive,
+            query.max_results,
+            None,
+        ),
+    };
     let base = { index.extra.lock().unwrap().base };
     let dtos = ids
         .into_iter()
@@ -899,72 +1150,40 @@ pub async fn expand_to(
     let guard = idx.read().unwrap();
     let index = guard.as_ref().ok_or("Nessun file aperto")?;
 
-    // Walk the parent chain using the original (possibly search-registered) IDs.
-    let mut search_chain: Vec<u32> = Vec::new();
-    let mut current = node_id;
-    loop {
-        match index.parent_of_any(current) {
-            None => break,
-            Some(p) => {
-                search_chain.push(p);
-                current = p;
-            }
-        }
-    }
-    search_chain.reverse(); // root → ... → direct parent
+    let search_path = index.get_path_any(node_id);
+    let segments: Vec<&str> = search_path
+        .trim()
+        .strip_prefix("$.")
+        .or_else(|| search_path.trim().strip_prefix('$'))
+        .map(|path| {
+            path.split('.')
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-    // Build expansions, resolving canonical IDs along the way.
-    //
-    // `search_in_lazy_node` creates per-element sub-indices whose IDs are
-    // incompatible with the canonical sub-index produced by
-    // `materialize_lazy_node`. When the frontend later calls `get_children_any`
-    // for the same lazy parent it gets a *different* sub-index, so the
-    // search-registered child IDs never appear in the tree's expanded map and
-    // the selected node can't be scrolled into view.
-    //
-    // Fix: at each step, if the expected child ID (from the search chain) is
-    // not present in the canonical children, we match it by key (array index or
-    // object key) and substitute the canonical ID.  The final canonical ID is
-    // returned as `resolved_node_id` for the frontend to use.
-    let mut expansions: Vec<(u32, Vec<NodeDto>)> = Vec::with_capacity(search_chain.len());
-    let mut canonical_ancestor: Option<u32> = None;
-    let mut resolved_node_id = node_id;
+    let mut expansions: Vec<(u32, Vec<NodeDto>)> = Vec::with_capacity(segments.len());
+    let mut current = index.root;
+    let mut resolved_node_id = current;
 
-    let n = search_chain.len();
-    for i in 0..n {
-        // Use the canonical ancestor if we remapped in a previous step.
-        let ancestor_id = canonical_ancestor.unwrap_or(search_chain[i]);
-
-        // The next expected node going toward the target (original/search ID).
-        let search_next = if i + 1 < n { search_chain[i + 1] } else { node_id };
-
-        let children_ids = index.get_children_any(ancestor_id).unwrap_or_default();
+    for segment in segments {
+        let children_ids =
+            collect_navigation_children_ids(index, current, segment).unwrap_or_default();
         let children: Vec<NodeDto> = children_ids
             .iter()
             .map(|&id| node_to_dto(index, id))
             .collect();
-        expansions.push((ancestor_id, children));
+        expansions.push((current, children));
 
-        // Resolve the canonical ID for the next step.
-        if children_ids.contains(&search_next) {
-            // Already canonical — no remapping needed.
-            canonical_ancestor = Some(search_next);
-            resolved_node_id = search_next;
-        } else {
-            // ID mismatch: find the canonical child whose key matches the
-            // search-registered node's key (array index or object field name).
-            let search_key = node_key_string(index, search_next);
-            let resolved = search_key.and_then(|key| {
-                children_ids
-                    .iter()
-                    .find(|&&cid| node_key_string(index, cid).map_or(false, |k| k == key))
-                    .copied()
-            });
-            canonical_ancestor = resolved;
-            if let Some(canonical) = resolved {
-                resolved_node_id = canonical;
-            }
-        }
+        let Some(next_id) = children_ids
+            .iter()
+            .find(|&&child_id| node_key_string(index, child_id).is_some_and(|k| k == segment))
+            .copied()
+        else {
+            break;
+        };
+        current = next_id;
+        resolved_node_id = next_id;
     }
 
     let path = index.get_path_any(resolved_node_id);

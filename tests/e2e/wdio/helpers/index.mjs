@@ -13,15 +13,15 @@ export async function waitForApp(browser, timeout = 10000) {
  * Carica il file fixture di test tramite lo store Zustand.
  * Equivale a aprire il file dall'app.
  */
-export async function loadFixture(browser) {
+export async function loadFixture(browser, fixturePath = global.FIXTURE_PATH, timeout = 10000) {
   await waitForApp(browser);
-  await browser.execute(async (fixturePath) => {
-    await window.__jsonStore.getState().openFile(fixturePath);
-  }, global.FIXTURE_PATH);
+  await browser.execute(async (path) => {
+    await window.__jsonStore.getState().openFile(path);
+  }, fixturePath);
   // Aspetta che rootNode sia popolato
   await browser.waitUntil(
     () => browser.execute(() => window.__jsonStore.getState().rootNode !== null),
-    { timeout: 10000, timeoutMsg: 'rootNode non popolato dopo openFile' }
+    { timeout, timeoutMsg: 'rootNode non popolato dopo openFile' }
   );
 }
 

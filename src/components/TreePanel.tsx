@@ -14,6 +14,19 @@ import { TreeNode } from "./TreeNode";
 
 const SLICE_PADDING = 40;
 
+function isNodeFullyVisible(
+  container: HTMLDivElement | null,
+  nodeId: number
+): boolean {
+  if (!container) return false;
+  const row = container.querySelector<HTMLElement>(`[data-node-id="${nodeId}"]`);
+  if (!row) return false;
+
+  const containerRect = container.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  return rowRect.top >= containerRect.top && rowRect.bottom <= containerRect.bottom;
+}
+
 export const TreePanel: FC = () => {
   const {
     rootNode,
@@ -90,6 +103,7 @@ export const TreePanel: FC = () => {
     nodeId: null,
     index: -1
   });
+  const pendingScrollNodeIdRef = useRef<number | null>(null);
   const treeStateRef = useRef({ rootChildren, expandedNodes });
   treeStateRef.current = { rootChildren, expandedNodes };
 
@@ -125,14 +139,48 @@ export const TreePanel: FC = () => {
     };
   }, [expandedNodes, focusedNodeId, rootChildren]);
 
-  // Scroll al nodo selezionato — scatta SOLO quando selectedNodeId cambia
+  useEffect(() => {
+    pendingScrollNodeIdRef.current = selectedNodeId;
+  }, [selectedNodeId]);
+
+  // Scroll al nodo selezionato. Per i nodi oltre la prima pagina lazy serve
+  // ritentare fino a quando il virtualizer ha realmente renderizzato la riga.
   useEffect(() => {
     if (selectedNodeId === null) return;
+    if (pendingScrollNodeIdRef.current !== selectedNodeId) return;
+
     const { rootChildren, expandedNodes } = treeStateRef.current;
     const idx = findVisibleNodeIndex(rootChildren, expandedNodes, selectedNodeId);
-    if (idx >= 0) rowVirtualizer.scrollToIndex(idx, { align: "center" });
+    if (idx < 0) return;
+
     focusedIndexRef.current = { nodeId: selectedNodeId, index: idx };
-  }, [selectedNodeId, rowVirtualizer]);
+
+    let frameId = 0;
+    let attempts = 0;
+    const maxAttempts = 6;
+
+    const ensureVisible = () => {
+      if (pendingScrollNodeIdRef.current !== selectedNodeId) {
+        return;
+      }
+
+      rowVirtualizer.scrollToIndex(idx, { align: "center" });
+      if (isNodeFullyVisible(treeRef.current, selectedNodeId) || attempts >= maxAttempts) {
+        pendingScrollNodeIdRef.current = null;
+        return;
+      }
+
+      attempts += 1;
+      frameId = requestAnimationFrame(ensureVisible);
+    };
+
+    ensureVisible();
+    return () => {
+      if (frameId !== 0) {
+        cancelAnimationFrame(frameId);
+      }
+    };
+  }, [expandedNodes, rootChildren, rowVirtualizer, selectedNodeId, visibleCount]);
 
   // Ref sempre aggiornato con i valori correnti — evita di ri-registrare il listener
   // ad ogni expand/collapse (da N dipendenze a 1)

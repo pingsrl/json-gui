@@ -1,14 +1,53 @@
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '../../..');
+const BENCH_ENV_PATH = path.resolve(ROOT, '.bench.env');
+
+function readDotEnv(filePath) {
+  try {
+    const env = {};
+    const content = fs.readFileSync(filePath, 'utf8');
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eq = line.indexOf('=');
+      if (eq <= 0) continue;
+      const key = line.slice(0, eq).trim();
+      const value = line.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '');
+      env[key] = value;
+    }
+    return env;
+  } catch {
+    return {};
+  }
+}
+
+const benchEnv = readDotEnv(BENCH_ENV_PATH);
 
 const APP_BIN = process.env.TAURI_APP_PATH
-  || path.resolve(ROOT, 'src-tauri/target/debug/json-gui');
+  || path.resolve(ROOT, 'scripts/wdio-app-wrapper.mjs');
 
-const FIXTURE_PATH = path.resolve(__dirname, '../fixtures/test.json');
+if (process.env.RUN_LARGE_FIXTURE_E2E === undefined && benchEnv.RUN_LARGE_FIXTURE_E2E) {
+  process.env.RUN_LARGE_FIXTURE_E2E = benchEnv.RUN_LARGE_FIXTURE_E2E;
+}
+if (process.env.E2E_LARGE_FIXTURE_PATH === undefined && benchEnv.E2E_LARGE_FIXTURE_PATH) {
+  process.env.E2E_LARGE_FIXTURE_PATH = benchEnv.E2E_LARGE_FIXTURE_PATH;
+}
+if (
+  process.env.FIXTURE_PATH === undefined &&
+  process.env.RUN_LARGE_FIXTURE_E2E === '1' &&
+  process.env.E2E_LARGE_FIXTURE_PATH
+) {
+  process.env.FIXTURE_PATH = process.env.E2E_LARGE_FIXTURE_PATH;
+}
+
+const FIXTURE_PATH = process.env.FIXTURE_PATH
+  ? path.resolve(process.env.FIXTURE_PATH)
+  : path.resolve(__dirname, '../fixtures/test.json');
 const VITE_PORT = 1420;
 
 let viteProcess = null;
@@ -40,8 +79,9 @@ export const config = {
   specs: ['./specs/**/*.spec.mjs'],
   maxInstances: 1,
   capabilities: [{
+    maxInstances: 1,
     'tauri:options': {
-      application: APP_BIN,
+      binary: APP_BIN,
     },
   }],
   logLevel: 'warn',

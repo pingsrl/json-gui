@@ -22,7 +22,6 @@ const EXPAND_SUBTREE_INLINE_PAGE: usize = 1_000;
 /// Global ID for extra node: base + sub_idx * SUB_INDEX_ID_RANGE + sub_id.
 pub const SUB_INDEX_ID_RANGE: u32 = 1 << 16; // 65536
 
-
 // ---- InternedStrings ----
 // Compact pool for string values: a single Vec<u8> for bytes + open-addressing
 // hash table on Vec<u32> (4 bytes/slot). Zero allocations per string,
@@ -213,7 +212,6 @@ impl InternedStrings {
     }
 }
 
-
 fn shrink_vec_if_wasteful<T>(vec: &mut Vec<T>) {
     // Only shrink if wasted capacity exceeds 25 % of used length (or > 4 MB
     // of raw bytes) — avoids an expensive realloc+copy on large Vecs where
@@ -261,9 +259,9 @@ pub enum NodeKey {
 pub enum NodeKind {
     Object = 0,
     Array = 1,
-    Str = 2,       // value_data = InternedStrings id in val_strings
-    Num = 3,       // value_data = inline i31 or nums_pool index
-    Bool = 4,      // value_data = 0 (false) or 1 (true)
+    Str = 2,  // value_data = InternedStrings id in val_strings
+    Num = 3,  // value_data = inline i31 or nums_pool index
+    Bool = 4, // value_data = 0 (false) or 1 (true)
     Null = 5,
     LazyObject = 6, // value_data = index into lazy_spans; children not parsed yet
     LazyArray = 7,  // value_data = index into lazy_spans; children not parsed yet
@@ -670,7 +668,13 @@ impl StreamCtx {
     /// Allocates a lazy container node (LazyObject or LazyArray).
     /// `span_id` = index into lazy_spans for this node's raw bytes.
     /// The parent MUST be a normal container (Object/Array) already allocated.
-    fn alloc_lazy(&mut self, kind: NodeKind, key: Option<NodeKey>, span_id: u32, parent: u32) -> u32 {
+    fn alloc_lazy(
+        &mut self,
+        kind: NodeKind,
+        key: Option<NodeKey>,
+        span_id: u32,
+        parent: u32,
+    ) -> u32 {
         debug_assert!(kind.is_lazy());
         let id = self.nodes.len() as u32;
         self.nodes.push(Node {
@@ -714,7 +718,13 @@ impl<'a> StreamCtxPtr<'a> {
     fn with_mut<R>(self, f: impl FnOnce(&mut StreamCtx) -> R) -> R {
         // SAFETY: parsing is strictly single-threaded and synchronous; the context
         // outlives all visitors/seeds created during parse_streaming_with_cap.
-        unsafe { f(self.ptr.as_ptr().as_mut().expect("stream ctx pointer is null")) }
+        unsafe {
+            f(self
+                .ptr
+                .as_ptr()
+                .as_mut()
+                .expect("stream ctx pointer is null"))
+        }
     }
 }
 
@@ -831,25 +841,35 @@ impl<'de> Visitor<'de> for ValVisitor {
         let id = self
             .ctx
             .with_mut(|ctx| ctx.alloc(NodeKind::Object, self.key, 0, self.parent));
-        let use_lazy = self.ctx.with_mut(|ctx| ctx.lazy_depth > 0 && self.depth + 1 >= ctx.lazy_depth);
+        let use_lazy = self
+            .ctx
+            .with_mut(|ctx| ctx.lazy_depth > 0 && self.depth + 1 >= ctx.lazy_depth);
         while let Some(key_str) = map.next_key::<Cow<'de, str>>()? {
             let kid = self.ctx.with_mut(|ctx| ctx.keys.intern(&key_str));
             if use_lazy {
                 // Consume value as raw LazyValue
-                let raw_val = map.next_value::<sonic_rs::LazyValue>()
+                let raw_val = map
+                    .next_value::<sonic_rs::LazyValue>()
                     .map_err(|e| de::Error::custom(e.to_string()))?;
                 let raw_bytes = raw_val.as_raw_str().as_bytes();
                 match raw_bytes.first().copied() {
                     Some(b'{') | Some(b'[') => {
                         let is_obj = raw_bytes[0] == b'{';
-                        let kind = if is_obj { NodeKind::LazyObject } else { NodeKind::LazyArray };
+                        let kind = if is_obj {
+                            NodeKind::LazyObject
+                        } else {
+                            NodeKind::LazyArray
+                        };
                         let placeholder_count = estimate_children_count(raw_bytes);
                         self.ctx.with_mut(|ctx| {
                             let mmap_base = ctx.mmap_base;
                             let file_offset = raw_bytes.as_ptr() as u64 - mmap_base as u64;
                             let byte_len = raw_bytes.len() as u64;
                             let span_id = ctx.lazy_spans.len() as u32;
-                            ctx.lazy_spans.push(LazySpan { file_offset, byte_len });
+                            ctx.lazy_spans.push(LazySpan {
+                                file_offset,
+                                byte_len,
+                            });
                             ctx.lazy_child_counts.push(placeholder_count);
                             ctx.alloc_lazy(kind, Some(NodeKey::String(kid)), span_id, id);
                         });
@@ -862,8 +882,9 @@ impl<'de> Visitor<'de> for ValVisitor {
                             parent: id,
                             key: Some(NodeKey::String(kid)),
                             depth: self.depth + 1,
-                        }.deserialize(&mut sub_de)
-                            .map_err(|e| de::Error::custom(e.to_string()))?;
+                        }
+                        .deserialize(&mut sub_de)
+                        .map_err(|e| de::Error::custom(e.to_string()))?;
                     }
                 }
                 // No subtree_len update needed for lazy children (they count as 0-len)
@@ -890,7 +911,9 @@ impl<'de> Visitor<'de> for ValVisitor {
         let id = self
             .ctx
             .with_mut(|ctx| ctx.alloc(NodeKind::Array, self.key, 0, self.parent));
-        let use_lazy = self.ctx.with_mut(|ctx| ctx.lazy_depth > 0 && self.depth + 1 >= ctx.lazy_depth);
+        let use_lazy = self
+            .ctx
+            .with_mut(|ctx| ctx.lazy_depth > 0 && self.depth + 1 >= ctx.lazy_depth);
         let mut index = 0usize;
         loop {
             if index >= KEY_DATA_MASK as usize {
@@ -899,23 +922,36 @@ impl<'de> Visitor<'de> for ValVisitor {
                 ));
             }
             if use_lazy {
-                let raw_opt = seq.next_element::<sonic_rs::LazyValue>()
+                let raw_opt = seq
+                    .next_element::<sonic_rs::LazyValue>()
                     .map_err(|e| de::Error::custom(e.to_string()))?;
                 let Some(lazy) = raw_opt else { break };
                 let raw_bytes = lazy.as_raw_str().as_bytes();
                 match raw_bytes.first().copied() {
                     Some(b'{') | Some(b'[') => {
                         let is_obj = raw_bytes[0] == b'{';
-                        let kind = if is_obj { NodeKind::LazyObject } else { NodeKind::LazyArray };
+                        let kind = if is_obj {
+                            NodeKind::LazyObject
+                        } else {
+                            NodeKind::LazyArray
+                        };
                         let placeholder_count = estimate_children_count(raw_bytes);
                         self.ctx.with_mut(|ctx| {
                             let mmap_base = ctx.mmap_base;
                             let file_offset = raw_bytes.as_ptr() as u64 - mmap_base as u64;
                             let byte_len = raw_bytes.len() as u64;
                             let span_id = ctx.lazy_spans.len() as u32;
-                            ctx.lazy_spans.push(LazySpan { file_offset, byte_len });
+                            ctx.lazy_spans.push(LazySpan {
+                                file_offset,
+                                byte_len,
+                            });
                             ctx.lazy_child_counts.push(placeholder_count);
-                            ctx.alloc_lazy(kind, Some(NodeKey::ArrayIndex(index as u32)), span_id, id);
+                            ctx.alloc_lazy(
+                                kind,
+                                Some(NodeKey::ArrayIndex(index as u32)),
+                                span_id,
+                                id,
+                            );
                         });
                     }
                     _ => {
@@ -926,8 +962,9 @@ impl<'de> Visitor<'de> for ValVisitor {
                             parent: id,
                             key: Some(NodeKey::ArrayIndex(index as u32)),
                             depth: self.depth + 1,
-                        }.deserialize(&mut sub_de)
-                            .map_err(|e| de::Error::custom(e.to_string()))?;
+                        }
+                        .deserialize(&mut sub_de)
+                        .map_err(|e| de::Error::custom(e.to_string()))?;
                     }
                 }
             } else {
@@ -979,7 +1016,7 @@ fn estimate_children_count(bytes: &[u8]) -> u16 {
 
 /// One entry at the top level of a JSON object or array.
 struct TopLevelEntry {
-    key: String,       // empty for array roots
+    key: String, // empty for array roots
     value_start: usize,
     value_end: usize,
     is_container: bool,
@@ -993,9 +1030,16 @@ pub fn scan_json_string(bytes: &[u8], start: usize) -> usize {
     let mut pos = start + 1; // skip opening "
     while pos < bytes.len() {
         match bytes[pos] {
-            b'\\' => { pos = (pos + 2).min(bytes.len()); } // skip escaped char (clamp to avoid OOB)
-            b'"' => { pos += 1; break; }
-            _ => { pos += 1; }
+            b'\\' => {
+                pos = (pos + 2).min(bytes.len());
+            } // skip escaped char (clamp to avoid OOB)
+            b'"' => {
+                pos += 1;
+                break;
+            }
+            _ => {
+                pos += 1;
+            }
         }
     }
     pos
@@ -1016,22 +1060,36 @@ pub fn scan_json_value_end(bytes: &[u8], start: usize) -> usize {
             pos += 1;
             while pos < bytes.len() {
                 match bytes[pos] {
-                    b'"' => { pos = scan_json_string(bytes, pos); }
-                    b if b == open => { depth += 1; pos += 1; }
+                    b'"' => {
+                        pos = scan_json_string(bytes, pos);
+                    }
+                    b if b == open => {
+                        depth += 1;
+                        pos += 1;
+                    }
                     b if b == close => {
                         depth -= 1;
                         pos += 1;
-                        if depth == 0 { break; }
+                        if depth == 0 {
+                            break;
+                        }
                     }
-                    _ => { pos += 1; }
+                    _ => {
+                        pos += 1;
+                    }
                 }
             }
         }
-        b'"' => { pos = scan_json_string(bytes, pos); }
+        b'"' => {
+            pos = scan_json_string(bytes, pos);
+        }
         _ => {
             // null, true, false, or number
             while pos < bytes.len()
-                && !matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r'|b','|b']'|b'}')
+                && !matches!(
+                    bytes[pos],
+                    b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}'
+                )
             {
                 pos += 1;
             }
@@ -1063,7 +1121,7 @@ pub fn scan_json_elements(
 
     loop {
         // Skip whitespace and commas
-        while pos < bytes.len() && matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r'|b',') {
+        while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b',') {
             pos += 1;
         }
         if pos >= bytes.len() || matches!(bytes[pos], b']' | b'}') {
@@ -1077,7 +1135,8 @@ pub fn scan_json_elements(
             if pos < bytes.len() && bytes[pos] == b'"' {
                 pos = scan_json_string(bytes, pos);
                 // Skip whitespace and colon
-                while pos < bytes.len() && matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r'|b':') {
+                while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b':')
+                {
                     pos += 1;
                 }
             }
@@ -1115,7 +1174,7 @@ fn find_value_end_reverse(bytes: &[u8], open_char: u8, value_start: usize) -> us
     // (which is the outermost closing bracket from the end).
 
     // First skip trailing whitespace from end
-    while pos > value_start && matches!(bytes[pos - 1], b' '|b'\t'|b'\n'|b'\r') {
+    while pos > value_start && matches!(bytes[pos - 1], b' ' | b'\t' | b'\n' | b'\r') {
         pos -= 1;
     }
 
@@ -1148,13 +1207,20 @@ fn find_value_end_reverse(bytes: &[u8], open_char: u8, value_start: usize) -> us
             // The byte before the `"` could be `\` (escaped quote) or not.
             let mut q = p;
             loop {
-                if q == 0 { break; }
+                if q == 0 {
+                    break;
+                }
                 q -= 1;
-                if bytes[q] != b'\\' { break; }
+                if bytes[q] != b'\\' {
+                    break;
+                }
                 // Count consecutive backslashes
                 let mut bs = 0usize;
                 let mut bq = q;
-                while bq > 0 && bytes[bq] == b'\\' { bs += 1; bq -= 1; }
+                while bq > 0 && bytes[bq] == b'\\' {
+                    bs += 1;
+                    bq -= 1;
+                }
                 if bs % 2 == 1 {
                     // odd backslashes: this `"` is escaped, keep scanning
                     p = q;
@@ -1203,26 +1269,40 @@ fn scan_json_value_end_budgeted(bytes: &[u8], start: usize, budget: usize) -> Op
                         // scan string using the slice
                         rel = scan_json_string(slice, rel);
                     }
-                    b if b == open => { depth += 1; rel += 1; }
+                    b if b == open => {
+                        depth += 1;
+                        rel += 1;
+                    }
                     b if b == close => {
                         depth -= 1;
                         rel += 1;
-                        if depth == 0 { return Some(start + rel); }
+                        if depth == 0 {
+                            return Some(start + rel);
+                        }
                     }
-                    _ => { rel += 1; }
+                    _ => {
+                        rel += 1;
+                    }
                 }
             }
             None // hit budget limit without finding close
         }
         b'"' => {
             let end_rel = scan_json_string(slice, 0);
-            if end_rel <= slice.len() { Some(start + end_rel) } else { None }
+            if end_rel <= slice.len() {
+                Some(start + end_rel)
+            } else {
+                None
+            }
         }
         _ => {
             // scalar
             let mut pos = 0usize;
             while pos < slice.len()
-                && !matches!(slice[pos], b' '|b'\t'|b'\n'|b'\r'|b','|b']'|b'}')
+                && !matches!(
+                    slice[pos],
+                    b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}'
+                )
             {
                 pos += 1;
             }
@@ -1242,7 +1322,7 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
     let mut pos = 0usize;
 
     // Find root bracket
-    while pos < bytes.len() && matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r') {
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
         pos += 1;
     }
     if pos >= bytes.len() {
@@ -1251,7 +1331,10 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
 
     let root_char = bytes[pos];
     if root_char != b'{' && root_char != b'[' {
-        return Err(format!("expected '{{' or '[' at root, got '{}'", root_char as char));
+        return Err(format!(
+            "expected '{{' or '[' at root, got '{}'",
+            root_char as char
+        ));
     }
     let is_array_root = root_char == b'[';
     pos += 1;
@@ -1259,7 +1342,7 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
     // Find root close position from the end (for reverse scan fallback)
     // The root's closing bracket is the last non-whitespace byte of the file.
     let mut root_close_pos = bytes.len();
-    while root_close_pos > 0 && matches!(bytes[root_close_pos - 1], b' '|b'\t'|b'\n'|b'\r') {
+    while root_close_pos > 0 && matches!(bytes[root_close_pos - 1], b' ' | b'\t' | b'\n' | b'\r') {
         root_close_pos -= 1;
     }
     // root_close_pos now points one past the root's closing bracket
@@ -1269,7 +1352,7 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
 
     loop {
         // Skip whitespace/commas
-        while pos < bytes.len() && matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r'|b',') {
+        while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b',') {
             pos += 1;
         }
         if pos >= bytes.len() || matches!(bytes[pos], b']' | b'}') {
@@ -1294,7 +1377,7 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
 
         if !is_array_root {
             // Skip whitespace and colon
-            while pos < bytes.len() && matches!(bytes[pos], b' '|b'\t'|b'\n'|b'\r'|b':') {
+            while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b':') {
                 pos += 1;
             }
         }
@@ -1311,15 +1394,17 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
 
         // Try fast forward scan with budget; fall back to full scan for large values.
         // We must NOT break here even for large values — there may be more entries after this one.
-        let value_end = match scan_json_value_end_budgeted(bytes, value_start, FAST_SCAN_SMALL_VALUE_THRESHOLD) {
-            Some(end) => end,
-            None => {
-                // Value exceeds quick-scan budget — do a full (unbounded) forward scan.
-                let remaining = bytes.len().saturating_sub(value_start);
-                scan_json_value_end_budgeted(bytes, value_start, remaining)
-                    .unwrap_or_else(|| find_value_end_reverse(bytes, first_byte, value_start))
-            }
-        };
+        let value_end =
+            match scan_json_value_end_budgeted(bytes, value_start, FAST_SCAN_SMALL_VALUE_THRESHOLD)
+            {
+                Some(end) => end,
+                None => {
+                    // Value exceeds quick-scan budget — do a full (unbounded) forward scan.
+                    let remaining = bytes.len().saturating_sub(value_start);
+                    scan_json_value_end_budgeted(bytes, value_start, remaining)
+                        .unwrap_or_else(|| find_value_end_reverse(bytes, first_byte, value_start))
+                }
+            };
 
         pos = value_end;
 
@@ -1563,7 +1648,10 @@ impl JsonIndex {
     /// No-op if already materialized.
     pub fn materialize_lazy_node(&self, node_id: u32) -> Result<(), String> {
         let node = &self.nodes[node_id as usize];
-        debug_assert!(node.kind().is_lazy(), "materialize_lazy_node called on non-lazy node");
+        debug_assert!(
+            node.kind().is_lazy(),
+            "materialize_lazy_node called on non-lazy node"
+        );
 
         // Check already materialized (fast path without sub-parse)
         {
@@ -1578,7 +1666,9 @@ impl JsonIndex {
 
         // Re-open and mmap the source file just for this expansion, then drop it.
         // This avoids keeping the entire file resident in RAM between expansions.
-        let file_path = self.source_file.as_deref()
+        let file_path = self
+            .source_file
+            .as_deref()
             .ok_or_else(|| "source_file not set for lazy expansion".to_string())?;
         let file = File::open(file_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
@@ -1612,14 +1702,25 @@ impl JsonIndex {
             let sub_node = &sub_index.nodes[sub_id as usize];
             if sub_node.kind().is_container() {
                 Self::register_sub_descendants(
-                    &sub_index, sub_id, global_id, sub_idx, base, &mut extra.extra_parent,
+                    &sub_index,
+                    sub_id,
+                    global_id,
+                    sub_idx,
+                    base,
+                    &mut extra.extra_parent,
                 );
             }
             let _ = i; // suppress unused warning
         }
 
         extra.sub_indices.push(sub_index);
-        extra.mat.insert(node_id, MatInfo2 { sub_idx, child_sub_ids });
+        extra.mat.insert(
+            node_id,
+            MatInfo2 {
+                sub_idx,
+                child_sub_ids,
+            },
+        );
 
         Ok(())
     }
@@ -1639,7 +1740,12 @@ impl JsonIndex {
             let child_node = &sub_index.nodes[child_sub_id as usize];
             if child_node.kind().is_container() {
                 Self::register_sub_descendants(
-                    sub_index, child_sub_id, child_global_id, sub_idx, base, extra_parent,
+                    sub_index,
+                    child_sub_id,
+                    child_global_id,
+                    sub_idx,
+                    base,
+                    extra_parent,
                 );
             }
         }
@@ -1668,7 +1774,9 @@ impl JsonIndex {
                 let extra = self.extra.lock().unwrap();
                 if let Some(mat) = extra.mat.get(&id) {
                     let sub_idx = mat.sub_idx;
-                    let global_ids: Vec<u32> = mat.child_sub_ids.iter()
+                    let global_ids: Vec<u32> = mat
+                        .child_sub_ids
+                        .iter()
                         .map(|&sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
                         .collect();
                     return Ok(global_ids);
@@ -1698,7 +1806,8 @@ impl JsonIndex {
         if !sub_node.kind().is_container() {
             return Ok(Vec::new());
         }
-        let child_ids: Vec<u32> = sub_index.children_iter(sub_id)
+        let child_ids: Vec<u32> = sub_index
+            .children_iter(sub_id)
             .map(|csub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + csub_id)
             .collect();
         Ok(child_ids)
@@ -1844,7 +1953,8 @@ impl JsonIndex {
         if segments.is_empty() {
             "$".to_string()
         } else {
-            let mut out = String::with_capacity(segments.iter().map(|s| s.len() + 1).sum::<usize>() + 2);
+            let mut out =
+                String::with_capacity(segments.iter().map(|s| s.len() + 1).sum::<usize>() + 2);
             out.push('$');
             for seg in segments {
                 out.push('.');
@@ -1904,23 +2014,40 @@ impl JsonIndex {
                     0
                 };
                 return if kind == NodeKind::LazyObject {
-                    if count == 0 { "{}".to_string() } else { format!("{{{} keys}}", count) }
+                    if count == 0 {
+                        "{}".to_string()
+                    } else {
+                        format!("{{{} keys}}", count)
+                    }
                 } else {
-                    if count == 0 { "[]".to_string() } else { format!("[{} items]", count) }
+                    if count == 0 {
+                        "[]".to_string()
+                    } else {
+                        format!("[{} items]", count)
+                    }
                 };
             }
             // Delegate to existing method via a temporary node ref
             let children_len = self.children_len(id) as usize;
             return match kind {
                 NodeKind::Object => {
-                    if children_len == 0 { "{}".to_string() } else { format!("{{{} keys}}", children_len) }
+                    if children_len == 0 {
+                        "{}".to_string()
+                    } else {
+                        format!("{{{} keys}}", children_len)
+                    }
                 }
                 NodeKind::Array => {
-                    if children_len == 0 { "[]".to_string() } else { format!("[{} items]", children_len) }
+                    if children_len == 0 {
+                        "[]".to_string()
+                    } else {
+                        format!("[{} items]", children_len)
+                    }
                 }
                 NodeKind::Str => {
                     let s = self.str_val_of_node(node);
-                    let truncated = &s[..s.char_indices().nth(80).map(|(i,_)| i).unwrap_or(s.len())];
+                    let truncated =
+                        &s[..s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len())];
                     if truncated.len() < s.len() {
                         format!("\"{}…\"", truncated)
                     } else {
@@ -1928,7 +2055,13 @@ impl JsonIndex {
                     }
                 }
                 NodeKind::Num => self.number_to_string(id),
-                NodeKind::Bool => if node.value_data != 0 { "true".to_string() } else { "false".to_string() },
+                NodeKind::Bool => {
+                    if node.value_data != 0 {
+                        "true".to_string()
+                    } else {
+                        "false".to_string()
+                    }
+                }
                 NodeKind::Null => "null".to_string(),
                 _ => String::new(),
             };
@@ -1948,14 +2081,22 @@ impl JsonIndex {
         let children_len = sub_index.children_len(sub_id) as usize;
         match node.kind() {
             NodeKind::Object => {
-                if children_len == 0 { "{}".to_string() } else { format!("{{{} keys}}", children_len) }
+                if children_len == 0 {
+                    "{}".to_string()
+                } else {
+                    format!("{{{} keys}}", children_len)
+                }
             }
             NodeKind::Array => {
-                if children_len == 0 { "[]".to_string() } else { format!("[{} items]", children_len) }
+                if children_len == 0 {
+                    "[]".to_string()
+                } else {
+                    format!("[{} items]", children_len)
+                }
             }
             NodeKind::Str => {
                 let s = sub_index.str_val_of_node(node);
-                let truncated = &s[..s.char_indices().nth(80).map(|(i,_)| i).unwrap_or(s.len())];
+                let truncated = &s[..s.char_indices().nth(80).map(|(i, _)| i).unwrap_or(s.len())];
                 if truncated.len() < s.len() {
                     format!("\"{}…\"", truncated)
                 } else {
@@ -1963,7 +2104,13 @@ impl JsonIndex {
                 }
             }
             NodeKind::Num => sub_index.number_to_string(sub_id),
-            NodeKind::Bool => if node.value_data != 0 { "true".to_string() } else { "false".to_string() },
+            NodeKind::Bool => {
+                if node.value_data != 0 {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
             NodeKind::Null => "null".to_string(),
             _ => String::new(),
         }
@@ -2192,14 +2339,19 @@ impl JsonIndex {
 
         // Determine root kind (object vs array)
         let mut root_start = 0usize;
-        while root_start < bytes.len() && matches!(bytes[root_start], b' '|b'\t'|b'\n'|b'\r') {
+        while root_start < bytes.len() && matches!(bytes[root_start], b' ' | b'\t' | b'\n' | b'\r')
+        {
             root_start += 1;
         }
         let is_array_root = root_start < bytes.len() && bytes[root_start] == b'[';
 
         let mut ctx = StreamCtx::with_capacity(entries.len() + 2, 0);
 
-        let root_kind = if is_array_root { NodeKind::Array } else { NodeKind::Object };
+        let root_kind = if is_array_root {
+            NodeKind::Array
+        } else {
+            NodeKind::Object
+        };
         let root_id = ctx.alloc(root_kind, None, 0, u32::MAX);
 
         for (i, entry) in entries.iter().enumerate() {
@@ -2211,7 +2363,11 @@ impl JsonIndex {
             };
 
             if entry.is_container {
-                let kind = if entry.is_array { NodeKind::LazyArray } else { NodeKind::LazyObject };
+                let kind = if entry.is_array {
+                    NodeKind::LazyArray
+                } else {
+                    NodeKind::LazyObject
+                };
                 let span_id = ctx.lazy_spans.len() as u32;
                 let byte_len = (entry.value_end - entry.value_start) as u64;
                 ctx.lazy_spans.push(LazySpan {
@@ -2233,8 +2389,9 @@ impl JsonIndex {
                     parent: root_id,
                     key,
                     depth: 1,
-                }.deserialize(&mut sub_de)
-                    .map_err(|e| e.to_string())?;
+                }
+                .deserialize(&mut sub_de)
+                .map_err(|e| e.to_string())?;
             }
         }
 
@@ -2273,7 +2430,9 @@ impl JsonIndex {
             let base = extra.base;
             if let Some(mat) = extra.mat.get(&node_id) {
                 let sub_idx = mat.sub_idx;
-                let global_ids: Vec<u32> = mat.child_sub_ids.iter()
+                let global_ids: Vec<u32> = mat
+                    .child_sub_ids
+                    .iter()
                     .skip(offset)
                     .take(limit)
                     .map(|&sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
@@ -2284,7 +2443,10 @@ impl JsonIndex {
         }
 
         // Large lazy span: use custom byte scanner for pagination
-        let path = self.source_file.as_deref().ok_or("no source file for lazy expansion")?;
+        let path = self
+            .source_file
+            .as_deref()
+            .ok_or("no source file for lazy expansion")?;
         let file = File::open(path).map_err(|e| e.to_string())?;
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
         let start = span.file_offset as usize;
@@ -2308,7 +2470,9 @@ impl JsonIndex {
         let mut wrapper = String::with_capacity(total_bytes);
         wrapper.push('{');
         for (i, (elem_start, elem_end)) in elements.iter().enumerate() {
-            if i > 0 { wrapper.push(','); }
+            if i > 0 {
+                wrapper.push(',');
+            }
             if is_array {
                 // Explicit numeric key so the sub-index stores the correct global index.
                 wrapper.push('"');
@@ -2339,7 +2503,12 @@ impl JsonIndex {
             let sub_node = &sub_index.nodes[sub_id as usize];
             if sub_node.kind().is_container() {
                 Self::register_sub_descendants(
-                    &sub_index, sub_id, global_id, sub_idx, base, &mut extra.extra_parent,
+                    &sub_index,
+                    sub_id,
+                    global_id,
+                    sub_idx,
+                    base,
+                    &mut extra.extra_parent,
                 );
             }
             child_ids.push(global_id);
@@ -2436,8 +2605,7 @@ impl JsonIndex {
                         let cl = si.children_len(lcid);
                         f.next_child_id = lcid + 1 + st;
                         f.remaining -= 1;
-                        let gid =
-                            extra.base + (si_idx as u32) * SUB_INDEX_ID_RANGE + lcid;
+                        let gid = extra.base + (si_idx as u32) * SUB_INDEX_ID_RANGE + lcid;
                         (st, cl, gid)
                     }
                 };
@@ -2776,7 +2944,9 @@ impl JsonIndex {
                 "false"
             }),
             NodeKind::Null => re.is_match("null"),
-            NodeKind::Object | NodeKind::Array | NodeKind::LazyObject | NodeKind::LazyArray => false,
+            NodeKind::Object | NodeKind::Array | NodeKind::LazyObject | NodeKind::LazyArray => {
+                false
+            }
         }
     }
 
@@ -2823,7 +2993,9 @@ impl JsonIndex {
                 exact_match,
             ),
             NodeKind::Null => matches_text("null", query, query_lower, case_sensitive, exact_match),
-            NodeKind::Object | NodeKind::Array | NodeKind::LazyObject | NodeKind::LazyArray => false,
+            NodeKind::Object | NodeKind::Array | NodeKind::LazyObject | NodeKind::LazyArray => {
+                false
+            }
         }
     }
 
@@ -2941,9 +3113,9 @@ impl JsonIndex {
                         }
                         want_values
                             && match node.kind() {
-                                NodeKind::Str => finder
-                                    .find(self.str_val_of_node(node).as_bytes())
-                                    .is_some(),
+                                NodeKind::Str => {
+                                    finder.find(self.str_val_of_node(node).as_bytes()).is_some()
+                                }
                                 NodeKind::Num => {
                                     let mut text = StackString::<64>::new();
                                     finder
@@ -2958,7 +3130,10 @@ impl JsonIndex {
                                     })
                                     .is_some(),
                                 NodeKind::Null => finder.find(b"null").is_some(),
-                                NodeKind::Object | NodeKind::Array | NodeKind::LazyObject | NodeKind::LazyArray => false,
+                                NodeKind::Object
+                                | NodeKind::Array
+                                | NodeKind::LazyObject
+                                | NodeKind::LazyArray => false,
                             }
                     },
                 );
@@ -2971,7 +3146,13 @@ impl JsonIndex {
                 }
                 if want_values
                     && !want_keys
-                    && matches!(node.kind(), NodeKind::Object | NodeKind::Array | NodeKind::LazyObject | NodeKind::LazyArray)
+                    && matches!(
+                        node.kind(),
+                        NodeKind::Object
+                            | NodeKind::Array
+                            | NodeKind::LazyObject
+                            | NodeKind::LazyArray
+                    )
                 {
                     return false;
                 }
@@ -3028,6 +3209,89 @@ impl JsonIndex {
                 })?,
                 _ => return None,
             };
+        }
+
+        Some(current)
+    }
+
+    fn find_child_any_by_segment(&self, parent_id: u32, segment: &str) -> Option<u32> {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+
+        if parent_id < base {
+            let parent = &self.nodes[parent_id as usize];
+            return match parent.kind() {
+                NodeKind::Array => {
+                    let wanted_index = segment.parse::<u32>().ok()?;
+                    self.children_iter(parent_id).find(|&child_id| {
+                        self.nodes[child_id as usize].array_index() == Some(wanted_index)
+                    })
+                }
+                NodeKind::Object => self.children_iter(parent_id).find(|&child_id| {
+                    self.nodes[child_id as usize]
+                        .string_key_id()
+                        .is_some_and(|kid| self.keys.get(kid) == segment)
+                }),
+                NodeKind::LazyArray => {
+                    let wanted_index = segment.parse::<usize>().ok()?;
+                    if self.is_large_lazy(parent_id) {
+                        return self
+                            .get_lazy_children_page(parent_id, wanted_index, 1)
+                            .ok()?
+                            .into_iter()
+                            .next();
+                    }
+                    self.get_children_any(parent_id)
+                        .ok()?
+                        .into_iter()
+                        .find(|&child_id| {
+                            self.key_string_any(child_id)
+                                .is_some_and(|key| key == segment)
+                        })
+                }
+                NodeKind::LazyObject => {
+                    if self.is_large_lazy(parent_id) {
+                        self.materialize_lazy_node(parent_id).ok()?;
+                    }
+                    self.get_children_any(parent_id)
+                        .ok()?
+                        .into_iter()
+                        .find(|&child_id| {
+                            self.key_string_any(child_id)
+                                .is_some_and(|key| key == segment)
+                        })
+                }
+                _ => None,
+            };
+        }
+
+        self.get_children_any(parent_id)
+            .ok()?
+            .into_iter()
+            .find(|&child_id| {
+                self.key_string_any(child_id)
+                    .is_some_and(|key| key == segment)
+            })
+    }
+
+    pub fn resolve_path_any(&self, path: &str) -> Option<u32> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() || trimmed == "$" {
+            return Some(self.root);
+        }
+
+        let normalized = trimmed
+            .strip_prefix("$.")
+            .or_else(|| trimmed.strip_prefix('$'))?;
+        if normalized.is_empty() {
+            return Some(self.root);
+        }
+
+        let mut current = self.root;
+        for segment in normalized.split('.').filter(|segment| !segment.is_empty()) {
+            current = self.find_child_any_by_segment(current, segment)?;
         }
 
         Some(current)
@@ -3182,6 +3446,145 @@ impl JsonIndex {
         }
     }
 
+    pub fn search_objects_in_lazy_node(
+        &self,
+        lazy_node_id: u32,
+        filters: &[ObjectSearchFilter],
+        key_case_sensitive: bool,
+        value_case_sensitive: bool,
+        max_results: usize,
+    ) -> Result<Vec<u32>, String> {
+        let node = &self.nodes[lazy_node_id as usize];
+        if !node.kind().is_lazy() || max_results == 0 {
+            return Ok(Vec::new());
+        }
+
+        let is_large_array = node.kind() == NodeKind::LazyArray && self.is_large_lazy(lazy_node_id);
+        if !is_large_array {
+            self.materialize_lazy_node(lazy_node_id)?;
+
+            let extra = self.extra.lock().unwrap();
+            let base = extra.base;
+            let Some(mat) = extra.mat.get(&lazy_node_id) else {
+                return Ok(Vec::new());
+            };
+            let sub_idx = mat.sub_idx;
+            let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+            drop(extra);
+
+            let matches = sub_index.search_objects(
+                filters,
+                key_case_sensitive,
+                value_case_sensitive,
+                max_results,
+                None,
+            );
+
+            return Ok(matches
+                .into_iter()
+                .map(|sub_id| {
+                    if sub_id == sub_index.root {
+                        lazy_node_id
+                    } else {
+                        base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id
+                    }
+                })
+                .collect());
+        }
+
+        let span_id = node.value_data as usize;
+        if span_id >= self.lazy_spans.len() {
+            return Ok(Vec::new());
+        }
+        let span = self.lazy_spans[span_id];
+
+        let file_path = self
+            .source_file
+            .as_deref()
+            .ok_or_else(|| "source_file not set".to_string())?;
+        let file = File::open(file_path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        let span_start = span.file_offset as usize;
+        let span_end = span_start + span.byte_len as usize;
+        let bytes = &mmap[span_start..span_end.min(mmap.len())];
+
+        let mut results: Vec<u32> = Vec::new();
+        let mut elem_index: usize = 0;
+        let mut pos = 0usize;
+        let base = { self.extra.lock().unwrap().base };
+
+        while pos < bytes.len() && bytes[pos] != b'[' {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return Ok(results);
+        }
+        pos += 1;
+
+        loop {
+            while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b',') {
+                pos += 1;
+            }
+            if pos >= bytes.len() || bytes[pos] == b']' {
+                break;
+            }
+
+            let value_start = pos;
+            pos = scan_json_value_end(bytes, pos);
+            let elem_end = pos.min(bytes.len());
+            let elem_bytes = &bytes[value_start..elem_end];
+
+            if let Ok(sub_index) = JsonIndex::from_slice(elem_bytes) {
+                let matching_sub = sub_index.search_objects(
+                    filters,
+                    key_case_sensitive,
+                    value_case_sensitive,
+                    max_results.saturating_sub(results.len()),
+                    None,
+                );
+
+                if !matching_sub.is_empty() {
+                    let sub_index = Arc::new(sub_index);
+                    let sub_root = sub_index.root;
+                    let mut extra = self.extra.lock().unwrap();
+                    let sub_idx = extra.sub_indices.len();
+                    let root_global = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_root;
+
+                    extra.extra_parent.insert(root_global, lazy_node_id);
+                    extra
+                        .extra_key_override
+                        .insert(root_global, elem_index.to_string());
+
+                    Self::register_sub_descendants(
+                        &sub_index,
+                        sub_root,
+                        root_global,
+                        sub_idx,
+                        base,
+                        &mut extra.extra_parent,
+                    );
+
+                    extra.sub_indices.push(sub_index);
+
+                    for sub_id in matching_sub {
+                        let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
+                        results.push(global_id);
+                        if results.len() >= max_results {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            elem_index += 1;
+            if results.len() >= max_results {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
     pub fn search_objects(
         &self,
         filters: &[ObjectSearchFilter],
@@ -3222,9 +3625,7 @@ impl JsonIndex {
                     })
             });
 
-        // With always-lazy loading the main index has very few nodes (top-level structure
-        // only). Actual objects live inside lazy spans. Materialize each lazy node in scope
-        // and search its sub-index with the same filters.
+        // Search inside lazy nodes separately so scope and result IDs stay coherent.
         if results.len() < max_results {
             let lazy_ids: Vec<u32> = scoped_nodes
                 .iter()
@@ -3233,32 +3634,21 @@ impl JsonIndex {
                 .map(|(i, _)| start_id + i as u32)
                 .collect();
 
-            for &lazy_id in &lazy_ids {
+            for lazy_id in lazy_ids {
                 if results.len() >= max_results {
                     break;
                 }
-                // Materializes if not already done; large nodes return first page only.
-                let _ = self.get_children_any(lazy_id);
-            }
-
-            let extra = self.extra.lock().unwrap();
-            let base = extra.base;
-            for (sub_idx, sub_index) in extra.sub_indices.iter().enumerate() {
-                if results.len() >= max_results {
-                    break;
-                }
-                let remaining = max_results - results.len();
-                // sub_index is a full JsonIndex parsed eagerly — search_objects works on it
-                // directly without entering the lazy branch again (sub-indices have no lazy nodes).
-                let sub_results = sub_index.search_objects(
+                if let Ok(lazy_results) = self.search_objects_in_lazy_node(
+                    lazy_id,
                     filters,
                     key_case_sensitive,
                     value_case_sensitive,
-                    remaining,
-                    None,
-                );
-                for sub_id in sub_results {
-                    results.push(base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id);
+                    max_results - results.len(),
+                ) {
+                    results.extend(lazy_results);
+                    if results.len() >= max_results {
+                        break;
+                    }
                 }
             }
         }
@@ -3357,16 +3747,87 @@ impl JsonIndex {
     /// Matching leaf nodes are materialized as sub-indices with correct path info.
     ///
     /// Returns global IDs of matching leaf nodes (usable with `get_path_any` etc.).
-    pub fn search_in_lazy_node(
+    pub fn search_in_lazy_node_with_options(
         &self,
         lazy_node_id: u32,
         query: &str,
+        target: &str,
         case_sensitive: bool,
+        use_regex: bool,
         exact_match: bool,
         max_results: usize,
+        multiline: bool,
+        dot_all: bool,
     ) -> Result<Vec<u32>, String> {
         let node = &self.nodes[lazy_node_id as usize];
-        if !node.kind().is_lazy() {
+        if !node.kind().is_lazy() || max_results == 0 {
+            return Ok(vec![]);
+        }
+
+        let is_large_array = node.kind() == NodeKind::LazyArray && self.is_large_lazy(lazy_node_id);
+        if !is_large_array {
+            self.materialize_lazy_node(lazy_node_id)?;
+
+            let extra = self.extra.lock().unwrap();
+            let base = extra.base;
+            let Some(mat) = extra.mat.get(&lazy_node_id) else {
+                return Ok(Vec::new());
+            };
+            let sub_idx = mat.sub_idx;
+            let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+            drop(extra);
+
+            let matches = sub_index.search(
+                query,
+                target,
+                case_sensitive,
+                use_regex,
+                exact_match,
+                max_results,
+                None,
+                multiline,
+                dot_all,
+            );
+
+            return Ok(matches
+                .into_iter()
+                .filter_map(|sub_id| {
+                    if sub_id == sub_index.root && node.kind() == NodeKind::LazyObject {
+                        None
+                    } else {
+                        Some(base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
+                    }
+                })
+                .collect());
+        }
+
+        self.search_in_lazy_node_streaming(
+            lazy_node_id,
+            query,
+            target,
+            case_sensitive,
+            use_regex,
+            exact_match,
+            max_results,
+            multiline,
+            dot_all,
+        )
+    }
+
+    fn search_in_lazy_node_streaming(
+        &self,
+        lazy_node_id: u32,
+        query: &str,
+        target: &str,
+        case_sensitive: bool,
+        use_regex: bool,
+        exact_match: bool,
+        max_results: usize,
+        multiline: bool,
+        dot_all: bool,
+    ) -> Result<Vec<u32>, String> {
+        let node = &self.nodes[lazy_node_id as usize];
+        if !node.kind().is_lazy() || max_results == 0 {
             return Ok(vec![]);
         }
         let span_id = node.value_data as usize;
@@ -3375,7 +3836,9 @@ impl JsonIndex {
         }
         let span = self.lazy_spans[span_id];
 
-        let file_path = self.source_file.as_deref()
+        let file_path = self
+            .source_file
+            .as_deref()
             .ok_or_else(|| "source_file not set".to_string())?;
         let file = File::open(file_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
@@ -3423,7 +3886,8 @@ impl JsonIndex {
             // `value_start` covers only the value for JSON parsing.
             if !is_array && pos < bytes.len() && bytes[pos] == b'"' {
                 pos = scan_json_string(bytes, pos);
-                while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b':') {
+                while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b':')
+                {
                     pos += 1;
                 }
             }
@@ -3438,11 +3902,13 @@ impl JsonIndex {
             let elem_bytes = &bytes[value_start..elem_end];
 
             // Fast byte pre-filter before parsing
-            let maybe_matches = if case_sensitive {
+            let maybe_matches = if use_regex {
+                true
+            } else if case_sensitive {
                 memchr::memmem::find(full_elem, needle).is_some()
             } else {
-                // Lowercase the element bytes for case-insensitive comparison.
-                // Elements are typically small (hundreds of bytes each) so this is fast.
+                // Elements are typically small, so a lowercase copy is cheap and
+                // avoids reparsing elements that clearly cannot match.
                 let lower: Vec<u8> = full_elem.iter().map(|b| b.to_ascii_lowercase()).collect();
                 memchr::memmem::find(&lower, needle).is_some()
             };
@@ -3451,14 +3917,14 @@ impl JsonIndex {
                 if let Ok(sub_index) = JsonIndex::from_slice(elem_bytes) {
                     let matching_sub: Vec<u32> = sub_index.search(
                         query,
-                        "both", // search both keys and values within the element
+                        target,
                         case_sensitive,
-                        false, // no regex in lazy search (pre-filtered already)
+                        use_regex,
                         exact_match,
                         max_results.saturating_sub(results.len()),
                         None,
-                        false,
-                        false,
+                        multiline,
+                        dot_all,
                     );
 
                     if !matching_sub.is_empty() {
@@ -3470,7 +3936,9 @@ impl JsonIndex {
 
                         // Register parent → lazy node and key → element index
                         extra.extra_parent.insert(root_global, lazy_node_id);
-                        extra.extra_key_override.insert(root_global, elem_index.to_string());
+                        extra
+                            .extra_key_override
+                            .insert(root_global, elem_index.to_string());
 
                         // Register all descendants so get_path_any works transitively
                         Self::register_sub_descendants(
@@ -3502,6 +3970,27 @@ impl JsonIndex {
         }
 
         Ok(results)
+    }
+
+    pub fn search_in_lazy_node(
+        &self,
+        lazy_node_id: u32,
+        query: &str,
+        case_sensitive: bool,
+        exact_match: bool,
+        max_results: usize,
+    ) -> Result<Vec<u32>, String> {
+        self.search_in_lazy_node_with_options(
+            lazy_node_id,
+            query,
+            "both",
+            case_sensitive,
+            false,
+            exact_match,
+            max_results,
+            false,
+            false,
+        )
     }
 }
 
@@ -3958,7 +4447,8 @@ mod tests {
         // Regressione: con always-lazy loading le chiavi degli oggetti dentro i
         // lazy span non finivano in self.keys → la tendina mostrava solo le chiavi
         // del top-level e non quelle dei nodi figli materializzati.
-        let json = r#"[{"name":"Alice","age":30,"role":"admin"},{"name":"Bob","age":25,"role":"user"}]"#;
+        let json =
+            r#"[{"name":"Alice","age":30,"role":"admin"},{"name":"Bob","age":25,"role":"user"}]"#;
         let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
 
         // Materializza il primo figlio del nodo lazy (simula expand-all)
@@ -3966,9 +4456,21 @@ mod tests {
 
         let suggestions = index.suggest_property_paths("", 20);
         // Dopo materializzazione, le chiavi degli oggetti figli devono comparire
-        assert!(suggestions.contains(&"name".to_string()),  "manca 'name': {:?}", suggestions);
-        assert!(suggestions.contains(&"age".to_string()),   "manca 'age': {:?}", suggestions);
-        assert!(suggestions.contains(&"role".to_string()),  "manca 'role': {:?}", suggestions);
+        assert!(
+            suggestions.contains(&"name".to_string()),
+            "manca 'name': {:?}",
+            suggestions
+        );
+        assert!(
+            suggestions.contains(&"age".to_string()),
+            "manca 'age': {:?}",
+            suggestions
+        );
+        assert!(
+            suggestions.contains(&"role".to_string()),
+            "manca 'role': {:?}",
+            suggestions
+        );
     }
 
     // ── Regressione: search_objects su file lazy non trova nulla ──────────────
@@ -3994,7 +4496,12 @@ mod tests {
             10,
             None,
         );
-        assert_eq!(results.len(), 2, "dovrebbe trovare Alice e Carol: {:?}", results);
+        assert_eq!(
+            results.len(),
+            2,
+            "dovrebbe trovare Alice e Carol: {:?}",
+            results
+        );
     }
 
     #[test]
@@ -4023,7 +4530,11 @@ mod tests {
             None,
         );
         // "Alice" (name contains 'a') e "Carol" (name contains 'a')
-        assert!(results.len() >= 2, "attesi almeno 2 risultati: {:?}", results);
+        assert!(
+            results.len() >= 2,
+            "attesi almeno 2 risultati: {:?}",
+            results
+        );
     }
 
     // ── get_expanded_slice / expanded_visible_count con lazy loading ──────────
@@ -4034,8 +4545,8 @@ mod tests {
 
     #[test]
     fn get_expanded_slice_includes_materialized_sub_index_nodes() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let json = r#"[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"},{"id":3,"name":"Carol"}]"#;
         let mut tmp = NamedTempFile::new().expect("tmp file");
@@ -4080,13 +4591,15 @@ mod tests {
 
     #[test]
     fn get_expanded_slice_paginate_works_with_lazy_nodes() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         // 10 oggetti con 2 campi ciascuno → 10 lazy obj + 20 sub-fields = 30 nodi visibili
         let mut json = String::from("[");
         for i in 0..10 {
-            if i > 0 { json.push(','); }
+            if i > 0 {
+                json.push(',');
+            }
             json.push_str(&format!(r#"{{"id":{i},"val":{}}}"#, i * 10));
         }
         json.push(']');
@@ -4114,10 +4627,14 @@ mod tests {
         let mut offset = 0;
         loop {
             let page = index.get_expanded_slice(offset, page_size);
-            if page.is_empty() { break; }
+            if page.is_empty() {
+                break;
+            }
             offset += page.len();
             paginated.extend(page);
-            if offset >= total { break; }
+            if offset >= total {
+                break;
+            }
         }
 
         assert_eq!(
@@ -4342,7 +4859,9 @@ mod tests {
     fn get_children_any_returns_same_as_children_iter_for_objects() {
         let index = idx(r#"{"x":1,"y":2,"z":3}"#);
         let via_iter: Vec<u32> = index.children_iter(index.root).collect();
-        let via_any = index.get_children_any(index.root).expect("get_children_any failed");
+        let via_any = index
+            .get_children_any(index.root)
+            .expect("get_children_any failed");
         assert_eq!(via_iter, via_any);
     }
 
@@ -4350,14 +4869,18 @@ mod tests {
     fn get_children_any_returns_same_as_children_iter_for_arrays() {
         let index = idx(r#"[10,20,30,40,50]"#);
         let via_iter: Vec<u32> = index.children_iter(index.root).collect();
-        let via_any = index.get_children_any(index.root).expect("get_children_any failed");
+        let via_any = index
+            .get_children_any(index.root)
+            .expect("get_children_any failed");
         assert_eq!(via_iter, via_any);
     }
 
     #[test]
     fn get_children_any_empty_for_leaf() {
         let index = idx(r#""hello""#);
-        let result = index.get_children_any(index.root).expect("get_children_any failed");
+        let result = index
+            .get_children_any(index.root)
+            .expect("get_children_any failed");
         assert!(result.is_empty());
     }
 
@@ -4371,8 +4894,8 @@ mod tests {
     /// Crea un JsonIndex con un lazy span artificiale che punta a un file temp.
     /// Utile per testare `search_in_lazy_node` indipendentemente dalla soglia 512MB.
     fn make_lazy_index_from_json(json: &str) -> (JsonIndex, u32, tempfile::NamedTempFile) {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         // Scrive il JSON in un file temp
         let mut tmp = NamedTempFile::new().expect("tmp file");
@@ -4386,7 +4909,10 @@ mod tests {
 
         // Aggiungi lo span che copre tutto il file
         let file_len = json.len() as u64;
-        index.lazy_spans.push(LazySpan { file_offset: 0, byte_len: file_len });
+        index.lazy_spans.push(LazySpan {
+            file_offset: 0,
+            byte_len: file_len,
+        });
         index.lazy_child_counts.push(1);
 
         // Trasforma il root node in LazyArray con ktype corretto (NO_KEY nelle bits basse)
@@ -4400,14 +4926,20 @@ mod tests {
 
     #[test]
     fn search_in_lazy_node_finds_matching_elements() {
-        let json = r#"[{"name":"Alice","age":30},{"name":"Bob","age":25},{"name":"Charlie","age":30}]"#;
+        let json =
+            r#"[{"name":"Alice","age":30},{"name":"Bob","age":25},{"name":"Charlie","age":30}]"#;
         let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
 
-        let results = index.search_in_lazy_node(lazy_id, "Alice", true, false, 10)
+        let results = index
+            .search_in_lazy_node(lazy_id, "Alice", true, false, 10)
             .expect("search failed");
         assert_eq!(results.len(), 1, "deve trovare solo Alice");
         let path = index.get_path_any(results[0]);
-        assert!(path.contains("0"), "path deve contenere l'indice 0: {}", path);
+        assert!(
+            path.contains("0"),
+            "path deve contenere l'indice 0: {}",
+            path
+        );
     }
 
     #[test]
@@ -4415,9 +4947,14 @@ mod tests {
         let json = r#"[{"city":"Rome"},{"city":"ROME"},{"city":"Milan"}]"#;
         let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
 
-        let results = index.search_in_lazy_node(lazy_id, "rome", false, false, 10)
+        let results = index
+            .search_in_lazy_node(lazy_id, "rome", false, false, 10)
             .expect("search failed");
-        assert_eq!(results.len(), 2, "deve trovare Rome e ROME case-insensitive");
+        assert_eq!(
+            results.len(),
+            2,
+            "deve trovare Rome e ROME case-insensitive"
+        );
     }
 
     #[test]
@@ -4425,18 +4962,22 @@ mod tests {
         let json = r#"[{"a":"foo"},{"a":"bar"}]"#;
         let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
 
-        let results = index.search_in_lazy_node(lazy_id, "xyz", true, false, 10)
+        let results = index
+            .search_in_lazy_node(lazy_id, "xyz", true, false, 10)
             .expect("search failed");
         assert!(results.is_empty());
     }
 
     #[test]
     fn search_in_lazy_node_respects_max_results() {
-        let items: Vec<String> = (0..20).map(|i| format!(r#"{{"v":"match{}"}}"#, i)).collect();
+        let items: Vec<String> = (0..20)
+            .map(|i| format!(r#"{{"v":"match{}"}}"#, i))
+            .collect();
         let json = format!("[{}]", items.join(","));
         let (index, lazy_id, _tmp) = make_lazy_index_from_json(&json);
 
-        let results = index.search_in_lazy_node(lazy_id, "match", true, false, 5)
+        let results = index
+            .search_in_lazy_node(lazy_id, "match", true, false, 5)
             .expect("search failed");
         assert_eq!(results.len(), 5);
     }
@@ -4446,12 +4987,17 @@ mod tests {
         let json = r#"[{"x":1},{"x":2},{"target":"found"},{"x":4}]"#;
         let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
 
-        let results = index.search_in_lazy_node(lazy_id, "found", true, false, 10)
+        let results = index
+            .search_in_lazy_node(lazy_id, "found", true, false, 10)
             .expect("search failed");
         assert_eq!(results.len(), 1);
         let path = index.get_path_any(results[0]);
         // Path should encode element index 2 (third element, 0-based)
-        assert!(path.contains("2"), "path dovrebbe contenere indice '2': {}", path);
+        assert!(
+            path.contains("2"),
+            "path dovrebbe contenere indice '2': {}",
+            path
+        );
     }
 
     #[test]
@@ -4459,7 +5005,7 @@ mod tests {
         // Bug: per nodi LazyObject, elem_bytes includeva "chiave": valore,
         // quindi from_slice parsava solo la chiave e ignorava il valore.
         // Ora elem_bytes contiene solo il valore → i match nei valori vengono trovati.
-        let json = r#"{"state":"ARIZ","region":"West","capital":"Phoenix"}"#;
+        let _json = r#"{"state":"ARIZ","region":"West","capital":"Phoenix"}"#;
         // Usa un LazyArray che contiene un oggetto (per testare il caso is_array=false
         // nel ciclo interno dell'oggetto che stiamo scansionando).
         // In realtà search_in_lazy_node è chiamato su un nodo lazy il cui span è un
@@ -4467,7 +5013,8 @@ mod tests {
         let json_arr = r#"[{"state":"ARIZ","region":"West"},{"state":"CA","region":"West"}]"#;
         let (index, lazy_id, _tmp) = make_lazy_index_from_json(json_arr);
 
-        let results = index.search_in_lazy_node(lazy_id, "ARIZ", true, false, 10)
+        let results = index
+            .search_in_lazy_node(lazy_id, "ARIZ", true, false, 10)
             .expect("search failed");
         assert_eq!(results.len(), 1, "deve trovare 1 risultato per ARIZ");
     }
@@ -4484,11 +5031,182 @@ mod tests {
         // Modifica il nodo root in LazyObject per simulare un oggetto lazy.
         index.nodes[lazy_id as usize].ktype = Node::make_ktype(NodeKind::LazyObject, None);
 
-        let results = index.search_in_lazy_node(lazy_id, "ARIZ", true, false, 10)
+        let results = index
+            .search_in_lazy_node(lazy_id, "ARIZ", true, false, 10)
             .expect("search failed");
         // Con il fix, trova "ARIZ" nel valore dell'elemento "us"
-        assert!(!results.is_empty(), "deve trovare ARIZ nel valore di un LazyObject");
+        assert!(
+            !results.is_empty(),
+            "deve trovare ARIZ nel valore di un LazyObject"
+        );
         let _ = tmp; // mantieni il file temp vivo
+    }
+
+    #[test]
+    fn resolve_path_any_descends_into_lazy_object() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let json = r#"{"settings":{"theme":"dark","lang":"en"}}"#;
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let theme_id = index
+            .resolve_path_any("$.settings.theme")
+            .expect("path inside lazy object should resolve");
+
+        assert_eq!(index.get_path_any(theme_id), "$.settings.theme");
+    }
+
+    #[test]
+    fn search_in_lazy_node_with_options_finds_top_level_keys_in_lazy_object() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let json = r#"{"settings":{"theme":"dark","lang":"en"}}"#;
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let settings_id = index
+            .resolve_path_any("$.settings")
+            .expect("settings path should resolve");
+
+        let results = index
+            .search_in_lazy_node_with_options(
+                settings_id,
+                "theme",
+                "keys",
+                true,
+                false,
+                false,
+                10,
+                false,
+                false,
+            )
+            .expect("lazy key search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(index.get_path_any(results[0]), "$.settings.theme");
+    }
+
+    #[test]
+    fn search_objects_returns_canonical_main_id_for_lazy_object_root() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let json = r#"{"settings":{"theme":"dark","lang":"en"},"other":{"theme":"light"}}"#;
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let settings_id = index
+            .resolve_path_any("$.settings")
+            .expect("settings path should resolve");
+
+        let results = index.search_objects(
+            &[ObjectSearchFilter {
+                path: "theme".to_string(),
+                operator: ObjectSearchOperator::Equals,
+                value: Some("dark".to_string()),
+                ..Default::default()
+            }],
+            false,
+            false,
+            10,
+            None,
+        );
+
+        assert_eq!(results, vec![settings_id]);
+        assert_eq!(index.get_path_any(results[0]), "$.settings");
+    }
+
+    #[test]
+    fn search_objects_in_large_lazy_array_scans_beyond_first_page() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let users = (0..1505)
+            .map(|idx| {
+                let role = if idx == 1500 { "admin" } else { "user" };
+                format!(r#"{{"role":"{}","name":"user-{}"}}"#, role, idx)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"users":[{}]}}"#, users);
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let mut index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let users_id = index
+            .resolve_path_any("$.users")
+            .expect("users path should resolve");
+        let span_id = index.nodes[users_id as usize].value_data as usize;
+        index.lazy_spans[span_id].byte_len = LAZY_PAGINATE_THRESHOLD;
+
+        let results = index
+            .search_objects_in_lazy_node(
+                users_id,
+                &[ObjectSearchFilter {
+                    path: "role".to_string(),
+                    operator: ObjectSearchOperator::Equals,
+                    value: Some("admin".to_string()),
+                    ..Default::default()
+                }],
+                false,
+                false,
+                10,
+            )
+            .expect("streaming object search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(index.get_path_any(results[0]), "$.users.1500");
+    }
+
+    #[test]
+    fn search_in_large_lazy_array_supports_regex_beyond_first_page() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let users = (0..1505)
+            .map(|idx| format!(r#"{{"name":"user-{}"}}"#, idx))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"users":[{}]}}"#, users);
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let mut index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let users_id = index
+            .resolve_path_any("$.users")
+            .expect("users path should resolve");
+        let span_id = index.nodes[users_id as usize].value_data as usize;
+        index.lazy_spans[span_id].byte_len = LAZY_PAGINATE_THRESHOLD;
+
+        let results = index
+            .search_in_lazy_node_with_options(
+                users_id,
+                "^user-1500$",
+                "values",
+                true,
+                true,
+                false,
+                10,
+                false,
+                false,
+            )
+            .expect("streaming regex search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(index.get_path_any(results[0]), "$.users.1500.name");
     }
 
     // ── Regressione: expand_subtree su nodi lazy non deve crashare ─────────────
@@ -4506,13 +5224,15 @@ mod tests {
         let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
 
         // Prima espansione: figli del nodo lazy (extra IDs)
-        let children = index.get_children_any(lazy_id)
+        let children = index
+            .get_children_any(lazy_id)
             .expect("prima espansione fallita");
         assert!(!children.is_empty(), "il nodo lazy deve avere figli");
 
         // Seconda espansione: figli degli extra node (simula BFS di expand_subtree)
         for child_id in &children {
-            let grandchildren = index.get_children_any(*child_id)
+            let grandchildren = index
+                .get_children_any(*child_id)
                 .expect("espansione extra node fallita");
             // Per ogni nipote, verifica che get_children_any non panichi
             for gc_id in &grandchildren {
@@ -4528,14 +5248,20 @@ mod tests {
         let json = r#"[1, "hello", true, null]"#;
         let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
 
-        let children = index.get_children_any(lazy_id)
+        let children = index
+            .get_children_any(lazy_id)
             .expect("espansione lazy fallita");
         assert_eq!(children.len(), 4);
 
         for child_id in children {
-            let grandchildren = index.get_children_any(child_id)
+            let grandchildren = index
+                .get_children_any(child_id)
                 .expect("get_children_any su foglia extra non deve fallire");
-            assert!(grandchildren.is_empty(), "scalare non ha figli: id={}", child_id);
+            assert!(
+                grandchildren.is_empty(),
+                "scalare non ha figli: id={}",
+                child_id
+            );
         }
     }
 
@@ -4555,8 +5281,7 @@ mod tests {
             let mut f = std::fs::File::create(&path).unwrap();
             f.write_all(json.as_bytes()).unwrap();
         }
-        let index = JsonIndex::from_file(path.to_str().unwrap())
-            .expect("from_file must succeed");
+        let index = JsonIndex::from_file(path.to_str().unwrap()).expect("from_file must succeed");
         std::fs::remove_file(&path).ok();
 
         // Root array must contain all 3 entries, not just the first large one.
