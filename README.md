@@ -186,6 +186,8 @@ To benchmark against a real JSON file, create `.bench.env` in the project root
 cp .bench.env.example .bench.env
 # edit .bench.env:
 # BENCH_JSON_PATH=/path/to/large.json
+# RUN_LARGE_FIXTURE_E2E=1
+# E2E_LARGE_FIXTURE_PATH=/path/to/rows-compatible.json
 
 cd src-tauri && cargo bench -- real_file
 ```

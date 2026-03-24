@@ -13,7 +13,10 @@
     "test:coverage": "vitest run --coverage",
     "bench": "cd src-tauri && cargo bench",
     "bench:real": "cd src-tauri && cargo bench -- real_file",
-    "bench:frontend": "node --experimental-strip-types src/bench/perf.mts"
+    "bench:frontend": "node --experimental-strip-types src/bench/perf.mts",
+    "test:e2e": "node scripts/run-e2e.mjs",
+    "test:e2e:build": "node scripts/run-e2e.mjs",
+    "test:e2e:setup": "cd tests/e2e/wdio && npm install"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.13.23",

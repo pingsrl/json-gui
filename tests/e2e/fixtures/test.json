@@ -1,0 +1,44 @@
+{
+  "users": [
+    {
+      "id": 1,
+      "name": "Alice Johnson",
+      "email": "alice@example.com",
+      "role": "admin",
+      "active": true,
+      "address": {
+        "city": "Milano",
+        "country": "IT"
+      }
+    },
+    {
+      "id": 2,
+      "name": "Bob Smith",
+      "email": "bob@example.com",
+      "role": "user",
+      "active": false,
+      "address": {
+        "city": "Roma",
+        "country": "IT"
+      }
+    },
+    {
+      "id": 3,
+      "name": "Charlie Brown",
+      "email": "charlie@example.com",
+      "role": "user",
+      "active": true,
+      "address": {
+        "city": "Torino",
+        "country": "IT"
+      }
+    }
+  ],
+  "settings": {
+    "theme": "dark",
+    "language": "it",
+    "maxResults": 500
+  },
+  "tags": ["alpha", "beta", "gamma"],
+  "version": "1.0.0"
+}

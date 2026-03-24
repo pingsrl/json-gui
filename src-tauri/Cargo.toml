@@ -28,6 +28,8 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# Solo in debug — registrato nel codice con #[cfg(debug_assertions)]
+tauri-plugin-webdriver-automation = "0.1"
 
 [[bench]]
 name = "expand_bench"
