@@ -1,5 +1,6 @@
 use json_gui_lib::json_index::{
-    HeapBytesBreakdown, JsonIndex, Node, NodeKind, ObjectSearchFilter, ObjectSearchOperator,
+    ExtraHeapBytesBreakdown, HeapBytesBreakdown, JsonIndex, Node, NodeKind, ObjectSearchFilter,
+    ObjectSearchOperator,
 };
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -74,6 +75,22 @@ struct MemoryInfo {
     index_heap_mib_estimate: f64,
     bytes_per_node: f64,
     bytes_per_input_byte: f64,
+    extra_heap_bytes_estimate: usize,
+    extra_heap_mib_estimate: f64,
+    total_heap_bytes_estimate: usize,
+    total_heap_mib_estimate: f64,
+    realized_node_count: usize,
+    total_bytes_per_realized_node: f64,
+    total_bytes_per_input_byte: f64,
+    extra_sub_indices_bytes_estimate: usize,
+    extra_sub_index_attachments_bytes_estimate: usize,
+    extra_mat_tables_bytes_estimate: usize,
+    extra_mat_child_ids_bytes_estimate: usize,
+    extra_key_override_bytes_estimate: usize,
+    extra_key_strings_bytes_estimate: usize,
+    extra_page_cache_bytes_estimate: usize,
+    extra_page_cache_values_bytes_estimate: usize,
+    extra_nested_indices_bytes_estimate: usize,
     node_size_bytes: usize,
     nodes_bytes_estimate: usize,
     parent_index_bytes_estimate: usize,
@@ -442,7 +459,21 @@ fn main() -> Result<(), String> {
         val_strings: value_strings_bytes_estimate,
         nums_pool: numbers_bytes_estimate,
     } = index.heap_bytes_breakdown();
+    let ExtraHeapBytesBreakdown {
+        sub_indices: extra_sub_indices_bytes_estimate,
+        sub_index_attachments: extra_sub_index_attachments_bytes_estimate,
+        mat_tables: extra_mat_tables_bytes_estimate,
+        mat_child_ids: extra_mat_child_ids_bytes_estimate,
+        extra_key_override: extra_key_override_bytes_estimate,
+        extra_key_strings: extra_key_strings_bytes_estimate,
+        page_cache: extra_page_cache_bytes_estimate,
+        page_cache_values: extra_page_cache_values_bytes_estimate,
+        nested_indices: extra_nested_indices_bytes_estimate,
+    } = index.extra_heap_bytes_breakdown();
     let index_heap_bytes_estimate = index.heap_bytes_estimate();
+    let extra_heap_bytes_estimate = index.extra_heap_bytes_estimate();
+    let total_heap_bytes_estimate = index.heap_bytes_estimate_total();
+    let realized_node_count = index.realized_node_count();
     let bytes_per_node = if node_count == 0 {
         0.0
     } else {
@@ -452,6 +483,16 @@ fn main() -> Result<(), String> {
         0.0
     } else {
         index_heap_bytes_estimate as f64 / size_bytes as f64
+    };
+    let total_bytes_per_realized_node = if realized_node_count == 0 {
+        0.0
+    } else {
+        total_heap_bytes_estimate as f64 / realized_node_count as f64
+    };
+    let total_bytes_per_input_byte = if size_bytes == 0 {
+        0.0
+    } else {
+        total_heap_bytes_estimate as f64 / size_bytes as f64
     };
 
     let report = PerfReport {
@@ -498,6 +539,22 @@ fn main() -> Result<(), String> {
             index_heap_mib_estimate: index_heap_bytes_estimate as f64 / (1024.0 * 1024.0),
             bytes_per_node,
             bytes_per_input_byte,
+            extra_heap_bytes_estimate,
+            extra_heap_mib_estimate: extra_heap_bytes_estimate as f64 / (1024.0 * 1024.0),
+            total_heap_bytes_estimate,
+            total_heap_mib_estimate: total_heap_bytes_estimate as f64 / (1024.0 * 1024.0),
+            realized_node_count,
+            total_bytes_per_realized_node,
+            total_bytes_per_input_byte,
+            extra_sub_indices_bytes_estimate,
+            extra_sub_index_attachments_bytes_estimate,
+            extra_mat_tables_bytes_estimate,
+            extra_mat_child_ids_bytes_estimate,
+            extra_key_override_bytes_estimate,
+            extra_key_strings_bytes_estimate,
+            extra_page_cache_bytes_estimate,
+            extra_page_cache_values_bytes_estimate,
+            extra_nested_indices_bytes_estimate,
             node_size_bytes: std::mem::size_of::<Node>(),
             nodes_bytes_estimate,
             parent_index_bytes_estimate,

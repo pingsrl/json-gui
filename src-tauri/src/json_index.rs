@@ -18,6 +18,8 @@ pub const LAZY_DEPTH_THRESHOLD: u32 = 1;
 pub const LAZY_PAGINATE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MB
 /// Default page size for inline lazy expansion (get_children_any on large lazy nodes).
 const EXPAND_SUBTREE_INLINE_PAGE: usize = 1_000;
+/// Page size used by lazy search on large arrays.
+const LAZY_SEARCH_PAGE: usize = 1_000;
 /// Maximum number of sub-nodes encoded per sub-index in the global ID space.
 /// Global ID for extra node: base + sub_idx * SUB_INDEX_ID_RANGE + sub_id.
 pub const SUB_INDEX_ID_RANGE: u32 = 1 << 16; // 65536
@@ -27,6 +29,7 @@ pub const SUB_INDEX_ID_RANGE: u32 = 1 << 16; // 65536
 // hash table on Vec<u32> (4 bytes/slot). Zero allocations per string,
 // zero byte doubling as in HashMap<String> or HashMap<Arc<str>>.
 // Memory for N unique strings, T total bytes: T + 13N bytes.
+const INTERNED_STRINGS_MIN_CAPACITY: usize = 16;
 
 pub struct InternedStrings {
     pub data: Vec<u8>,     // bytes of all unique strings, concatenated
@@ -46,9 +49,11 @@ impl InternedStrings {
     pub fn with_capacity(n_strings: usize, data_bytes: usize) -> Self {
         // The hash table must have power-of-2 capacity ≥ n_strings / 0.75
         let hash_cap = if n_strings == 0 {
-            1024usize
+            INTERNED_STRINGS_MIN_CAPACITY
         } else {
-            let min_cap = (n_strings * 4 / 3).next_power_of_two().max(1024);
+            let min_cap = (n_strings * 4 / 3)
+                .next_power_of_two()
+                .max(INTERNED_STRINGS_MIN_CAPACITY);
             min_cap
         };
         Self {
@@ -212,6 +217,13 @@ impl InternedStrings {
     }
 }
 
+#[inline]
+fn estimated_parse_caps(input_len: usize) -> (usize, usize) {
+    let node_cap = (input_len / 50).max(4);
+    let str_bytes = (input_len / 10).max(16);
+    (node_cap, str_bytes)
+}
+
 fn shrink_vec_if_wasteful<T>(vec: &mut Vec<T>) {
     // Only shrink if wasted capacity exceeds 25 % of used length (or > 4 MB
     // of raw bytes) — avoids an expensive realloc+copy on large Vecs where
@@ -295,17 +307,24 @@ pub struct MatInfo2 {
     pub child_sub_ids: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubIndexAttachment {
+    /// Global parent to attach the local sub-index root to.
+    pub parent_global_id: u32,
+    /// Whether the local sub-index root is exposed as a global extra node.
+    pub root_is_exposed: bool,
+}
+
 /// Dynamic state accumulated as the user expands lazy nodes on-demand.
 pub struct ExtraState {
     /// = main nodes.len() at end of from_file; global IDs for extra nodes start here.
     pub base: u32,
     /// Sub-indices from lazy expansions (one per materialization call).
     pub sub_indices: Vec<Arc<JsonIndex>>,
+    /// Metadata describing how each sub-index is attached to the global tree.
+    pub sub_index_attachments: Vec<SubIndexAttachment>,
     /// lazy_node_id → MatInfo2
     pub mat: HashMap<u32, MatInfo2>,
-    /// Maps global_extra_id → parent_global_id (the lazy node that was expanded,
-    /// or another extra node for deeper nesting).
-    pub extra_parent: HashMap<u32, u32>,
     /// Key override for extra nodes whose key can't be stored in the sub-index
     /// (e.g. the element index within a lazy array for search results).
     pub extra_key_override: HashMap<u32, String>,
@@ -606,10 +625,10 @@ impl StreamCtx {
     /// `str_bytes`   = estimated unique bytes for val_strings (file_size / 10).
     fn with_capacity(node_cap: usize, str_bytes: usize) -> Self {
         // JSON keys: few short strings (e.g. field names). Estimate: 1% of nodes, 20 bytes/key.
-        let key_n = (node_cap / 100).max(64);
+        let key_n = (node_cap / 100).max(4);
         let key_bytes = key_n * 20;
-        let parent_overflow_cap = (node_cap / 256).max(16);
-        let container_cap = (node_cap / 4).max(64);
+        let parent_overflow_cap = (node_cap / 256).max(1);
+        let container_cap = (node_cap / 4).max(4);
         // String values: ~30% of nodes, deduplicated bytes already passed as str_bytes.
         let val_n = node_cap * 3 / 10;
         // Numbers: ~20% of nodes.
@@ -856,25 +875,38 @@ impl<'de> Visitor<'de> for ValVisitor {
                 let raw_bytes = raw_val.as_raw_str().as_bytes();
                 match raw_bytes.first().copied() {
                     Some(b'{') | Some(b'[') => {
-                        let is_obj = raw_bytes[0] == b'{';
-                        let kind = if is_obj {
-                            NodeKind::LazyObject
-                        } else {
-                            NodeKind::LazyArray
-                        };
-                        let placeholder_count = estimate_children_count(raw_bytes);
-                        self.ctx.with_mut(|ctx| {
-                            let mmap_base = ctx.mmap_base;
-                            let file_offset = raw_bytes.as_ptr() as u64 - mmap_base as u64;
-                            let byte_len = raw_bytes.len() as u64;
-                            let span_id = ctx.lazy_spans.len() as u32;
-                            ctx.lazy_spans.push(LazySpan {
-                                file_offset,
-                                byte_len,
+                        let preserve_lazy = !(self.depth == 0 && raw_bytes[0] == b'{');
+                        if preserve_lazy {
+                            let is_obj = raw_bytes[0] == b'{';
+                            let kind = if is_obj {
+                                NodeKind::LazyObject
+                            } else {
+                                NodeKind::LazyArray
+                            };
+                            let placeholder_count = estimate_children_count(raw_bytes);
+                            self.ctx.with_mut(|ctx| {
+                                let mmap_base = ctx.mmap_base;
+                                let file_offset = raw_bytes.as_ptr() as u64 - mmap_base as u64;
+                                let byte_len = raw_bytes.len() as u64;
+                                let span_id = ctx.lazy_spans.len() as u32;
+                                ctx.lazy_spans.push(LazySpan {
+                                    file_offset,
+                                    byte_len,
+                                });
+                                ctx.lazy_child_counts.push(placeholder_count);
+                                ctx.alloc_lazy(kind, Some(NodeKey::String(kid)), span_id, id);
                             });
-                            ctx.lazy_child_counts.push(placeholder_count);
-                            ctx.alloc_lazy(kind, Some(NodeKey::String(kid)), span_id, id);
-                        });
+                        } else {
+                            let mut sub_de = sonic_rs::Deserializer::from_slice(raw_bytes);
+                            ValSeed {
+                                ctx: self.ctx,
+                                parent: id,
+                                key: Some(NodeKey::String(kid)),
+                                depth: self.depth + 1,
+                            }
+                            .deserialize(&mut sub_de)
+                            .map_err(|e| de::Error::custom(e.to_string()))?;
+                        }
                     }
                     _ => {
                         // Scalar at lazy depth: re-parse from raw bytes via ValSeed
@@ -1480,8 +1512,8 @@ fn finish_index(ctx: StreamCtx) -> JsonIndex {
         extra: Mutex::new(ExtraState {
             base,
             sub_indices: Vec::new(),
+            sub_index_attachments: Vec::new(),
             mat: HashMap::new(),
-            extra_parent: HashMap::new(),
             extra_key_override: HashMap::new(),
             page_cache: HashMap::new(),
         }),
@@ -1546,6 +1578,11 @@ enum SourceBacking {
     Owned(memmap2::Mmap),
 }
 
+enum LazyNodeOwner<'a> {
+    Main(&'a JsonIndex, u32),
+    Sub(Arc<JsonIndex>, u32),
+}
+
 impl SourceBacking {
     #[inline]
     fn as_bytes(&self) -> &[u8] {
@@ -1561,6 +1598,29 @@ impl SourceBacking {
             Self::Shared(mmap) => mmap,
             Self::Owned(mmap) => Arc::new(mmap),
         }
+    }
+}
+
+impl<'a> LazyNodeOwner<'a> {
+    #[inline]
+    fn index(&self) -> &JsonIndex {
+        match self {
+            Self::Main(index, _) => index,
+            Self::Sub(index, _) => index.as_ref(),
+        }
+    }
+
+    #[inline]
+    fn local_id(&self) -> u32 {
+        match self {
+            Self::Main(_, id) | Self::Sub(_, id) => *id,
+        }
+    }
+
+    #[inline]
+    fn kind(&self) -> NodeKind {
+        let index = self.index();
+        index.nodes[self.local_id() as usize].kind()
     }
 }
 
@@ -1583,6 +1643,34 @@ impl HeapBytesBreakdown {
             + self.keys
             + self.val_strings
             + self.nums_pool
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtraHeapBytesBreakdown {
+    pub sub_indices: usize,
+    pub sub_index_attachments: usize,
+    pub mat_tables: usize,
+    pub mat_child_ids: usize,
+    pub extra_key_override: usize,
+    pub extra_key_strings: usize,
+    pub page_cache: usize,
+    pub page_cache_values: usize,
+    pub nested_indices: usize,
+}
+
+impl ExtraHeapBytesBreakdown {
+    #[inline]
+    pub fn total(self) -> usize {
+        self.sub_indices
+            + self.sub_index_attachments
+            + self.mat_tables
+            + self.mat_child_ids
+            + self.extra_key_override
+            + self.extra_key_strings
+            + self.page_cache
+            + self.page_cache_values
+            + self.nested_indices
     }
 }
 
@@ -1638,6 +1726,61 @@ impl JsonIndex {
         let file = File::open(file_path).map_err(|e| e.to_string())?;
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
         Ok(SourceBacking::Owned(mmap))
+    }
+
+    fn lazy_node_owner_any(&self, id: u32) -> Option<LazyNodeOwner<'_>> {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if id < base {
+            let node = &self.nodes[id as usize];
+            return node.kind().is_lazy().then_some(LazyNodeOwner::Main(self, id));
+        }
+
+        let extra = self.extra.lock().unwrap();
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        if sub_idx >= extra.sub_indices.len() {
+            return None;
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        drop(extra);
+        let node = &sub_index.nodes[sub_id as usize];
+        node.kind()
+            .is_lazy()
+            .then_some(LazyNodeOwner::Sub(sub_index, sub_id))
+    }
+
+    #[inline]
+    fn is_large_lazy_any(&self, id: u32) -> bool {
+        let Some(owner) = self.lazy_node_owner_any(id) else {
+            return false;
+        };
+        owner.index().is_large_lazy(owner.local_id())
+    }
+
+    fn lazy_page_sub_index(
+        &self,
+        lazy_node_id: u32,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<(u32, usize, Arc<JsonIndex>)>, String> {
+        let child_ids = self.get_lazy_children_page(lazy_node_id, offset, limit)?;
+        if child_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let extra = self.extra.lock().unwrap();
+        let base = extra.base;
+        let inner = child_ids[0].saturating_sub(base);
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        if sub_idx >= extra.sub_indices.len() {
+            return Ok(None);
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        Ok(Some((base, sub_idx, sub_index)))
     }
 
     #[inline]
@@ -1716,13 +1859,19 @@ impl JsonIndex {
         // Keep direct children eager for UX/search, but preserve lazy loading for
         // deeper nested containers so materializing one node doesn't eagerly parse
         // the entire subtree again.
+        let nested_lazy_depth = if node.kind() == NodeKind::LazyObject {
+            LAZY_DEPTH_THRESHOLD
+        } else {
+            LAZY_DEPTH_THRESHOLD + 1
+        };
+        let (node_cap, str_bytes) = estimated_parse_caps(raw.len());
         let mut sub_de = sonic_rs::Deserializer::from_slice(raw);
         let mut parsed = parse_streaming_with_cap(
             &mut sub_de,
+            node_cap,
+            str_bytes,
             0,
-            0,
-            0,
-            LAZY_DEPTH_THRESHOLD + 1,
+            nested_lazy_depth,
             source_base,
         )
         .map_err(|e| e.to_string())?;
@@ -1738,33 +1887,16 @@ impl JsonIndex {
             return Ok(());
         }
 
-        let base = extra.base;
         let sub_idx = extra.sub_indices.len();
 
         // Collect direct children of sub_index root
         let child_sub_ids: Vec<u32> = sub_index.children_iter(sub_root).collect();
 
-        // Register global IDs for direct children in extra_parent
-        for (i, &sub_id) in child_sub_ids.iter().enumerate() {
-            let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
-            extra.extra_parent.insert(global_id, node_id);
-            // Also register grandchildren (children of containers within sub_index)
-            // so parent_of_any works transitively for path building.
-            let sub_node = &sub_index.nodes[sub_id as usize];
-            if sub_node.kind().is_container() {
-                Self::register_sub_descendants(
-                    &sub_index,
-                    sub_id,
-                    global_id,
-                    sub_idx,
-                    base,
-                    &mut extra.extra_parent,
-                );
-            }
-            let _ = i; // suppress unused warning
-        }
-
         extra.sub_indices.push(sub_index);
+        extra.sub_index_attachments.push(SubIndexAttachment {
+            parent_global_id: node_id,
+            root_is_exposed: false,
+        });
         extra.mat.insert(
             node_id,
             MatInfo2 {
@@ -1806,13 +1938,19 @@ impl JsonIndex {
         let end = start + span.byte_len as usize;
         let raw = &source.as_bytes()[start..end];
 
+        let nested_lazy_depth = if node.kind() == NodeKind::LazyObject {
+            LAZY_DEPTH_THRESHOLD
+        } else {
+            LAZY_DEPTH_THRESHOLD + 1
+        };
+        let (node_cap, str_bytes) = estimated_parse_caps(raw.len());
         let mut sub_de = sonic_rs::Deserializer::from_slice(raw);
         let mut parsed = parse_streaming_with_cap(
             &mut sub_de,
+            node_cap,
+            str_bytes,
             0,
-            0,
-            0,
-            LAZY_DEPTH_THRESHOLD + 1,
+            nested_lazy_depth,
             source_base,
         )
         .map_err(|e| e.to_string())?;
@@ -1839,22 +1977,14 @@ impl JsonIndex {
 
         for &sub_id in &child_sub_ids {
             let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
-            extra.extra_parent.insert(global_id, global_lazy_id);
-            let sub_node = &sub_index.nodes[sub_id as usize];
-            if sub_node.kind().is_container() {
-                Self::register_sub_descendants(
-                    &sub_index,
-                    sub_id,
-                    global_id,
-                    sub_idx,
-                    base,
-                    &mut extra.extra_parent,
-                );
-            }
             child_ids.push(global_id);
         }
 
         extra.sub_indices.push(sub_index);
+        extra.sub_index_attachments.push(SubIndexAttachment {
+            parent_global_id: global_lazy_id,
+            root_is_exposed: false,
+        });
         extra.mat.insert(
             global_lazy_id,
             MatInfo2 {
@@ -1864,32 +1994,6 @@ impl JsonIndex {
         );
 
         Ok(child_ids)
-    }
-
-    /// Recursively registers extra_parent entries for sub-descendants.
-    fn register_sub_descendants(
-        sub_index: &JsonIndex,
-        container_sub_id: u32,
-        parent_global_id: u32,
-        sub_idx: usize,
-        base: u32,
-        extra_parent: &mut HashMap<u32, u32>,
-    ) {
-        for child_sub_id in sub_index.children_iter(container_sub_id) {
-            let child_global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + child_sub_id;
-            extra_parent.insert(child_global_id, parent_global_id);
-            let child_node = &sub_index.nodes[child_sub_id as usize];
-            if child_node.kind().is_container() {
-                Self::register_sub_descendants(
-                    sub_index,
-                    child_sub_id,
-                    child_global_id,
-                    sub_idx,
-                    base,
-                    extra_parent,
-                );
-            }
-        }
     }
 
     /// Returns direct children of any node (main, lazy, or extra).
@@ -1904,14 +2008,6 @@ impl JsonIndex {
         if id < base {
             let node = &self.nodes[id as usize];
             if node.kind().is_lazy() {
-                let span_id = node.value_data as usize;
-                let is_large = span_id < self.lazy_spans.len()
-                    && self.lazy_spans[span_id].byte_len >= LAZY_PAGINATE_THRESHOLD;
-                if is_large {
-                    // Use paginated scanner for large spans — avoids reading full span
-                    return self.get_lazy_children_page(id, 0, EXPAND_SUBTREE_INLINE_PAGE);
-                }
-                self.materialize_lazy_node(id)?;
                 let extra = self.extra.lock().unwrap();
                 if let Some(mat) = extra.mat.get(&id) {
                     let sub_idx = mat.sub_idx;
@@ -1922,7 +2018,27 @@ impl JsonIndex {
                         .collect();
                     return Ok(global_ids);
                 }
-                return Ok(Vec::new());
+                drop(extra);
+
+                let span_id = node.value_data as usize;
+                let is_large = span_id < self.lazy_spans.len()
+                    && self.lazy_spans[span_id].byte_len >= LAZY_PAGINATE_THRESHOLD;
+                if is_large {
+                    // Use paginated scanner for large spans — avoids reading full span
+                    return self.get_lazy_children_page(id, 0, EXPAND_SUBTREE_INLINE_PAGE);
+                }
+                self.materialize_lazy_node(id)?;
+                let extra = self.extra.lock().unwrap();
+                let Some(mat) = extra.mat.get(&id) else {
+                    return Ok(Vec::new());
+                };
+                let sub_idx = mat.sub_idx;
+                let global_ids: Vec<u32> = mat
+                    .child_sub_ids
+                    .iter()
+                    .map(|&sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
+                    .collect();
+                return Ok(global_ids);
             }
             // Normal main-index container
             if node.kind().is_container() {
@@ -1951,6 +2067,9 @@ impl JsonIndex {
         }
         let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
         drop(extra);
+        if sub_id as usize >= sub_index.nodes.len() {
+            return Ok(Vec::new());
+        }
 
         let sub_node = &sub_index.nodes[sub_id as usize];
         if sub_node.kind().is_lazy() {
@@ -1976,7 +2095,29 @@ impl JsonIndex {
             return self.parent_of(id);
         }
         let extra = self.extra.lock().unwrap();
-        extra.extra_parent.get(&id).copied()
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        if sub_idx >= extra.sub_indices.len() || sub_idx >= extra.sub_index_attachments.len() {
+            return None;
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        let attachment = extra.sub_index_attachments[sub_idx];
+        drop(extra);
+        if sub_id as usize >= sub_index.nodes.len() {
+            return None;
+        }
+
+        match sub_index.parent_of(sub_id) {
+            Some(local_parent) => {
+                if local_parent == sub_index.root && !attachment.root_is_exposed {
+                    Some(attachment.parent_global_id)
+                } else {
+                    Some(base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + local_parent)
+                }
+            }
+            None => attachment.root_is_exposed.then_some(attachment.parent_global_id),
+        }
     }
 
     /// Returns children count for any node (main, lazy, or extra).
@@ -2000,6 +2141,9 @@ impl JsonIndex {
         }
         let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
         drop(extra);
+        if sub_id as usize >= sub_index.nodes.len() {
+            return 0;
+        }
         sub_index.children_len(sub_id)
     }
 
@@ -2033,6 +2177,9 @@ impl JsonIndex {
         }
         let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
         drop(extra);
+        if sub_id as usize >= sub_index.nodes.len() {
+            return NodeKind::Null;
+        }
         sub_index.nodes[sub_id as usize].kind()
     }
 
@@ -2359,6 +2506,83 @@ impl JsonIndex {
         self.heap_bytes_breakdown().total()
     }
 
+    pub fn extra_heap_bytes_breakdown(&self) -> ExtraHeapBytesBreakdown {
+        let (
+            sub_indices,
+            sub_indices_bytes,
+            sub_index_attachments_bytes,
+            mat_bytes,
+            mat_child_ids_bytes,
+            extra_key_override_bytes,
+            extra_key_strings_bytes,
+            page_cache_bytes,
+            page_cache_values_bytes,
+        ) = {
+            let extra = self.extra.lock().unwrap();
+            (
+                extra.sub_indices.clone(),
+                extra.sub_indices.capacity() * std::mem::size_of::<Arc<JsonIndex>>(),
+                extra.sub_index_attachments.capacity() * std::mem::size_of::<SubIndexAttachment>(),
+                extra.mat.capacity() * std::mem::size_of::<(u32, MatInfo2)>(),
+                extra
+                    .mat
+                    .values()
+                    .map(|info| info.child_sub_ids.capacity() * std::mem::size_of::<u32>())
+                    .sum::<usize>(),
+                extra.extra_key_override.capacity() * std::mem::size_of::<(u32, String)>(),
+                extra
+                    .extra_key_override
+                    .values()
+                    .map(|key| key.capacity())
+                    .sum::<usize>(),
+                extra.page_cache.capacity()
+                    * std::mem::size_of::<((u32, usize, usize), Vec<u32>)>(),
+                extra
+                    .page_cache
+                    .values()
+                    .map(|ids| ids.capacity() * std::mem::size_of::<u32>())
+                    .sum::<usize>(),
+            )
+        };
+
+        let nested_bytes = sub_indices
+            .into_iter()
+            .map(|sub_index| sub_index.heap_bytes_estimate_total())
+            .sum::<usize>();
+
+        ExtraHeapBytesBreakdown {
+            sub_indices: sub_indices_bytes,
+            sub_index_attachments: sub_index_attachments_bytes,
+            mat_tables: mat_bytes,
+            mat_child_ids: mat_child_ids_bytes,
+            extra_key_override: extra_key_override_bytes,
+            extra_key_strings: extra_key_strings_bytes,
+            page_cache: page_cache_bytes,
+            page_cache_values: page_cache_values_bytes,
+            nested_indices: nested_bytes,
+        }
+    }
+
+    pub fn extra_heap_bytes_estimate(&self) -> usize {
+        self.extra_heap_bytes_breakdown().total()
+    }
+
+    pub fn heap_bytes_estimate_total(&self) -> usize {
+        self.heap_bytes_estimate() + self.extra_heap_bytes_estimate()
+    }
+
+    pub fn realized_node_count(&self) -> usize {
+        let sub_indices = {
+            let extra = self.extra.lock().unwrap();
+            extra.sub_indices.clone()
+        };
+        self.nodes.len()
+            + sub_indices
+                .into_iter()
+                .map(|sub_index| sub_index.realized_node_count())
+                .sum::<usize>()
+    }
+
     /// Returns the direct parent of `id`.
     /// Fast path is O(1) via delta decoding; large parent gaps fall back to sparse overflow lookup.
     pub fn parent_of(&self, id: u32) -> Option<u32> {
@@ -2447,12 +2671,15 @@ impl JsonIndex {
     pub fn from_str(json: &str) -> Result<Self, String> {
         // sonic-rs is SIMD-accelerated and ~2x faster than serde_json for in-memory strings.
         let mut de = sonic_rs::Deserializer::from_str(json);
-        parse_streaming(&mut de).map_err(|e| e.to_string())
+        let (node_cap, str_bytes) = estimated_parse_caps(json.len());
+        parse_streaming_with_cap(&mut de, node_cap, str_bytes, 0, 0, 0).map_err(|e| e.to_string())
     }
 
     pub fn from_slice(bytes: &[u8]) -> Result<Self, String> {
         let mut de = sonic_rs::Deserializer::from_slice(bytes);
-        parse_streaming(&mut de).map_err(|e| e.to_string())
+        let (node_cap, str_bytes) = estimated_parse_caps(bytes.len());
+        parse_streaming_with_cap(&mut de, node_cap, str_bytes, 0, 0, 0)
+            .map_err(|e| e.to_string())
     }
 
     /// Loads from file via mmap + sonic-rs (SIMD parsing).
@@ -2567,27 +2794,47 @@ impl JsonIndex {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<u32>, String> {
-        let node = &self.nodes[node_id as usize];
+        let Some(owner) = self.lazy_node_owner_any(node_id) else {
+            return Ok(Vec::new());
+        };
+        let owner_index = owner.index();
+        let owner_local_id = owner.local_id();
+        let node = &owner_index.nodes[owner_local_id as usize];
         debug_assert!(node.kind().is_lazy());
 
         let span_id = node.value_data as usize;
-        let span = self.lazy_spans[span_id];
+        if span_id >= owner_index.lazy_spans.len() {
+            return Ok(Vec::new());
+        }
+        let span = owner_index.lazy_spans[span_id];
 
         // For small lazy spans, use full materialization (fast enough)
         if span.byte_len < LAZY_PAGINATE_THRESHOLD {
-            self.materialize_lazy_node(node_id)?;
-            let extra = self.extra.lock().unwrap();
-            let base = extra.base;
-            if let Some(mat) = extra.mat.get(&node_id) {
-                let sub_idx = mat.sub_idx;
-                let global_ids: Vec<u32> = mat
-                    .child_sub_ids
-                    .iter()
-                    .skip(offset)
-                    .take(limit)
-                    .map(|&sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
-                    .collect();
-                return Ok(global_ids);
+            match owner {
+                LazyNodeOwner::Main(_, local_id) => {
+                    self.materialize_lazy_node(local_id)?;
+                    let extra = self.extra.lock().unwrap();
+                    let base = extra.base;
+                    if let Some(mat) = extra.mat.get(&node_id) {
+                        let sub_idx = mat.sub_idx;
+                        let global_ids: Vec<u32> = mat
+                            .child_sub_ids
+                            .iter()
+                            .skip(offset)
+                            .take(limit)
+                            .map(|&sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
+                            .collect();
+                        return Ok(global_ids);
+                    }
+                }
+                LazyNodeOwner::Sub(sub_index, local_id) => {
+                    return Ok(self
+                        .materialize_lazy_node_from_sub_index(node_id, &sub_index, local_id)?
+                        .into_iter()
+                        .skip(offset)
+                        .take(limit)
+                        .collect());
+                }
             }
             return Ok(Vec::new());
         }
@@ -2600,7 +2847,7 @@ impl JsonIndex {
         }
 
         // Large lazy span: use custom byte scanner for pagination
-        let source = self
+        let source = owner_index
             .source_backing()
             .map_err(|_| "no source file for lazy expansion".to_string())?;
         let mmap = source.as_bytes();
@@ -2614,35 +2861,24 @@ impl JsonIndex {
             return Ok(Vec::new());
         }
 
-        // Build a wrapper JSON string for these elements and parse as a sub-index.
-        // For arrays we use an object wrapper with keys = offset+i so that array
-        // indices in the sub-index reflect the correct global position (e.g. page 2
-        // at offset=1000 gets keys "1000", "1001", … instead of "0", "1", …).
+        // Build a wrapper JSON value for this page and parse it as a sub-index.
+        // Arrays keep an array root to avoid interning thousands of numeric string keys;
+        // we remap visible array indices through `extra_key_override`.
         // For objects the keys are already embedded in the raw bytes.
         let total_bytes: usize = elements.iter().map(|(s, e)| e - s).sum::<usize>()
             + elements.len().saturating_sub(1) // commas
             + 2; // brackets
-        let mut wrapper = String::with_capacity(total_bytes);
-        wrapper.push('{');
+        let mut wrapper = Vec::with_capacity(total_bytes);
+        wrapper.push(if is_array { b'[' } else { b'{' });
         for (i, (elem_start, elem_end)) in elements.iter().enumerate() {
             if i > 0 {
-                wrapper.push(',');
+                wrapper.push(b',');
             }
-            if is_array {
-                // Explicit numeric key so the sub-index stores the correct global index.
-                wrapper.push('"');
-                wrapper.push_str(&(offset + i).to_string());
-                wrapper.push_str("\":");
-            }
-            let elem_bytes = &raw[*elem_start..*elem_end];
-            match std::str::from_utf8(elem_bytes) {
-                Ok(s) => wrapper.push_str(s),
-                Err(_) => wrapper.push_str("null"),
-            }
+            wrapper.extend_from_slice(&raw[*elem_start..*elem_end]);
         }
-        wrapper.push('}');
+        wrapper.push(if is_array { b']' } else { b'}' });
 
-        let sub_index = Arc::new(JsonIndex::from_str(&wrapper)?);
+        let sub_index = Arc::new(JsonIndex::from_slice(&wrapper)?);
         let sub_root = sub_index.root;
         let child_sub_ids: Vec<u32> = sub_index.children_iter(sub_root).collect();
 
@@ -2651,23 +2887,20 @@ impl JsonIndex {
         let sub_idx = extra.sub_indices.len();
 
         let mut child_ids = Vec::with_capacity(child_sub_ids.len());
-        for &sub_id in &child_sub_ids {
+        for (i, &sub_id) in child_sub_ids.iter().enumerate() {
             let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
-            extra.extra_parent.insert(global_id, node_id);
-            let sub_node = &sub_index.nodes[sub_id as usize];
-            if sub_node.kind().is_container() {
-                Self::register_sub_descendants(
-                    &sub_index,
-                    sub_id,
-                    global_id,
-                    sub_idx,
-                    base,
-                    &mut extra.extra_parent,
-                );
+            if is_array {
+                extra
+                    .extra_key_override
+                    .insert(global_id, (offset + i).to_string());
             }
             child_ids.push(global_id);
         }
         extra.sub_indices.push(sub_index);
+        extra.sub_index_attachments.push(SubIndexAttachment {
+            parent_global_id: node_id,
+            root_is_exposed: false,
+        });
         extra
             .page_cache
             .insert((node_id, offset, limit), child_ids.clone());
@@ -3455,7 +3688,7 @@ impl JsonIndex {
                 }),
                 NodeKind::LazyArray => {
                     let wanted_index = segment.parse::<usize>().ok()?;
-                    if self.is_large_lazy(parent_id) {
+                    if self.is_large_lazy_any(parent_id) {
                         return self
                             .get_lazy_children_page(parent_id, wanted_index, 1)
                             .ok()?
@@ -3606,11 +3839,88 @@ impl JsonIndex {
             let extra = self.extra.lock().unwrap();
             extra.base
         };
+        if parent_id < base {
+            let parent = &self.nodes[parent_id as usize];
+            return match parent.kind() {
+                NodeKind::Array => {
+                    let wanted_index = segment.array_index?;
+                    self.children_iter(parent_id).find(|&child_id| {
+                        self.nodes[child_id as usize].array_index() == Some(wanted_index)
+                    })
+                }
+                NodeKind::Object => self.children_iter(parent_id).find(|&child_id| {
+                    let child = &self.nodes[child_id as usize];
+                    if key_case_sensitive {
+                        if let Some(exact_id) = segment.exact_id {
+                            return child.string_key_id() == Some(exact_id);
+                        }
+                        child
+                            .string_key_id()
+                            .is_some_and(|kid| self.keys.get(kid) == segment.raw)
+                    } else {
+                        child.string_key_id().is_some_and(|kid| {
+                            matches_text(
+                                self.keys.get(kid),
+                                &segment.raw,
+                                &segment.lower,
+                                false,
+                                true,
+                            )
+                        })
+                    }
+                }),
+                NodeKind::LazyArray => {
+                    let wanted_index = segment.array_index?;
+                    if self.is_large_lazy_any(parent_id) {
+                        return self
+                            .get_lazy_children_page(parent_id, wanted_index as usize, 1)
+                            .ok()?
+                            .into_iter()
+                            .next();
+                    }
+                    self.get_children_any(parent_id)
+                        .ok()?
+                        .into_iter()
+                        .find(|&child_id| {
+                            self.key_string_any(child_id)
+                                .is_some_and(|key| key == wanted_index.to_string())
+                        })
+                }
+                NodeKind::LazyObject => {
+                    self.get_children_any(parent_id)
+                        .ok()?
+                        .into_iter()
+                        .find(|&child_id| {
+                            if key_case_sensitive {
+                                if let Some(exact_id) = segment.exact_id {
+                                    if child_id < base {
+                                        return self.nodes[child_id as usize].string_key_id()
+                                            == Some(exact_id);
+                                    }
+                                }
+                                self.key_string_any(child_id)
+                                    .is_some_and(|key| key == segment.raw)
+                            } else {
+                                self.key_string_any(child_id).is_some_and(|key| {
+                                    matches_text(
+                                        &key,
+                                        &segment.raw,
+                                        &segment.lower,
+                                        false,
+                                        true,
+                                    )
+                                })
+                            }
+                        })
+                }
+                _ => None,
+            };
+        }
         let kind = self.node_kind_any(parent_id);
         match kind {
             NodeKind::Array | NodeKind::LazyArray => {
                 let wanted_index = segment.array_index?;
-                if kind == NodeKind::LazyArray && parent_id < base && self.is_large_lazy(parent_id) {
+                if kind == NodeKind::LazyArray && self.is_large_lazy_any(parent_id) {
                     return self
                         .get_lazy_children_page(parent_id, wanted_index as usize, 1)
                         .ok()?
@@ -3705,14 +4015,20 @@ impl JsonIndex {
         value_case_sensitive: bool,
         max_results: usize,
     ) -> Result<Vec<u32>, String> {
-        let node = &self.nodes[lazy_node_id as usize];
-        if !node.kind().is_lazy() || max_results == 0 {
+        let Some(owner) = self.lazy_node_owner_any(lazy_node_id) else {
+            return Ok(Vec::new());
+        };
+        if max_results == 0 {
             return Ok(Vec::new());
         }
+        let owner_index = owner.index();
+        let owner_local_id = owner.local_id();
+        let owner_kind = owner.kind();
 
-        let is_large_array = node.kind() == NodeKind::LazyArray && self.is_large_lazy(lazy_node_id);
+        let is_large_array =
+            owner_kind == NodeKind::LazyArray && owner_index.is_large_lazy(owner_local_id);
         if !is_large_array {
-            self.materialize_lazy_node(lazy_node_id)?;
+            self.get_children_any(lazy_node_id)?;
 
             let extra = self.extra.lock().unwrap();
             let base = extra.base;
@@ -3735,7 +4051,11 @@ impl JsonIndex {
                 .into_iter()
                 .map(|sub_id| {
                     if sub_id == sub_index.root {
-                        lazy_node_id
+                        if owner_kind == NodeKind::LazyObject {
+                            lazy_node_id
+                        } else {
+                            base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id
+                        }
                     } else {
                         base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id
                     }
@@ -3743,90 +4063,36 @@ impl JsonIndex {
                 .collect());
         }
 
-        let span_id = node.value_data as usize;
-        if span_id >= self.lazy_spans.len() {
-            return Ok(Vec::new());
-        }
-        let span = self.lazy_spans[span_id];
-
-        let source = self.source_backing()?;
-        let mmap = source.as_bytes();
-        let span_start = span.file_offset as usize;
-        let span_end = span_start + span.byte_len as usize;
-        let bytes = &mmap[span_start..span_end.min(mmap.len())];
-
         let mut results: Vec<u32> = Vec::new();
-        let mut elem_index: usize = 0;
-        let mut pos = 0usize;
-        let base = { self.extra.lock().unwrap().base };
-
-        while pos < bytes.len() && bytes[pos] != b'[' {
-            pos += 1;
-        }
-        if pos >= bytes.len() {
-            return Ok(results);
-        }
-        pos += 1;
-
-        loop {
-            while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b',') {
-                pos += 1;
-            }
-            if pos >= bytes.len() || bytes[pos] == b']' {
+        let mut offset = 0usize;
+        while results.len() < max_results {
+            let remaining = max_results - results.len();
+            let Some((base, sub_idx, sub_index)) =
+                self.lazy_page_sub_index(lazy_node_id, offset, remaining.min(LAZY_SEARCH_PAGE))?
+            else {
                 break;
-            }
+            };
 
-            let value_start = pos;
-            pos = scan_json_value_end(bytes, pos);
-            let elem_end = pos.min(bytes.len());
-            let elem_bytes = &bytes[value_start..elem_end];
+            let matching_sub = sub_index.search_objects(
+                filters,
+                key_case_sensitive,
+                value_case_sensitive,
+                remaining.saturating_add(1),
+                None,
+            );
 
-            if let Ok(sub_index) = JsonIndex::from_slice(elem_bytes) {
-                let matching_sub = sub_index.search_objects(
-                    filters,
-                    key_case_sensitive,
-                    value_case_sensitive,
-                    max_results.saturating_sub(results.len()),
-                    None,
-                );
-
-                if !matching_sub.is_empty() {
-                    let sub_index = Arc::new(sub_index);
-                    let sub_root = sub_index.root;
-                    let mut extra = self.extra.lock().unwrap();
-                    let sub_idx = extra.sub_indices.len();
-                    let root_global = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_root;
-
-                    extra.extra_parent.insert(root_global, lazy_node_id);
-                    extra
-                        .extra_key_override
-                        .insert(root_global, elem_index.to_string());
-
-                    Self::register_sub_descendants(
-                        &sub_index,
-                        sub_root,
-                        root_global,
-                        sub_idx,
-                        base,
-                        &mut extra.extra_parent,
-                    );
-
-                    extra.sub_indices.push(sub_index);
-
-                    for sub_id in matching_sub {
-                        let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
-                        results.push(global_id);
-                        if results.len() >= max_results {
-                            break;
-                        }
-                    }
+            for sub_id in matching_sub {
+                if sub_id == sub_index.root {
+                    continue;
+                }
+                let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
+                results.push(global_id);
+                if results.len() >= max_results {
+                    break;
                 }
             }
 
-            elem_index += 1;
-            if results.len() >= max_results {
-                break;
-            }
+            offset += remaining.min(LAZY_SEARCH_PAGE);
         }
 
         Ok(results)
@@ -4006,14 +4272,20 @@ impl JsonIndex {
         multiline: bool,
         dot_all: bool,
     ) -> Result<Vec<u32>, String> {
-        let node = &self.nodes[lazy_node_id as usize];
-        if !node.kind().is_lazy() || max_results == 0 {
-            return Ok(vec![]);
+        let Some(owner) = self.lazy_node_owner_any(lazy_node_id) else {
+            return Ok(Vec::new());
+        };
+        if max_results == 0 {
+            return Ok(Vec::new());
         }
+        let owner_index = owner.index();
+        let owner_local_id = owner.local_id();
+        let owner_kind = owner.kind();
 
-        let is_large_array = node.kind() == NodeKind::LazyArray && self.is_large_lazy(lazy_node_id);
+        let is_large_array =
+            owner_kind == NodeKind::LazyArray && owner_index.is_large_lazy(owner_local_id);
         if !is_large_array {
-            self.materialize_lazy_node(lazy_node_id)?;
+            self.get_children_any(lazy_node_id)?;
 
             let extra = self.extra.lock().unwrap();
             let base = extra.base;
@@ -4039,13 +4311,45 @@ impl JsonIndex {
             return Ok(matches
                 .into_iter()
                 .filter_map(|sub_id| {
-                    if sub_id == sub_index.root && node.kind() == NodeKind::LazyObject {
+                    if sub_id == sub_index.root && owner_kind == NodeKind::LazyObject {
                         None
                     } else {
                         Some(base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
                     }
                 })
                 .collect());
+        }
+
+        if !use_regex {
+            let mut results = Vec::new();
+            let mut offset = 0usize;
+            while results.len() < max_results {
+                let remaining = max_results - results.len();
+                let Some((base, sub_idx, sub_index)) =
+                    self.lazy_page_sub_index(lazy_node_id, offset, remaining.min(LAZY_SEARCH_PAGE))?
+                else {
+                    break;
+                };
+
+                let matches = sub_index.search(
+                    query,
+                    target,
+                    case_sensitive,
+                    false,
+                    exact_match,
+                    remaining,
+                    None,
+                    multiline,
+                    dot_all,
+                );
+
+                results.extend(matches.into_iter().map(|sub_id| {
+                    base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id
+                }));
+
+                offset += remaining.min(LAZY_SEARCH_PAGE);
+            }
+            return Ok(results);
         }
 
         self.search_in_lazy_node_streaming(
@@ -4073,23 +4377,29 @@ impl JsonIndex {
         multiline: bool,
         dot_all: bool,
     ) -> Result<Vec<u32>, String> {
-        let node = &self.nodes[lazy_node_id as usize];
-        if !node.kind().is_lazy() || max_results == 0 {
-            return Ok(vec![]);
+        let Some(owner) = self.lazy_node_owner_any(lazy_node_id) else {
+            return Ok(Vec::new());
+        };
+        if max_results == 0 {
+            return Ok(Vec::new());
         }
+        let owner_index = owner.index();
+        let owner_local_id = owner.local_id();
+        let owner_kind = owner.kind();
+        let node = &owner_index.nodes[owner_local_id as usize];
         let span_id = node.value_data as usize;
-        if span_id >= self.lazy_spans.len() {
-            return Ok(vec![]);
+        if span_id >= owner_index.lazy_spans.len() {
+            return Ok(Vec::new());
         }
-        let span = self.lazy_spans[span_id];
+        let span = owner_index.lazy_spans[span_id];
 
-        let source = self.source_backing()?;
+        let source = owner_index.source_backing()?;
         let mmap = source.as_bytes();
         let span_start = span.file_offset as usize;
         let span_end = span_start + span.byte_len as usize;
         let bytes = &mmap[span_start..span_end.min(mmap.len())];
 
-        let is_array = node.kind() == NodeKind::LazyArray;
+        let is_array = owner_kind == NodeKind::LazyArray;
         let query_lower = query.to_lowercase();
         // Byte sequence used for the fast pre-filter
         let needle: &[u8] = if case_sensitive {
@@ -4177,23 +4487,16 @@ impl JsonIndex {
                         let sub_idx = extra.sub_indices.len();
                         let root_global = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_root;
 
-                        // Register parent → lazy node and key → element index
-                        extra.extra_parent.insert(root_global, lazy_node_id);
+                        // Register key override for the exposed root search result.
                         extra
                             .extra_key_override
                             .insert(root_global, elem_index.to_string());
 
-                        // Register all descendants so get_path_any works transitively
-                        Self::register_sub_descendants(
-                            &sub_index,
-                            sub_root,
-                            root_global,
-                            sub_idx,
-                            base,
-                            &mut extra.extra_parent,
-                        );
-
                         extra.sub_indices.push(sub_index);
+                        extra.sub_index_attachments.push(SubIndexAttachment {
+                            parent_global_id: lazy_node_id,
+                            root_is_exposed: true,
+                        });
 
                         for sub_id in matching_sub {
                             let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
@@ -5505,6 +5808,200 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(index.get_path_any(results[0]), "$.users.1500.name");
+    }
+
+    #[test]
+    fn search_in_extra_large_lazy_array_supports_text_search() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let items = (0..1505)
+            .map(|idx| format!(r#"{{"title":"Product {}"}}"#, idx))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"catalog":{{"items":[{}]}}}}"#, items);
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let items_id = index
+            .resolve_path_any("$.catalog.items")
+            .expect("items path should resolve");
+        let base = { index.extra.lock().unwrap().base };
+        let inner = items_id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        {
+            let mut extra = index.extra.lock().unwrap();
+            let owner = Arc::get_mut(&mut extra.sub_indices[sub_idx]).expect("unique owner");
+            let span_id = owner.nodes[sub_id as usize].value_data as usize;
+            owner.lazy_spans[span_id].byte_len = LAZY_PAGINATE_THRESHOLD;
+        }
+
+        let results = index
+            .search_in_lazy_node_with_options(
+                items_id,
+                "Product 1500",
+                "values",
+                false,
+                false,
+                false,
+                10,
+                false,
+                false,
+            )
+            .expect("streaming text search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(index.get_path_any(results[0]), "$.catalog.items.1500.title");
+    }
+
+    #[test]
+    fn search_objects_in_extra_large_lazy_array_supports_nested_filters() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let items = (0..1505)
+            .map(|idx| {
+                format!(
+                    r#"{{"content":{{"mainImage":[{{"url":"https://cdn.example.com/images/{:04}.jpg"}}]}}}}"#,
+                    idx
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"catalog":{{"items":[{}]}}}}"#, items);
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let items_id = index
+            .resolve_path_any("$.catalog.items")
+            .expect("items path should resolve");
+        let base = { index.extra.lock().unwrap().base };
+        let inner = items_id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        {
+            let mut extra = index.extra.lock().unwrap();
+            let owner = Arc::get_mut(&mut extra.sub_indices[sub_idx]).expect("unique owner");
+            let span_id = owner.nodes[sub_id as usize].value_data as usize;
+            owner.lazy_spans[span_id].byte_len = LAZY_PAGINATE_THRESHOLD;
+        }
+
+        let results = index
+            .search_objects_in_lazy_node(
+                items_id,
+                &[ObjectSearchFilter {
+                    path: "content.mainImage.0.url".to_string(),
+                    operator: ObjectSearchOperator::Contains,
+                    value: Some("1500.jpg".to_string()),
+                    ..Default::default()
+                }],
+                true,
+                false,
+                10,
+            )
+            .expect("streaming object search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(index.get_path_any(results[0]), "$.catalog.items.1500");
+    }
+
+    #[test]
+    fn search_in_extra_large_lazy_array_finds_nested_text_values() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let items = (0..1505)
+            .map(|idx| {
+                format!(
+                    r#"{{"content":{{"title":"Product {}","mainImage":[{{"url":"https://cdn.example.com/images/{:04}.jpg"}}]}}}}"#,
+                    idx, idx
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"catalog":{{"items":[{}]}}}}"#, items);
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let items_id = index
+            .resolve_path_any("$.catalog.items")
+            .expect("items path should resolve");
+        let base = { index.extra.lock().unwrap().base };
+        let inner = items_id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        {
+            let mut extra = index.extra.lock().unwrap();
+            let owner = Arc::get_mut(&mut extra.sub_indices[sub_idx]).expect("unique owner");
+            let span_id = owner.nodes[sub_id as usize].value_data as usize;
+            owner.lazy_spans[span_id].byte_len = LAZY_PAGINATE_THRESHOLD;
+        }
+
+        let results = index
+            .search_in_lazy_node_with_options(
+                items_id,
+                "product 1500",
+                "values",
+                false,
+                false,
+                false,
+                10,
+                false,
+                false,
+            )
+            .expect("streaming nested text search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(index.get_path_any(results[0]), "$.catalog.items.1500.content.title");
+    }
+
+    #[test]
+    fn get_lazy_children_page_supports_extra_large_lazy_array_ids() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let items = (0..1505)
+            .map(|idx| format!(r#"{{"title":"Product {}"}}"#, idx))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"catalog":{{"items":[{}]}}}}"#, items);
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let items_id = index
+            .resolve_path_any("$.catalog.items")
+            .expect("items path should resolve");
+        let base = { index.extra.lock().unwrap().base };
+        let inner = items_id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        {
+            let mut extra = index.extra.lock().unwrap();
+            let owner = Arc::get_mut(&mut extra.sub_indices[sub_idx]).expect("unique owner");
+            let span_id = owner.nodes[sub_id as usize].value_data as usize;
+            owner.lazy_spans[span_id].byte_len = LAZY_PAGINATE_THRESHOLD;
+        }
+
+        let child_ids = index
+            .get_lazy_children_page(items_id, 1500, 1)
+            .expect("paged children lookup failed");
+
+        assert_eq!(child_ids.len(), 1);
+        assert_eq!(index.get_path_any(child_ids[0]), "$.catalog.items.1500");
+        assert!(!index.extra.lock().unwrap().mat.contains_key(&items_id));
     }
 
     #[test]
