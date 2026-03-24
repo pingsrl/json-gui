@@ -1,5 +1,5 @@
 use json_gui_lib::json_index::{
-    HeapBytesBreakdown, JsonIndex, Node, ObjectSearchFilter, ObjectSearchOperator,
+    HeapBytesBreakdown, JsonIndex, Node, NodeKind, ObjectSearchFilter, ObjectSearchOperator,
 };
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -17,7 +17,7 @@ const SEARCH_REGEX_QUERY: &str = r"\d+";
 const SEARCH_TEXT_QUERY: &str = "product";
 const OBJECT_SEARCH_PATH: &str = "content.mainImage.0.url";
 const OBJECT_SEARCH_VALUE: &str = "cdn.example.com/images/";
-const LAZY_CATALOG_PATH: &str = "$.catalog";
+const LAZY_ITEMS_PATH: &str = "$.catalog.items";
 
 #[derive(Debug)]
 struct Config {
@@ -330,10 +330,9 @@ fn bfs_expand_all(index: &JsonIndex) -> usize {
     count
 }
 
-fn lazy_catalog_node_id(index: &JsonIndex) -> Option<u32> {
-    let node_id = index.resolve_path_any(LAZY_CATALOG_PATH)?;
-    let node = &index.nodes[node_id as usize];
-    if node.kind().is_lazy() {
+fn lazy_items_node_id(index: &JsonIndex) -> Option<u32> {
+    let node_id = index.resolve_path_any(LAZY_ITEMS_PATH)?;
+    if index.node_kind_any(node_id) == NodeKind::LazyArray {
         Some(node_id)
     } else {
         None
@@ -359,7 +358,7 @@ fn main() -> Result<(), String> {
     let (load_metric, index) = timed(config.iterations, || JsonIndex::from_file(path_str))?;
     let node_count = index.nodes.len();
 
-    let lazy_items_id = lazy_catalog_node_id(&index);
+    let lazy_items_id = lazy_items_node_id(&index);
     let (search_regex_metric, search_regex_matches) = timed(config.iterations, || {
         if let Some(node_id) = lazy_items_id {
             index.search_in_lazy_node_with_options(

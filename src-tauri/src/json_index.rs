@@ -1554,6 +1554,14 @@ impl SourceBacking {
             Self::Owned(mmap) => &mmap[..],
         }
     }
+
+    #[inline]
+    fn into_arc(self) -> Arc<memmap2::Mmap> {
+        match self {
+            Self::Shared(mmap) => mmap,
+            Self::Owned(mmap) => Arc::new(mmap),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1700,13 +1708,27 @@ impl JsonIndex {
         let source = self
             .source_backing()
             .map_err(|_| "source_file not set for lazy expansion".to_string())?;
-        let mmap = source.as_bytes();
+        let source_base = source.as_bytes().as_ptr() as usize;
         let start = span.file_offset as usize;
         let end = start + span.byte_len as usize;
-        let raw = &mmap[start..end];
+        let raw = &source.as_bytes()[start..end];
 
-        // Parse sub-index (no lazy mode for sub-parse — individual rows are small)
-        let sub_index = Arc::new(JsonIndex::from_slice(raw)?);
+        // Keep direct children eager for UX/search, but preserve lazy loading for
+        // deeper nested containers so materializing one node doesn't eagerly parse
+        // the entire subtree again.
+        let mut sub_de = sonic_rs::Deserializer::from_slice(raw);
+        let mut parsed = parse_streaming_with_cap(
+            &mut sub_de,
+            0,
+            0,
+            0,
+            LAZY_DEPTH_THRESHOLD + 1,
+            source_base,
+        )
+        .map_err(|e| e.to_string())?;
+        parsed.source_file = self.source_file.clone();
+        parsed.source_mmap = Some(source.into_arc());
+        let sub_index = Arc::new(parsed);
         let sub_root = sub_index.root;
 
         let mut extra = self.extra.lock().unwrap();
@@ -1752,6 +1774,96 @@ impl JsonIndex {
         );
 
         Ok(())
+    }
+
+    fn materialize_lazy_node_from_sub_index(
+        &self,
+        global_lazy_id: u32,
+        owner_index: &JsonIndex,
+        owner_lazy_id: u32,
+    ) -> Result<Vec<u32>, String> {
+        {
+            let extra = self.extra.lock().unwrap();
+            if let Some(mat) = extra.mat.get(&global_lazy_id) {
+                let base = extra.base;
+                let sub_idx = mat.sub_idx;
+                return Ok(mat
+                    .child_sub_ids
+                    .iter()
+                    .map(|&sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
+                    .collect());
+            }
+        }
+
+        let node = &owner_index.nodes[owner_lazy_id as usize];
+        debug_assert!(node.kind().is_lazy(), "owner node must be lazy");
+
+        let span_id = node.value_data as usize;
+        let span = owner_index.lazy_spans[span_id];
+        let source = owner_index.source_backing()?;
+        let source_base = source.as_bytes().as_ptr() as usize;
+        let start = span.file_offset as usize;
+        let end = start + span.byte_len as usize;
+        let raw = &source.as_bytes()[start..end];
+
+        let mut sub_de = sonic_rs::Deserializer::from_slice(raw);
+        let mut parsed = parse_streaming_with_cap(
+            &mut sub_de,
+            0,
+            0,
+            0,
+            LAZY_DEPTH_THRESHOLD + 1,
+            source_base,
+        )
+        .map_err(|e| e.to_string())?;
+        parsed.source_file = owner_index.source_file.clone();
+        parsed.source_mmap = Some(source.into_arc());
+        let sub_index = Arc::new(parsed);
+        let sub_root = sub_index.root;
+        let child_sub_ids: Vec<u32> = sub_index.children_iter(sub_root).collect();
+
+        let mut extra = self.extra.lock().unwrap();
+        if let Some(mat) = extra.mat.get(&global_lazy_id) {
+            let base = extra.base;
+            let sub_idx = mat.sub_idx;
+            return Ok(mat
+                .child_sub_ids
+                .iter()
+                .map(|&sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id)
+                .collect());
+        }
+
+        let base = extra.base;
+        let sub_idx = extra.sub_indices.len();
+        let mut child_ids = Vec::with_capacity(child_sub_ids.len());
+
+        for &sub_id in &child_sub_ids {
+            let global_id = base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id;
+            extra.extra_parent.insert(global_id, global_lazy_id);
+            let sub_node = &sub_index.nodes[sub_id as usize];
+            if sub_node.kind().is_container() {
+                Self::register_sub_descendants(
+                    &sub_index,
+                    sub_id,
+                    global_id,
+                    sub_idx,
+                    base,
+                    &mut extra.extra_parent,
+                );
+            }
+            child_ids.push(global_id);
+        }
+
+        extra.sub_indices.push(sub_index);
+        extra.mat.insert(
+            global_lazy_id,
+            MatInfo2 {
+                sub_idx,
+                child_sub_ids,
+            },
+        );
+
+        Ok(child_ids)
     }
 
     /// Recursively registers extra_parent entries for sub-descendants.
@@ -1821,6 +1933,15 @@ impl JsonIndex {
 
         // Extra node: look up its sub-index
         let extra = self.extra.lock().unwrap();
+        if let Some(mat) = extra.mat.get(&id) {
+            let sub_idx = mat.sub_idx;
+            let global_ids: Vec<u32> = mat
+                .child_sub_ids
+                .iter()
+                .map(|&child_sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + child_sub_id)
+                .collect();
+            return Ok(global_ids);
+        }
         let inner = id - base;
         let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
         let sub_id = inner % SUB_INDEX_ID_RANGE;
@@ -1832,6 +1953,9 @@ impl JsonIndex {
         drop(extra);
 
         let sub_node = &sub_index.nodes[sub_id as usize];
+        if sub_node.kind().is_lazy() {
+            return self.materialize_lazy_node_from_sub_index(id, &sub_index, sub_id);
+        }
         if !sub_node.kind().is_container() {
             return Ok(Vec::new());
         }
@@ -1865,6 +1989,9 @@ impl JsonIndex {
             return self.children_len(id);
         }
         let extra = self.extra.lock().unwrap();
+        if let Some(mat) = extra.mat.get(&id) {
+            return mat.child_sub_ids.len() as u32;
+        }
         let inner = id - base;
         let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
         let sub_id = inner % SUB_INDEX_ID_RANGE;
@@ -3029,6 +3156,68 @@ impl JsonIndex {
         }
     }
 
+    fn value_matches_regex_any(&self, id: u32, re: &Regex) -> bool {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if id < base {
+            return self.value_matches_regex(&self.nodes[id as usize], re);
+        }
+        let extra = self.extra.lock().unwrap();
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        if sub_idx >= extra.sub_indices.len() {
+            return false;
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        drop(extra);
+        sub_index.value_matches_regex(&sub_index.nodes[sub_id as usize], re)
+    }
+
+    fn value_matches_query_any(
+        &self,
+        id: u32,
+        query: &str,
+        query_lower: &str,
+        case_sensitive: bool,
+        exact_match: bool,
+        exact_number: Option<f64>,
+    ) -> bool {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if id < base {
+            return self.value_matches_query(
+                &self.nodes[id as usize],
+                query,
+                query_lower,
+                case_sensitive,
+                exact_match,
+                exact_number,
+            );
+        }
+        let extra = self.extra.lock().unwrap();
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        if sub_idx >= extra.sub_indices.len() {
+            return false;
+        }
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        drop(extra);
+        sub_index.value_matches_query(
+            &sub_index.nodes[sub_id as usize],
+            query,
+            query_lower,
+            case_sensitive,
+            exact_match,
+            exact_number,
+        )
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -3330,7 +3519,7 @@ impl JsonIndex {
     fn compile_object_search_filters(
         &self,
         filters: &[ObjectSearchFilter],
-        key_case_sensitive: bool,
+        _key_case_sensitive: bool,
         value_case_sensitive: bool,
     ) -> Option<Vec<CompiledObjectSearchFilter>> {
         let mut compiled = Vec::with_capacity(filters.len());
@@ -3344,9 +3533,6 @@ impl JsonIndex {
             for segment in path.split('.').filter(|segment| !segment.is_empty()) {
                 let exact_id = self.keys.id_of(segment);
                 let array_index = segment.parse::<u32>().ok();
-                if key_case_sensitive && exact_id.is_none() && array_index.is_none() {
-                    return None;
-                }
                 path_segments.push(CompiledPathSegment {
                     raw: segment.to_string(),
                     lower: segment.to_lowercase(),
@@ -3410,6 +3596,60 @@ impl JsonIndex {
         Some(compiled)
     }
 
+    fn find_child_any_by_compiled_segment(
+        &self,
+        parent_id: u32,
+        segment: &CompiledPathSegment,
+        key_case_sensitive: bool,
+    ) -> Option<u32> {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        let kind = self.node_kind_any(parent_id);
+        match kind {
+            NodeKind::Array | NodeKind::LazyArray => {
+                let wanted_index = segment.array_index?;
+                if kind == NodeKind::LazyArray && parent_id < base && self.is_large_lazy(parent_id) {
+                    return self
+                        .get_lazy_children_page(parent_id, wanted_index as usize, 1)
+                        .ok()?
+                        .into_iter()
+                        .next();
+                }
+                self.get_children_any(parent_id)
+                    .ok()?
+                    .into_iter()
+                    .find(|&child_id| {
+                        self.key_string_any(child_id)
+                            .is_some_and(|key| key == wanted_index.to_string())
+                    })
+            }
+            NodeKind::Object | NodeKind::LazyObject => {
+                self.get_children_any(parent_id)
+                    .ok()?
+                    .into_iter()
+                    .find(|&child_id| {
+                        let Some(child_key) = self.key_string_any(child_id) else {
+                            return false;
+                        };
+                        if key_case_sensitive {
+                            if let Some(exact_id) = segment.exact_id {
+                                if child_id < base {
+                                    return self.nodes[child_id as usize].string_key_id()
+                                        == Some(exact_id);
+                                }
+                            }
+                            child_key == segment.raw
+                        } else {
+                            matches_text(&child_key, &segment.raw, &segment.lower, false, true)
+                        }
+                    })
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_relative_path(
         &self,
         start_node_id: u32,
@@ -3418,26 +3658,8 @@ impl JsonIndex {
     ) -> Option<u32> {
         let mut current = start_node_id;
         for segment in path_segments {
-            let parent = &self.nodes[current as usize];
-            current = match parent.kind() {
-                NodeKind::Array => {
-                    let wanted_index = segment.array_index?;
-                    self.children_iter(current).find(|&child_id| {
-                        self.nodes[child_id as usize].array_index() == Some(wanted_index)
-                    })?
-                }
-                NodeKind::Object => self.children_iter(current).find(|&child_id| {
-                    let Some(child_key_id) = self.nodes[child_id as usize].string_key_id() else {
-                        return false;
-                    };
-                    if key_case_sensitive {
-                        return Some(child_key_id) == segment.exact_id;
-                    }
-                    let child_key = self.keys.get(child_key_id);
-                    matches_text(child_key, &segment.raw, &segment.lower, false, true)
-                })?,
-                _ => return None,
-            };
+            current =
+                self.find_child_any_by_compiled_segment(current, segment, key_case_sensitive)?;
         }
         Some(current)
     }
@@ -3454,18 +3676,17 @@ impl JsonIndex {
         else {
             return false;
         };
-        let node = &self.nodes[target_id as usize];
 
         match filter.operator {
             ObjectSearchOperator::Exists => true,
             ObjectSearchOperator::Regex => filter
                 .regex
                 .as_ref()
-                .is_some_and(|regex| self.value_matches_regex(node, regex)),
+                .is_some_and(|regex| self.value_matches_regex_any(target_id, regex)),
             ObjectSearchOperator::Contains | ObjectSearchOperator::Equals => {
                 let needle = filter.value_cmp.as_deref().unwrap_or_default();
-                self.value_matches_query(
-                    node,
+                self.value_matches_query_any(
+                    target_id,
                     needle,
                     needle,
                     value_case_sensitive,
@@ -4977,6 +5198,61 @@ mod tests {
             2,
             "deve trovare Rome e ROME case-insensitive"
         );
+    }
+
+    #[test]
+    fn materialize_lazy_node_preserves_nested_lazy_containers() {
+        let json = r#"[{"name":"Alice","info":{"city":"Rome"},"tags":[1,2,3]}]"#;
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
+
+        index
+            .materialize_lazy_node(lazy_id)
+            .expect("materialization failed");
+
+        let rows = index
+            .get_children_any(lazy_id)
+            .expect("children of lazy root should load");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(index.node_kind_any(rows[0]), NodeKind::Object);
+
+        let fields = index
+            .get_children_any(rows[0])
+            .expect("children of row object should load");
+        let mut seen = std::collections::HashMap::new();
+        for field_id in fields {
+            seen.insert(
+                index.key_string_any(field_id).unwrap_or_default(),
+                index.node_kind_any(field_id),
+            );
+        }
+
+        assert_eq!(seen.get("name"), Some(&NodeKind::Str));
+        assert_eq!(seen.get("info"), Some(&NodeKind::LazyObject));
+        assert_eq!(seen.get("tags"), Some(&NodeKind::LazyArray));
+    }
+
+    #[test]
+    fn search_objects_in_lazy_node_works_with_nested_lazy_fields_after_materialize() {
+        let json = r#"[{"content":{"mainImage":[{"url":"https://cdn.example.com/images/0001.jpg"}]}}]"#;
+        let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
+
+        let results = index
+            .search_objects_in_lazy_node(
+                lazy_id,
+                &[ObjectSearchFilter {
+                    path: "content.mainImage.0.url".to_string(),
+                    operator: ObjectSearchOperator::Contains,
+                    value: Some("cdn.example.com/images/".to_string()),
+                    ..Default::default()
+                }],
+                true,
+                false,
+                10,
+            )
+            .expect("object search should succeed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(index.get_path_any(results[0]), "$.0");
     }
 
     #[test]
