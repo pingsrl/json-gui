@@ -933,13 +933,17 @@ pub async fn search(
     let base = { index.extra.lock().unwrap().base };
     let dtos: Vec<SearchResult> = results
         .into_iter()
-        .map(|id| {
+        .filter(|&id| !index.is_hidden_extra_root(id))
+        .filter_map(|id| {
             // For extra nodes (materialized from lazy spans), use the any-methods
             if id >= base {
                 let value_preview = index.value_preview_any(id);
                 let path = index.get_path_any(id);
+                if path == "$" {
+                    return None;
+                }
                 let key = index.key_string_any(id);
-                return SearchResult {
+                return Some(SearchResult {
                     node_id: id,
                     file_order: id,
                     path,
@@ -947,7 +951,7 @@ pub async fn search(
                     value_preview,
                     kind: "node",
                     match_preview: None,
-                };
+                });
             }
             let node = &index.nodes[id as usize];
             let value_preview = match node.kind() {
@@ -960,7 +964,7 @@ pub async fn search(
                 NodeKind::LazyObject => "[object]".to_string(),
                 NodeKind::LazyArray => "[array]".to_string(),
             };
-            SearchResult {
+            Some(SearchResult {
                 node_id: id,
                 file_order: id,
                 path: index.get_path(id),
@@ -968,7 +972,7 @@ pub async fn search(
                 value_preview,
                 kind: "node",
                 match_preview: None,
-            }
+            })
         })
         .collect();
     Ok(dtos)
@@ -1092,6 +1096,7 @@ pub async fn search_objects(
     let base = { index.extra.lock().unwrap().base };
     let dtos = ids
         .into_iter()
+        .filter(|&id| !index.is_hidden_extra_root(id))
         .map(|id| {
             let (path, key, value_preview) = if id >= base {
                 let count = index.children_count_any(id) as usize;

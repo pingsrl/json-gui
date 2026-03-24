@@ -2216,6 +2216,28 @@ impl JsonIndex {
         }
     }
 
+    pub fn is_hidden_extra_root(&self, id: u32) -> bool {
+        let base = {
+            let extra = self.extra.lock().unwrap();
+            extra.base
+        };
+        if id < base {
+            return false;
+        }
+
+        let extra = self.extra.lock().unwrap();
+        let inner = id - base;
+        let sub_idx = (inner / SUB_INDEX_ID_RANGE) as usize;
+        let sub_id = inner % SUB_INDEX_ID_RANGE;
+        if sub_idx >= extra.sub_indices.len() || sub_idx >= extra.sub_index_attachments.len() {
+            return false;
+        }
+
+        let sub_index = Arc::clone(&extra.sub_indices[sub_idx]);
+        let attachment = extra.sub_index_attachments[sub_idx];
+        !attachment.root_is_exposed && sub_id == sub_index.root
+    }
+
     /// Returns children count for any node (main, lazy, or extra).
     pub fn children_count_any(&self, id: u32) -> u32 {
         let base = {
@@ -4445,6 +4467,20 @@ impl JsonIndex {
                     break;
                 };
 
+                if sub_index.nodes.len() >= SUB_INDEX_ID_RANGE as usize {
+                    return self.search_in_lazy_node_streaming(
+                        lazy_node_id,
+                        query,
+                        target,
+                        case_sensitive,
+                        false,
+                        exact_match,
+                        max_results,
+                        multiline,
+                        dot_all,
+                    );
+                }
+
                 let matches = sub_index.search(
                     query,
                     target,
@@ -4457,11 +4493,12 @@ impl JsonIndex {
                     dot_all,
                 );
 
-                results.extend(
-                    matches
-                        .into_iter()
-                        .map(|sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id),
-                );
+                for sub_id in matches {
+                    if sub_id == sub_index.root {
+                        continue;
+                    }
+                    results.push(base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id);
+                }
 
                 offset += remaining.min(LAZY_SEARCH_PAGE);
             }
@@ -6119,6 +6156,130 @@ mod tests {
         assert_eq!(child_ids.len(), 1);
         assert_eq!(index.get_path_any(child_ids[0]), "$.catalog.items.1500");
         assert!(!index.extra.lock().unwrap().mat.contains_key(&items_id));
+    }
+
+    #[test]
+    fn search_in_large_lazy_array_page_mode_skips_wrapper_root_results() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let users = (0..1505)
+            .map(|idx| format!(r#"{{"name":"adel-{}","role":"user"}}"#, idx))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"users":[{}]}}"#, users);
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let mut index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let users_id = index
+            .resolve_path_any("$.users")
+            .expect("users path should resolve");
+        let span_id = index.nodes[users_id as usize].value_data as usize;
+        index.lazy_spans[span_id].byte_len = LAZY_PAGINATE_THRESHOLD;
+
+        let results = index
+            .search_in_lazy_node_with_options(
+                users_id,
+                "adel-1200",
+                "values",
+                false,
+                false,
+                false,
+                10,
+                false,
+                false,
+            )
+            .expect("paged lazy search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(index.get_path_any(results[0]), "$.users.1200.name");
+    }
+
+    #[test]
+    fn search_in_large_lazy_array_page_mode_both_target_skips_hidden_roots() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let users = (0..1505)
+            .map(|idx| format!(r#"{{"name":"adel-{}","role":"user"}}"#, idx))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"users":[{}]}}"#, users);
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let mut index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let users_id = index
+            .resolve_path_any("$.users")
+            .expect("users path should resolve");
+        let span_id = index.nodes[users_id as usize].value_data as usize;
+        index.lazy_spans[span_id].byte_len = LAZY_PAGINATE_THRESHOLD;
+
+        let results = index
+            .search_in_lazy_node_with_options(
+                users_id, "adel", "both", false, false, false, 10, false, false,
+            )
+            .expect("paged lazy search failed");
+
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|&id| !index.is_hidden_extra_root(id)));
+        assert!(
+            results
+                .iter()
+                .all(|&id| index.get_path_any(id).starts_with("$.users."))
+        );
+    }
+
+    #[test]
+    fn search_in_large_lazy_array_falls_back_when_page_subindex_overflows_id_range() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let rows = (0..520)
+            .map(|idx| {
+                let fields = (0..180)
+                    .map(|field| format!(r#""field_{field}":"needle-{idx}-{field}""#))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{{{fields}}}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"users":[{rows}]}}"#);
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let mut index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let users_id = index
+            .resolve_path_any("$.users")
+            .expect("users path should resolve");
+        let span_id = index.nodes[users_id as usize].value_data as usize;
+        index.lazy_spans[span_id].byte_len = LAZY_PAGINATE_THRESHOLD;
+
+        let results = index
+            .search_in_lazy_node_with_options(
+                users_id,
+                "needle-519-179",
+                "both",
+                false,
+                false,
+                false,
+                500,
+                false,
+                false,
+            )
+            .expect("paged lazy search failed");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(index.get_path_any(results[0]), "$.users.519.field_179");
+        assert!(!index.is_hidden_extra_root(results[0]));
     }
 
     #[test]
