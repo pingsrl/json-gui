@@ -100,18 +100,18 @@ fn main() {
     let file_path = &args[1];
 
     // Parse optional flags
-    let search_text: Option<String> = args.windows(2)
+    let search_text: Option<String> = args
+        .windows(2)
         .find(|w| w[0] == "--search")
         .map(|w| w[1].clone());
 
-    let expand_rows: usize = args.windows(2)
+    let expand_rows: usize = args
+        .windows(2)
         .find(|w| w[0] == "--expand-rows")
         .and_then(|w| w[1].parse().ok())
         .unwrap_or(5);
 
-    let file_size = std::fs::metadata(file_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
     let file_mb = file_size as f64 / 1_048_576.0;
 
     println!();
@@ -136,16 +136,18 @@ fn main() {
     let node_count = index.nodes.len();
     let lazy_count = index.nodes.iter().filter(|n| n.kind().is_lazy()).count();
     let heap_mb = index.heap_bytes_estimate() as f64 / 1_048_576.0;
-    let ram_ratio = if file_mb > 0.0 { (rss1 - rss0) / file_mb } else { 0.0 };
+    let ram_ratio = if file_mb > 0.0 {
+        (rss1 - rss0) / file_mb
+    } else {
+        0.0
+    };
 
     phase(
         "1. Caricamento",
         load_elapsed,
         rss0,
         rss1,
-        &format!(
-            "nodes={node_count} lazy={lazy_count} heap={heap_mb:.0}MB ratio={ram_ratio:.2}x"
-        ),
+        &format!("nodes={node_count} lazy={lazy_count} heap={heap_mb:.0}MB ratio={ram_ratio:.2}x"),
     );
 
     // ── 2. Root children ──────────────────────────────────────────────────────
@@ -164,9 +166,10 @@ fn main() {
 
     // ── 3. First large container ──────────────────────────────────────────────
     // Find the first child with the most children (likely the data array)
-    let big_child = root_children.iter().copied().max_by_key(|&id| {
-        index.children_count_any(id)
-    });
+    let big_child = root_children
+        .iter()
+        .copied()
+        .max_by_key(|&id| index.children_count_any(id));
 
     if let Some(big_id) = big_child {
         let big_count = index.children_count_any(big_id);
@@ -180,7 +183,10 @@ fn main() {
             elapsed,
             rss_before,
             rss_after,
-            &format!("node={big_id} declared={big_count} got={}", big_children.len()),
+            &format!(
+                "node={big_id} declared={big_count} got={}",
+                big_children.len()
+            ),
         );
 
         // ── 4. Expand N rows ──────────────────────────────────────────────────
@@ -200,7 +206,10 @@ fn main() {
                 elapsed,
                 rss_before,
                 rss_after,
-                &format!("celle_tot={total_cells} ~{:.1}ms/riga", elapsed.as_secs_f64() * 1000.0 / n as f64),
+                &format!(
+                    "celle_tot={total_cells} ~{:.1}ms/riga",
+                    elapsed.as_secs_f64() * 1000.0 / n as f64
+                ),
             );
         }
     }
@@ -209,7 +218,26 @@ fn main() {
     if let Some(ref text) = search_text {
         let rss_before = rss_mb();
         let t = Instant::now();
-        let results = index.search(text, "all", false, false, false, 200, None, false, false);
+        let mut results = index.search(text, "both", false, false, false, 500, None, false, false);
+        if results.len() < 500 {
+            for (id, node) in index.nodes.iter().enumerate() {
+                if !node.kind().is_lazy() {
+                    continue;
+                }
+                let remaining = 500usize.saturating_sub(results.len());
+                if remaining == 0 {
+                    break;
+                }
+                if let Ok(lazy_results) = index.search_in_lazy_node_with_options(
+                    id as u32, text, "both", false, false, false, remaining, false, false,
+                ) {
+                    results.extend(lazy_results);
+                }
+                if results.len() >= 500 {
+                    break;
+                }
+            }
+        }
         let elapsed = t.elapsed();
         let rss_after = rss_mb();
         phase(
@@ -240,10 +268,16 @@ fn main() {
 
     // ── Summary ───────────────────────────────────────────────────────────────
     sep();
-    println!("  Totale tempo caricamento : {}", fmt_duration(load_elapsed));
+    println!(
+        "  Totale tempo caricamento : {}",
+        fmt_duration(load_elapsed)
+    );
     println!("  Nodi principali          : {node_count} (lazy={lazy_count})");
     println!("  Heap stimato             : {heap_mb:.1} MB");
-    println!("  RSS delta caricamento    : {:.0} MB  ({ram_ratio:.2}x file)", rss1 - rss0);
+    println!(
+        "  RSS delta caricamento    : {:.0} MB  ({ram_ratio:.2}x file)",
+        rss1 - rss0
+    );
     sep();
     println!();
 }

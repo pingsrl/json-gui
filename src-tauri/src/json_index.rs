@@ -20,6 +20,9 @@ pub const LAZY_PAGINATE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MB
 const EXPAND_SUBTREE_INLINE_PAGE: usize = 1_000;
 /// Page size used by lazy search on large arrays.
 const LAZY_SEARCH_PAGE: usize = 1_000;
+/// Above this span size, cold text search on large lazy arrays is cheaper in
+/// fully streaming mode than by materializing page sub-indices one by one.
+const LAZY_STREAMING_TEXT_SEARCH_THRESHOLD: u64 = 256 * 1024 * 1024; // 256 MB
 /// Maximum number of sub-nodes encoded per sub-index in the global ID space.
 /// Global ID for extra node: base + sub_idx * SUB_INDEX_ID_RANGE + sub_id.
 pub const SUB_INDEX_ID_RANGE: u32 = 1 << 16; // 65536
@@ -1057,6 +1060,71 @@ struct TopLevelEntry {
     is_array: bool,
 }
 
+#[inline]
+fn is_json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+#[inline]
+fn skip_json_whitespace(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_json_whitespace(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+#[inline]
+fn contains_ascii_case_insensitive_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+
+    let first_lower = needle[0].to_ascii_lowercase();
+    let first_upper = needle[0].to_ascii_uppercase();
+    let mut search_from = 0usize;
+
+    while search_from < haystack.len() {
+        let slice = &haystack[search_from..];
+        let next_lower = memchr::memchr(first_lower, slice);
+        let next_upper = if first_upper == first_lower {
+            None
+        } else {
+            memchr::memchr(first_upper, slice)
+        };
+
+        let Some(rel_pos) = (match (next_lower, next_upper) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }) else {
+            return false;
+        };
+
+        let start = search_from + rel_pos;
+        let end = start + needle.len();
+        if end <= haystack.len() && haystack[start..end].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+
+        search_from = start + 1;
+    }
+
+    false
+}
+
+#[inline]
+fn contains_query_bytes(haystack: &[u8], needle: &[u8], case_sensitive: bool) -> bool {
+    if case_sensitive {
+        memmem::find(haystack, needle).is_some()
+    } else if needle.is_ascii() {
+        contains_ascii_case_insensitive_bytes(haystack, needle)
+    } else {
+        let lower: Vec<u8> = haystack.iter().map(|b| b.to_ascii_lowercase()).collect();
+        memmem::find(&lower, needle).is_some()
+    }
+}
+
 /// Scan to end of a JSON string literal starting at `bytes[start]` (must be `"`).
 /// Returns the index one past the closing `"`.
 #[inline]
@@ -1279,6 +1347,29 @@ fn find_value_end_reverse(bytes: &[u8], open_char: u8, value_start: usize) -> us
     bytes.len() // fallback: return entire remainder
 }
 
+fn last_root_value_end_from_reverse(
+    bytes: &[u8],
+    value_start: usize,
+    open_char: u8,
+    root_close_pos: usize,
+) -> Option<usize> {
+    if !matches!(open_char, b'{' | b'[') || root_close_pos == 0 {
+        return None;
+    }
+
+    let value_end = find_value_end_reverse(bytes, open_char, value_start);
+    if value_end == 0 || value_end >= root_close_pos {
+        return None;
+    }
+
+    let tail = skip_json_whitespace(bytes, value_end);
+    if tail + 1 == root_close_pos && bytes[tail] == bytes[root_close_pos - 1] {
+        Some(value_end)
+    } else {
+        None
+    }
+}
+
 /// Threshold for "small value" forward scan budget per entry.
 const FAST_SCAN_SMALL_VALUE_THRESHOLD: usize = 2 * 1024 * 1024; // 2 MB
 
@@ -1356,9 +1447,7 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
     let mut pos = 0usize;
 
     // Find root bracket
-    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
-        pos += 1;
-    }
+    pos = skip_json_whitespace(bytes, pos);
     if pos >= bytes.len() {
         return Err("empty JSON".to_string());
     }
@@ -1376,7 +1465,7 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
     // Find root close position from the end (for reverse scan fallback)
     // The root's closing bracket is the last non-whitespace byte of the file.
     let mut root_close_pos = bytes.len();
-    while root_close_pos > 0 && matches!(bytes[root_close_pos - 1], b' ' | b'\t' | b'\n' | b'\r') {
+    while root_close_pos > 0 && is_json_whitespace(bytes[root_close_pos - 1]) {
         root_close_pos -= 1;
     }
     // root_close_pos now points one past the root's closing bracket
@@ -1386,7 +1475,7 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
 
     loop {
         // Skip whitespace/commas
-        while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b',') {
+        while pos < bytes.len() && (is_json_whitespace(bytes[pos]) || bytes[pos] == b',') {
             pos += 1;
         }
         if pos >= bytes.len() || matches!(bytes[pos], b']' | b'}') {
@@ -1411,7 +1500,7 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
 
         if !is_array_root {
             // Skip whitespace and colon
-            while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b':') {
+            while pos < bytes.len() && (is_json_whitespace(bytes[pos]) || bytes[pos] == b':') {
                 pos += 1;
             }
         }
@@ -1433,9 +1522,11 @@ fn scan_top_level_entries(bytes: &[u8]) -> Result<Vec<TopLevelEntry>, String> {
             {
                 Some(end) => end,
                 None => {
-                    // Value exceeds quick-scan budget — do a full (unbounded) forward scan.
-                    let remaining = bytes.len().saturating_sub(value_start);
-                    scan_json_value_end_budgeted(bytes, value_start, remaining)
+                    last_root_value_end_from_reverse(bytes, value_start, first_byte, root_close_pos)
+                        .or_else(|| {
+                            let remaining = bytes.len().saturating_sub(value_start);
+                            scan_json_value_end_budgeted(bytes, value_start, remaining)
+                        })
                         .unwrap_or_else(|| find_value_end_reverse(bytes, first_byte, value_start))
                 }
             };
@@ -1735,7 +1826,10 @@ impl JsonIndex {
         };
         if id < base {
             let node = &self.nodes[id as usize];
-            return node.kind().is_lazy().then_some(LazyNodeOwner::Main(self, id));
+            return node
+                .kind()
+                .is_lazy()
+                .then_some(LazyNodeOwner::Main(self, id));
         }
 
         let extra = self.extra.lock().unwrap();
@@ -2116,7 +2210,9 @@ impl JsonIndex {
                     Some(base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + local_parent)
                 }
             }
-            None => attachment.root_is_exposed.then_some(attachment.parent_global_id),
+            None => attachment
+                .root_is_exposed
+                .then_some(attachment.parent_global_id),
         }
     }
 
@@ -2678,8 +2774,7 @@ impl JsonIndex {
     pub fn from_slice(bytes: &[u8]) -> Result<Self, String> {
         let mut de = sonic_rs::Deserializer::from_slice(bytes);
         let (node_cap, str_bytes) = estimated_parse_caps(bytes.len());
-        parse_streaming_with_cap(&mut de, node_cap, str_bytes, 0, 0, 0)
-            .map_err(|e| e.to_string())
+        parse_streaming_with_cap(&mut de, node_cap, str_bytes, 0, 0, 0).map_err(|e| e.to_string())
     }
 
     /// Loads from file via mmap + sonic-rs (SIMD parsing).
@@ -3902,13 +3997,7 @@ impl JsonIndex {
                                     .is_some_and(|key| key == segment.raw)
                             } else {
                                 self.key_string_any(child_id).is_some_and(|key| {
-                                    matches_text(
-                                        &key,
-                                        &segment.raw,
-                                        &segment.lower,
-                                        false,
-                                        true,
-                                    )
+                                    matches_text(&key, &segment.raw, &segment.lower, false, true)
                                 })
                             }
                         })
@@ -3935,27 +4024,26 @@ impl JsonIndex {
                             .is_some_and(|key| key == wanted_index.to_string())
                     })
             }
-            NodeKind::Object | NodeKind::LazyObject => {
-                self.get_children_any(parent_id)
-                    .ok()?
-                    .into_iter()
-                    .find(|&child_id| {
-                        let Some(child_key) = self.key_string_any(child_id) else {
-                            return false;
-                        };
-                        if key_case_sensitive {
-                            if let Some(exact_id) = segment.exact_id {
-                                if child_id < base {
-                                    return self.nodes[child_id as usize].string_key_id()
-                                        == Some(exact_id);
-                                }
+            NodeKind::Object | NodeKind::LazyObject => self
+                .get_children_any(parent_id)
+                .ok()?
+                .into_iter()
+                .find(|&child_id| {
+                    let Some(child_key) = self.key_string_any(child_id) else {
+                        return false;
+                    };
+                    if key_case_sensitive {
+                        if let Some(exact_id) = segment.exact_id {
+                            if child_id < base {
+                                return self.nodes[child_id as usize].string_key_id()
+                                    == Some(exact_id);
                             }
-                            child_key == segment.raw
-                        } else {
-                            matches_text(&child_key, &segment.raw, &segment.lower, false, true)
                         }
-                    })
-            }
+                        child_key == segment.raw
+                    } else {
+                        matches_text(&child_key, &segment.raw, &segment.lower, false, true)
+                    }
+                }),
             _ => None,
         }
     }
@@ -4281,9 +4369,18 @@ impl JsonIndex {
         let owner_index = owner.index();
         let owner_local_id = owner.local_id();
         let owner_kind = owner.kind();
+        let owner_node = &owner_index.nodes[owner_local_id as usize];
+        let owner_span_bytes = owner_index
+            .lazy_spans
+            .get(owner_node.value_data as usize)
+            .map(|span| span.byte_len)
+            .unwrap_or(0);
 
         let is_large_array =
             owner_kind == NodeKind::LazyArray && owner_index.is_large_lazy(owner_local_id);
+        let prefer_streaming_text = !use_regex
+            && is_large_array
+            && owner_span_bytes >= LAZY_STREAMING_TEXT_SEARCH_THRESHOLD;
         if !is_large_array {
             self.get_children_any(lazy_node_id)?;
 
@@ -4320,13 +4417,30 @@ impl JsonIndex {
                 .collect());
         }
 
+        if prefer_streaming_text {
+            return self.search_in_lazy_node_streaming(
+                lazy_node_id,
+                query,
+                target,
+                case_sensitive,
+                false,
+                exact_match,
+                max_results,
+                multiline,
+                dot_all,
+            );
+        }
+
         if !use_regex {
             let mut results = Vec::new();
             let mut offset = 0usize;
             while results.len() < max_results {
                 let remaining = max_results - results.len();
-                let Some((base, sub_idx, sub_index)) =
-                    self.lazy_page_sub_index(lazy_node_id, offset, remaining.min(LAZY_SEARCH_PAGE))?
+                let Some((base, sub_idx, sub_index)) = self.lazy_page_sub_index(
+                    lazy_node_id,
+                    offset,
+                    remaining.min(LAZY_SEARCH_PAGE),
+                )?
                 else {
                     break;
                 };
@@ -4343,9 +4457,11 @@ impl JsonIndex {
                     dot_all,
                 );
 
-                results.extend(matches.into_iter().map(|sub_id| {
-                    base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id
-                }));
+                results.extend(
+                    matches
+                        .into_iter()
+                        .map(|sub_id| base + (sub_idx as u32) * SUB_INDEX_ID_RANGE + sub_id),
+                );
 
                 offset += remaining.min(LAZY_SEARCH_PAGE);
             }
@@ -4400,12 +4516,14 @@ impl JsonIndex {
         let bytes = &mmap[span_start..span_end.min(mmap.len())];
 
         let is_array = owner_kind == NodeKind::LazyArray;
-        let query_lower = query.to_lowercase();
-        // Byte sequence used for the fast pre-filter
-        let needle: &[u8] = if case_sensitive {
+        let query_lower = (!case_sensitive).then(|| query.to_lowercase());
+        let needle = if case_sensitive {
             query.as_bytes()
         } else {
-            query_lower.as_bytes()
+            query_lower
+                .as_ref()
+                .expect("query_lower must exist for case-insensitive search")
+                .as_bytes()
         };
 
         let base = { self.extra.lock().unwrap().base };
@@ -4457,13 +4575,8 @@ impl JsonIndex {
             // Fast byte pre-filter before parsing
             let maybe_matches = if use_regex {
                 true
-            } else if case_sensitive {
-                memchr::memmem::find(full_elem, needle).is_some()
             } else {
-                // Elements are typically small, so a lowercase copy is cheap and
-                // avoids reparsing elements that clearly cannot match.
-                let lower: Vec<u8> = full_elem.iter().map(|b| b.to_ascii_lowercase()).collect();
-                memchr::memmem::find(&lower, needle).is_some()
+                contains_query_bytes(full_elem, needle, case_sensitive)
             };
 
             if maybe_matches {
@@ -5536,7 +5649,8 @@ mod tests {
 
     #[test]
     fn search_objects_in_lazy_node_works_with_nested_lazy_fields_after_materialize() {
-        let json = r#"[{"content":{"mainImage":[{"url":"https://cdn.example.com/images/0001.jpg"}]}}]"#;
+        let json =
+            r#"[{"content":{"mainImage":[{"url":"https://cdn.example.com/images/0001.jpg"}]}}]"#;
         let (index, lazy_id, _tmp) = make_lazy_index_from_json(json);
 
         let results = index
@@ -5962,7 +6076,10 @@ mod tests {
             .expect("streaming nested text search failed");
 
         assert_eq!(results.len(), 1);
-        assert_eq!(index.get_path_any(results[0]), "$.catalog.items.1500.content.title");
+        assert_eq!(
+            index.get_path_any(results[0]),
+            "$.catalog.items.1500.content.title"
+        );
     }
 
     #[test]
