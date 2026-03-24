@@ -309,6 +309,8 @@ pub struct ExtraState {
     /// Key override for extra nodes whose key can't be stored in the sub-index
     /// (e.g. the element index within a lazy array for search results).
     pub extra_key_override: HashMap<u32, String>,
+    /// Cache of already materialized pages for large lazy containers.
+    pub page_cache: HashMap<(u32, usize, usize), Vec<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1474,12 +1476,14 @@ fn finish_index(ctx: StreamCtx) -> JsonIndex {
         lazy_spans,
         lazy_child_counts,
         source_file: None, // set by from_file after parsing for large files
+        source_mmap: None,
         extra: Mutex::new(ExtraState {
             base,
             sub_indices: Vec::new(),
             mat: HashMap::new(),
             extra_parent: HashMap::new(),
             extra_key_override: HashMap::new(),
+            page_cache: HashMap::new(),
         }),
     }
 }
@@ -1530,11 +1534,26 @@ pub struct JsonIndex {
     /// Estimated child count for each lazy span (for UI preview).
     pub lazy_child_counts: Vec<u16>,
     /// File path kept for on-demand lazy expansion (None for small files or in-memory parse).
-    /// The mmap is NOT kept alive after initial parse — re-opened per expansion to avoid
-    /// holding the entire 4+ GB file resident in RAM.
     pub source_file: Option<String>,
+    /// Shared mapping reused by lazy operations when the index was built from file.
+    pub source_mmap: Option<Arc<memmap2::Mmap>>,
     /// Dynamic state for materialized lazy nodes.
     pub extra: Mutex<ExtraState>,
+}
+
+enum SourceBacking {
+    Shared(Arc<memmap2::Mmap>),
+    Owned(memmap2::Mmap),
+}
+
+impl SourceBacking {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Shared(mmap) => &mmap[..],
+            Self::Owned(mmap) => &mmap[..],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1599,6 +1618,20 @@ struct CompiledPathSegment {
 }
 
 impl JsonIndex {
+    fn source_backing(&self) -> Result<SourceBacking, String> {
+        if let Some(mmap) = self.source_mmap.as_ref() {
+            return Ok(SourceBacking::Shared(Arc::clone(mmap)));
+        }
+
+        let file_path = self
+            .source_file
+            .as_deref()
+            .ok_or_else(|| "source_file not set".to_string())?;
+        let file = File::open(file_path).map_err(|e| e.to_string())?;
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        Ok(SourceBacking::Owned(mmap))
+    }
+
     #[inline]
     fn children_len_for_node(&self, node: &Node) -> u32 {
         if node.kind().is_container() {
@@ -1664,14 +1697,10 @@ impl JsonIndex {
         let span_id = node.value_data as usize;
         let span = self.lazy_spans[span_id];
 
-        // Re-open and mmap the source file just for this expansion, then drop it.
-        // This avoids keeping the entire file resident in RAM between expansions.
-        let file_path = self
-            .source_file
-            .as_deref()
-            .ok_or_else(|| "source_file not set for lazy expansion".to_string())?;
-        let file = File::open(file_path).map_err(|e| e.to_string())?;
-        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        let source = self
+            .source_backing()
+            .map_err(|_| "source_file not set for lazy expansion".to_string())?;
+        let mmap = source.as_bytes();
         let start = span.file_offset as usize;
         let end = start + span.byte_len as usize;
         let raw = &mmap[start..end];
@@ -1890,20 +1919,16 @@ impl JsonIndex {
         if id < base {
             let node = &self.nodes[id as usize];
             if node.kind().is_lazy() {
-                // Re-open the source file to read just this lazy span.
-                if let Some(ref path) = self.source_file {
+                if let Ok(source) = self.source_backing() {
                     let span_id = node.value_data as usize;
                     if span_id < self.lazy_spans.len() {
                         let span = self.lazy_spans[span_id];
                         let start = span.file_offset as usize;
                         let end = start + span.byte_len as usize;
-                        if let Ok(file) = File::open(path) {
-                            if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
-                                if end <= mmap.len() {
-                                    if let Ok(s) = std::str::from_utf8(&mmap[start..end]) {
-                                        return s.to_string();
-                                    }
-                                }
+                        let mmap = source.as_bytes();
+                        if end <= mmap.len() {
+                            if let Ok(s) = std::str::from_utf8(&mmap[start..end]) {
+                                return s.to_string();
                             }
                         }
                     }
@@ -2400,11 +2425,9 @@ impl JsonIndex {
         ctx.container_subtrees[meta_id] = ctx.nodes.len() as u32 - root_id - 1;
         ctx.container_children[meta_id] = entries.len() as u32;
 
-        drop(mmap);
-        drop(file);
-
         let mut index = finish_index(ctx);
         index.source_file = Some(path.to_string());
+        index.source_mmap = Some(Arc::new(mmap));
         Ok(index)
     }
 
@@ -2442,13 +2465,18 @@ impl JsonIndex {
             return Ok(Vec::new());
         }
 
+        {
+            let extra = self.extra.lock().unwrap();
+            if let Some(cached) = extra.page_cache.get(&(node_id, offset, limit)) {
+                return Ok(cached.clone());
+            }
+        }
+
         // Large lazy span: use custom byte scanner for pagination
-        let path = self
-            .source_file
-            .as_deref()
-            .ok_or("no source file for lazy expansion")?;
-        let file = File::open(path).map_err(|e| e.to_string())?;
-        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        let source = self
+            .source_backing()
+            .map_err(|_| "no source file for lazy expansion".to_string())?;
+        let mmap = source.as_bytes();
         let start = span.file_offset as usize;
         let end = (span.file_offset + span.byte_len) as usize;
         let raw = &mmap[start..end.min(mmap.len())];
@@ -2486,7 +2514,6 @@ impl JsonIndex {
             }
         }
         wrapper.push('}');
-        drop(mmap);
 
         let sub_index = Arc::new(JsonIndex::from_str(&wrapper)?);
         let sub_root = sub_index.root;
@@ -2514,6 +2541,9 @@ impl JsonIndex {
             child_ids.push(global_id);
         }
         extra.sub_indices.push(sub_index);
+        extra
+            .page_cache
+            .insert((node_id, offset, limit), child_ids.clone());
 
         Ok(child_ids)
     }
@@ -3498,12 +3528,8 @@ impl JsonIndex {
         }
         let span = self.lazy_spans[span_id];
 
-        let file_path = self
-            .source_file
-            .as_deref()
-            .ok_or_else(|| "source_file not set".to_string())?;
-        let file = File::open(file_path).map_err(|e| e.to_string())?;
-        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        let source = self.source_backing()?;
+        let mmap = source.as_bytes();
         let span_start = span.file_offset as usize;
         let span_end = span_start + span.byte_len as usize;
         let bytes = &mmap[span_start..span_end.min(mmap.len())];
@@ -3836,12 +3862,8 @@ impl JsonIndex {
         }
         let span = self.lazy_spans[span_id];
 
-        let file_path = self
-            .source_file
-            .as_deref()
-            .ok_or_else(|| "source_file not set".to_string())?;
-        let file = File::open(file_path).map_err(|e| e.to_string())?;
-        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        let source = self.source_backing()?;
+        let mmap = source.as_bytes();
         let span_start = span.file_offset as usize;
         let span_end = span_start + span.byte_len as usize;
         let bytes = &mmap[span_start..span_end.min(mmap.len())];
@@ -5207,6 +5229,42 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(index.get_path_any(results[0]), "$.users.1500.name");
+    }
+
+    #[test]
+    fn get_lazy_children_page_reuses_cached_page_ids() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let users = (0..1505)
+            .map(|idx| format!(r#"{{"name":"user-{}"}}"#, idx))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"users":[{}]}}"#, users);
+
+        let mut tmp = NamedTempFile::new().expect("tmp file");
+        tmp.write_all(json.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let mut index = JsonIndex::from_file(tmp.path().to_str().unwrap()).expect("parse failed");
+        let users_id = index
+            .resolve_path_any("$.users")
+            .expect("users path should resolve");
+        let span_id = index.nodes[users_id as usize].value_data as usize;
+        index.lazy_spans[span_id].byte_len = LAZY_PAGINATE_THRESHOLD;
+
+        let first = index
+            .get_lazy_children_page(users_id, 1000, 1000)
+            .expect("first page load failed");
+        let sub_indices_after_first = index.extra.lock().unwrap().sub_indices.len();
+        let second = index
+            .get_lazy_children_page(users_id, 1000, 1000)
+            .expect("second page load failed");
+        let extra = index.extra.lock().unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(extra.sub_indices.len(), sub_indices_after_first);
+        assert!(extra.page_cache.contains_key(&(users_id, 1000, 1000)));
     }
 
     // ── Regressione: expand_subtree su nodi lazy non deve crashare ─────────────

@@ -17,6 +17,7 @@ const SEARCH_REGEX_QUERY: &str = r"\d+";
 const SEARCH_TEXT_QUERY: &str = "product";
 const OBJECT_SEARCH_PATH: &str = "content.mainImage.0.url";
 const OBJECT_SEARCH_VALUE: &str = "cdn.example.com/images/";
+const LAZY_CATALOG_PATH: &str = "$.catalog";
 
 #[derive(Debug)]
 struct Config {
@@ -316,17 +317,27 @@ where
 fn bfs_expand_all(index: &JsonIndex) -> usize {
     let mut count = 0usize;
     let mut queue = VecDeque::new();
-    for id in index.get_children_slice(index.root) {
+    for id in index.get_children_any(index.root).unwrap_or_default() {
         queue.push_back(id);
     }
     while let Some(node_id) = queue.pop_front() {
-        let children = index.get_children_slice(node_id);
+        let children = index.get_children_any(node_id).unwrap_or_default();
         count += children.len();
         for id in children {
             queue.push_back(id);
         }
     }
     count
+}
+
+fn lazy_catalog_node_id(index: &JsonIndex) -> Option<u32> {
+    let node_id = index.resolve_path_any(LAZY_CATALOG_PATH)?;
+    let node = &index.nodes[node_id as usize];
+    if node.kind().is_lazy() {
+        Some(node_id)
+    } else {
+        None
+    }
 }
 
 fn main() -> Result<(), String> {
@@ -348,31 +359,60 @@ fn main() -> Result<(), String> {
     let (load_metric, index) = timed(config.iterations, || JsonIndex::from_file(path_str))?;
     let node_count = index.nodes.len();
 
+    let lazy_items_id = lazy_catalog_node_id(&index);
     let (search_regex_metric, search_regex_matches) = timed(config.iterations, || {
-        Ok(index.search(
-            SEARCH_REGEX_QUERY,
-            "values",
-            false,
-            true,
-            false,
-            DEFAULT_MAX_RESULTS,
-            None,
-            false,
-            false,
-        ))
+        if let Some(node_id) = lazy_items_id {
+            index.search_in_lazy_node_with_options(
+                node_id,
+                SEARCH_REGEX_QUERY,
+                "values",
+                false,
+                true,
+                false,
+                DEFAULT_MAX_RESULTS,
+                false,
+                false,
+            )
+        } else {
+            Ok(index.search(
+                SEARCH_REGEX_QUERY,
+                "values",
+                false,
+                true,
+                false,
+                DEFAULT_MAX_RESULTS,
+                None,
+                false,
+                false,
+            ))
+        }
     })?;
     let (search_text_metric, search_text_matches) = timed(config.iterations, || {
-        Ok(index.search(
-            SEARCH_TEXT_QUERY,
-            "values",
-            false,
-            false,
-            false,
-            DEFAULT_MAX_RESULTS,
-            None,
-            false,
-            false,
-        ))
+        if let Some(node_id) = lazy_items_id {
+            index.search_in_lazy_node_with_options(
+                node_id,
+                SEARCH_TEXT_QUERY,
+                "values",
+                false,
+                false,
+                false,
+                DEFAULT_MAX_RESULTS,
+                false,
+                false,
+            )
+        } else {
+            Ok(index.search(
+                SEARCH_TEXT_QUERY,
+                "values",
+                false,
+                false,
+                false,
+                DEFAULT_MAX_RESULTS,
+                None,
+                false,
+                false,
+            ))
+        }
     })?;
     let object_filters = [ObjectSearchFilter {
         path: OBJECT_SEARCH_PATH.to_string(),
@@ -381,7 +421,17 @@ fn main() -> Result<(), String> {
         ..Default::default()
     }];
     let (search_objects_metric, search_objects_matches) = timed(config.iterations, || {
-        Ok(index.search_objects(&object_filters, true, false, DEFAULT_MAX_RESULTS, None))
+        if let Some(node_id) = lazy_items_id {
+            index.search_objects_in_lazy_node(
+                node_id,
+                &object_filters,
+                true,
+                false,
+                DEFAULT_MAX_RESULTS,
+            )
+        } else {
+            Ok(index.search_objects(&object_filters, true, false, DEFAULT_MAX_RESULTS, None))
+        }
     })?;
 
     let (expand_metric, descendants) = timed(config.iterations, || Ok(bfs_expand_all(&index)))?;
