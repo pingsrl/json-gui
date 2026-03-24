@@ -4,7 +4,10 @@ import { useJsonStore } from "../store";
 import { useI18n } from "../i18n";
 
 export const ContextMenu: FC = () => {
-  const { contextMenu, hideContextMenu, setSearchScopePath, expandSubtree } = useJsonStore();
+  const contextMenu = useJsonStore((state) => state.contextMenu);
+  const hideContextMenu = useJsonStore((state) => state.hideContextMenu);
+  const setSearchScopePath = useJsonStore((state) => state.setSearchScopePath);
+  const expandSubtree = useJsonStore((state) => state.expandSubtree);
   const { t } = useI18n();
   const menuRef = useRef<HTMLDivElement>(null);
   // Pre-carica path e raw non appena il menu si apre, così le funzioni

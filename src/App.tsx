@@ -23,7 +23,11 @@ const DEFAULT_LEFT = 288;
 const DEFAULT_RIGHT = 288;
 
 export default function App() {
-  const { filePath, openFile, openFromString, expandProgress } = useJsonStore();
+  const filePath = useJsonStore((state) => state.filePath);
+  const openFile = useJsonStore((state) => state.openFile);
+  const openFromString = useJsonStore((state) => state.openFromString);
+  const expandProgress = useJsonStore((state) => state.expandProgress);
+  const loading = useJsonStore((state) => state.loading);
 
   const [darkMode, setDarkMode] = useState(
     () => localStorage.getItem("theme") !== "light"
@@ -79,7 +83,6 @@ export default function App() {
     return () => unlisten?.();
   }, []);
 
-  const { loading } = useJsonStore();
   useEffect(() => {
     if (!loading) {
       const timer = setTimeout(() => setParseProgress(null), 400);

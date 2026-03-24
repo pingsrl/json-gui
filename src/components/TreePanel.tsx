@@ -15,17 +15,15 @@ import { TreeNode } from "./TreeNode";
 const SLICE_PADDING = 40;
 
 export const TreePanel: FC = () => {
-  const {
-    rootNode,
-    rootChildren,
-    selectedNodeId,
-    focusedNodeId,
-    expandedNodes,
-    expandAll,
-    collapseAll,
-    toggleNode,
-    setFocusedNode
-  } = useJsonStore();
+  const rootNode = useJsonStore((state) => state.rootNode);
+  const rootChildren = useJsonStore((state) => state.rootChildren);
+  const selectedNodeId = useJsonStore((state) => state.selectedNodeId);
+  const focusedNodeId = useJsonStore((state) => state.focusedNodeId);
+  const expandedNodes = useJsonStore((state) => state.expandedNodes);
+  const expandAll = useJsonStore((state) => state.expandAll);
+  const collapseAll = useJsonStore((state) => state.collapseAll);
+  const toggleNode = useJsonStore((state) => state.toggleNode);
+  const setFocusedNode = useJsonStore((state) => state.setFocusedNode);
   const { t } = useI18n();
   const treeRef = useRef<HTMLDivElement>(null);
 

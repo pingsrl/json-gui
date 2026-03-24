@@ -98,7 +98,6 @@ impl RuntimeMonitor {
 #[derive(Serialize, Clone)]
 pub struct NodeDto {
     pub id: u32,
-    pub parent_id: Option<u32>,
     pub key: Option<String>,
     pub value_type: &'static str,
     pub value_preview: Cow<'static, str>,
@@ -261,7 +260,6 @@ fn node_to_dto(index: &JsonIndex, id: u32) -> NodeDto {
     };
     NodeDto {
         id,
-        parent_id: index.parent_of(id),
         key: node_key_string(index, id),
         value_type,
         value_preview: node_value_preview(index, id),
@@ -469,7 +467,7 @@ pub async fn expand_subtree(
     // Shared key pool across all expansions: deduplicates keys like "id", "name" globally.
     let mut key_pool: Vec<String> = Vec::new();
     let mut key_map: HashMap<NodeKey, i32> = HashMap::new();
-    let mut result: Vec<(u32, Vec<(u32, i32, i32, u8, String, u32)>)> = Vec::new();
+    let mut result: Vec<(u32, Vec<(u32, i32, u8, String, u32)>)> = Vec::new();
     let mut queue: Vec<u32> = vec![node_id];
     let mut qi = 0;
     let mut total_nodes: usize = 0;
@@ -492,7 +490,7 @@ pub async fn expand_subtree(
             .min(EXPAND_SUBTREE_MAX_CHILDREN_PER_PARENT);
 
         // children_iter is zero-alloc (no Vec<u32> per parent).
-        let mut children_rows: Vec<(u32, i32, i32, u8, String, u32)> =
+        let mut children_rows: Vec<(u32, i32, u8, String, u32)> =
             Vec::with_capacity(cap);
         for id in index.children_iter(parent_id).take(cap) {
             let node = &index.nodes[id as usize];
@@ -504,14 +502,9 @@ pub async fn expand_subtree(
                     pos
                 }),
             };
-            let parent_i32 = match index.parent_of(id) {
-                None => -1i32,
-                Some(p) => p as i32,
-            };
             let n_ch = index.children_len(id);
             children_rows.push((
                 id,
-                parent_i32,
                 key_idx,
                 node_type_byte(node.kind()),
                 node_value_preview(index, id).into_owned(),
@@ -520,7 +513,7 @@ pub async fn expand_subtree(
         }
 
         total_nodes += children_rows.len();
-        for &(child_id, _, _, _, _, n_ch) in &children_rows {
+        for &(child_id, _, _, _, n_ch) in &children_rows {
             if total_nodes < limit && n_ch > 0 {
                 queue.push(child_id);
             }
@@ -760,12 +753,12 @@ pub struct CompactExpandedSliceResult {
 
 /// Compact format for expand_subtree.
 /// Saves ~4-5x IPC payload vs Vec<(u32, Vec<NodeDto>)> with named fields.
-/// Each child row: (id, parent_id_i32, key_idx, type_byte, preview, children_count)
+/// Each child row: (id, key_idx, type_byte, preview, children_count)
 /// key_idx indexes into the shared key_pool (-1 = no key).
 #[derive(Serialize)]
 pub struct CompactExpandSubtreeResult {
     pub key_pool: Vec<String>,
-    pub expansions: Vec<(u32, Vec<(u32, i32, i32, u8, String, u32)>)>,
+    pub expansions: Vec<(u32, Vec<(u32, i32, u8, String, u32)>)>,
 }
 
 #[tauri::command]

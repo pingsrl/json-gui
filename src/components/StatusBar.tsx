@@ -14,13 +14,11 @@ function formatDuration(valueMs: number): string {
 }
 
 export const StatusBar: FC = () => {
-  const {
-    nodeCount,
-    sizeBytes,
-    runtimeStats,
-    lastOperation,
-    refreshRuntimeStats
-  } = useJsonStore();
+  const nodeCount = useJsonStore((state) => state.nodeCount);
+  const sizeBytes = useJsonStore((state) => state.sizeBytes);
+  const runtimeStats = useJsonStore((state) => state.runtimeStats);
+  const lastOperation = useJsonStore((state) => state.lastOperation);
+  const refreshRuntimeStats = useJsonStore((state) => state.refreshRuntimeStats);
   const { t } = useI18n();
 
   useEffect(() => {

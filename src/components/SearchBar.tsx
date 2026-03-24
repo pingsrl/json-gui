@@ -9,21 +9,19 @@ import { MODE_OPTIONS } from "./search-bar/shared";
 import { useSearchBarState } from "./search-bar/useSearchBarState";
 
 export const SearchBar: FC = () => {
-  const {
-    filePath,
-    nodeCount,
-    searchMode,
-    activeSearchMode,
-    searchScopePath,
-    searchSort,
-    searching,
-    setSearchMode,
-    setSearchScopePath,
-    setSearchSort,
-    search,
-    searchObjects,
-    clearSearch
-  } = useJsonStore();
+  const filePath = useJsonStore((state) => state.filePath);
+  const nodeCount = useJsonStore((state) => state.nodeCount);
+  const searchMode = useJsonStore((state) => state.searchMode);
+  const activeSearchMode = useJsonStore((state) => state.activeSearchMode);
+  const searchScopePath = useJsonStore((state) => state.searchScopePath);
+  const searchSort = useJsonStore((state) => state.searchSort);
+  const searching = useJsonStore((state) => state.searching);
+  const setSearchMode = useJsonStore((state) => state.setSearchMode);
+  const setSearchScopePath = useJsonStore((state) => state.setSearchScopePath);
+  const setSearchSort = useJsonStore((state) => state.setSearchSort);
+  const search = useJsonStore((state) => state.search);
+  const searchObjects = useJsonStore((state) => state.searchObjects);
+  const clearSearch = useJsonStore((state) => state.clearSearch);
   const { t } = useI18n();
 
   const state = useSearchBarState({

@@ -55,12 +55,10 @@ function NodeRow({
 }
 
 export const PropertiesPanel: FC = () => {
-  const {
-    selectedNode,
-    selectedNodePath,
-    selectedNodeSiblings,
-    navigateToNode
-  } = useJsonStore();
+  const selectedNode = useJsonStore((state) => state.selectedNode);
+  const selectedNodePath = useJsonStore((state) => state.selectedNodePath);
+  const selectedNodeSiblings = useJsonStore((state) => state.selectedNodeSiblings);
+  const navigateToNode = useJsonStore((state) => state.navigateToNode);
   const { t } = useI18n();
 
   const [detailHeight, setDetailHeight] = useState(() => {

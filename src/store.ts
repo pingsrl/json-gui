@@ -2,10 +2,10 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 
 // Compact expand_subtree response from Rust backend.
-// Each row: [id, parent_id_i32, key_idx, type_byte, preview, children_count]
+// Each row: [id, key_idx, type_byte, preview, children_count]
 interface CompactExpandSubtreeResult {
   key_pool: string[];
-  expansions: [number, [number, number, number, number, string, number][]][];
+  expansions: [number, [number, number, number, string, number][]][];
 }
 
 const COMPACT_TYPE_NAMES = ["object", "array", "string", "number", "boolean", "null"] as const;
@@ -15,7 +15,7 @@ function decodeCompactExpansions(
 ): [number, NodeDto[]][] {
   const { key_pool, expansions } = result;
   return expansions.map(([parentId, rows]) => {
-    const children: NodeDto[] = rows.map(([id, , key_idx, type_byte, preview, children_count]) => ({
+    const children: NodeDto[] = rows.map(([id, key_idx, type_byte, preview, children_count]) => ({
       id,
       key: key_idx >= 0 ? key_pool[key_idx] : null,
       value_type: COMPACT_TYPE_NAMES[type_byte] ?? "null",

@@ -52,7 +52,8 @@ function formatScalarValue(value: string | null, valueType: string): string | nu
 }
 
 export const DetailPanel: FC = () => {
-  const { selectedNode, selectedNodePath } = useJsonStore();
+  const selectedNode = useJsonStore((state) => state.selectedNode);
+  const selectedNodePath = useJsonStore((state) => state.selectedNodePath);
   const { t } = useI18n();
   const [fullValue, setFullValue] = useState<string | null>(null);
 

@@ -14,23 +14,22 @@ function splitSearchPath(path: string) {
 }
 
 export const SearchPanel: FC = () => {
-  const {
-    nodeCount,
-    searching,
-    searchResults,
-    navigateToNode,
-    toggleNode,
-    expandedNodes,
-    hasActiveSearch,
-    searchMode,
-    searchSort,
-    setSearchSort
-  } = useJsonStore();
+  const nodeCount = useJsonStore((state) => state.nodeCount);
+  const searching = useJsonStore((state) => state.searching);
+  const searchResults = useJsonStore((state) => state.searchResults);
+  const navigateToNode = useJsonStore((state) => state.navigateToNode);
+  const toggleNode = useJsonStore((state) => state.toggleNode);
+  const hasActiveSearch = useJsonStore((state) => state.hasActiveSearch);
+  const searchMode = useJsonStore((state) => state.searchMode);
+  const searchSort = useJsonStore((state) => state.searchSort);
+  const setSearchSort = useJsonStore((state) => state.setSearchSort);
   const { t } = useI18n();
 
   const handleResultClick = async (result: (typeof searchResults)[number]) => {
     if (result.kind === "object") {
-      const alreadyExpanded = expandedNodes.has(result.node_id);
+      const alreadyExpanded = useJsonStore
+        .getState()
+        .expandedNodes.has(result.node_id);
       await navigateToNode(result.node_id);
       if (!alreadyExpanded) {
         await toggleNode(result.node_id);
@@ -47,7 +46,9 @@ export const SearchPanel: FC = () => {
 
     const shouldExpandOneLevel =
       result.value_preview === "[object]" || result.value_preview === "[array]";
-    const alreadyExpanded = expandedNodes.has(result.node_id);
+    const alreadyExpanded = useJsonStore
+      .getState()
+      .expandedNodes.has(result.node_id);
     await navigateToNode(result.node_id);
     if (shouldExpandOneLevel && !alreadyExpanded) {
       await toggleNode(result.node_id);

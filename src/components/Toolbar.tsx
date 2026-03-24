@@ -20,7 +20,9 @@ export const Toolbar: FC<ToolbarProps> = ({
   darkMode,
   onDarkModeToggle
 }) => {
-  const { recentFiles, filePath, openFile } = useJsonStore();
+  const recentFiles = useJsonStore((state) => state.recentFiles);
+  const filePath = useJsonStore((state) => state.filePath);
+  const openFile = useJsonStore((state) => state.openFile);
   const { t, lang, setLang } = useI18n();
   const [recentOpen, setRecentOpen] = useState(false);
   const recentRef = useRef<HTMLDivElement>(null);

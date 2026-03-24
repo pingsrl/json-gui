@@ -1,4 +1,4 @@
-import { type FC } from "react";
+import { memo, type FC } from "react";
 import { NodeDto, useJsonStore, getParentId } from "../store";
 import { ChevronRight, ChevronDown } from "lucide-react";
 
@@ -17,21 +17,20 @@ interface Props {
   depth: number;
 }
 
-export const TreeNode: FC<Props> = ({ node, depth }) => {
-  const {
-    expandedNodes,
-    toggleNode,
-    loadMoreChildren,
-    selectNode,
-    selectedNodeId,
-    focusedNodeId,
-    showContextMenu
-  } = useJsonStore();
+const TreeNodeComponent: FC<Props> = ({ node, depth }) => {
   const isLoadMore = node.synthetic_kind === "load-more";
   const hasChildren = node.children_count > 0;
-  const isExpanded = expandedNodes.has(node.id);
-  const isSelected = !isLoadMore && selectedNodeId === node.id;
-  const isFocused = !isLoadMore && focusedNodeId === node.id;
+  const toggleNode = useJsonStore((state) => state.toggleNode);
+  const loadMoreChildren = useJsonStore((state) => state.loadMoreChildren);
+  const selectNode = useJsonStore((state) => state.selectNode);
+  const showContextMenu = useJsonStore((state) => state.showContextMenu);
+  const isExpanded = useJsonStore((state) => state.expandedNodes.has(node.id));
+  const isSelected = useJsonStore(
+    (state) => !isLoadMore && state.selectedNodeId === node.id
+  );
+  const isFocused = useJsonStore(
+    (state) => !isLoadMore && state.focusedNodeId === node.id
+  );
 
   const handleSelect = () => {
     if (isLoadMore) {
@@ -135,3 +134,5 @@ export const TreeNode: FC<Props> = ({ node, depth }) => {
     </div>
   );
 };
+
+export const TreeNode = memo(TreeNodeComponent);
