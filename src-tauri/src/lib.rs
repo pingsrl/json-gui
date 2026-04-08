@@ -117,6 +117,18 @@ fn setup_window_state_persistence<R: tauri::Runtime>(window: &WebviewWindow<R>) 
     });
 }
 
+fn emit_menu_event_to_focused_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &str) {
+    if let Some((label, _)) = app
+        .webview_windows()
+        .into_iter()
+        .find(|(_, window)| window.is_focused().unwrap_or(false))
+    {
+        let _ = app.emit_to(label, event, ());
+    } else {
+        let _ = app.emit(event, ());
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -231,19 +243,19 @@ pub fn run() {
 
             app.on_menu_event(|app, event| match event.id().as_ref() {
                 "open" => {
-                    app.emit("menu-open", ()).ok();
+                    emit_menu_event_to_focused_window(app, "menu-open");
                 }
                 "reload" => {
-                    app.emit("menu-reload", ()).ok();
+                    emit_menu_event_to_focused_window(app, "menu-reload");
                 }
                 "recent" => {
-                    app.emit("menu-recent", ()).ok();
+                    emit_menu_event_to_focused_window(app, "menu-recent");
                 }
                 "check-update" => {
-                    app.emit("menu-check-update", ()).ok();
+                    emit_menu_event_to_focused_window(app, "menu-check-update");
                 }
                 "export" => {
-                    app.emit("menu-export", ()).ok();
+                    emit_menu_event_to_focused_window(app, "menu-export");
                 }
                 "new-window" => {
                     let label = format!(
