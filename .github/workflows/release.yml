@@ -67,7 +67,7 @@ jobs:
           echo "RELEASE_NOTES_EOF" >> "$GITHUB_OUTPUT"
       - name: Create draft release
         id: create
-        uses: softprops/action-gh-release@v2.6.1
+        uses: softprops/action-gh-release@v3.0.0
         with:
           draft: true
           body: ${{ steps.notes.outputs.body }}
@@ -336,7 +336,7 @@ jobs:
           APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
       - name: Upload macOS artifacts
-        uses: softprops/action-gh-release@v2.6.1
+        uses: softprops/action-gh-release@v3.0.0
         with:
           files: |
             src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
@@ -413,7 +413,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' && format('{0}/tauri-signing.key', runner.temp) || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - name: Upload Windows artifacts
-        uses: softprops/action-gh-release@v2.6.1
+        uses: softprops/action-gh-release@v3.0.0
         with:
           files: |
             src-tauri/target/release/bundle/nsis/*.exe
@@ -496,7 +496,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' && format('{0}/tauri-signing.key', runner.temp) || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - name: Upload Linux artifacts
-        uses: softprops/action-gh-release@v2.6.1
+        uses: softprops/action-gh-release@v3.0.0
         with:
           files: |
             src-tauri/target/release/bundle/appimage/*.AppImage
@@ -595,12 +595,12 @@ jobs:
           PYEOF
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2.6.1
+        uses: softprops/action-gh-release@v3.0.0
         with:
           draft: false
 
       - name: Upload latest.json (if signatures were available)
         if: hashFiles('latest.json') != ''
-        uses: softprops/action-gh-release@v2.6.1
+        uses: softprops/action-gh-release@v3.0.0
         with:
           files: latest.json
