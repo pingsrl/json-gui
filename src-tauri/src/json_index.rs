@@ -1,4 +1,4 @@
-use memchr::memmem;
+use memchr::{memchr, memchr2, memmem};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -24,7 +24,6 @@ const STRING_BYTES_DIVISOR_VERY_LARGE_FILE: u64 = 40;
 /// (previews are already limited to 80 chars).  The raw export of truncated
 /// nodes will be shortened.
 const VERY_LARGE_FILE_STR_MAX_BYTES: usize = 256;
-
 
 // ---- InternedStrings ----
 // Compact pool for string values: a single Vec<u8> for bytes + open-addressing
@@ -499,9 +498,29 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     if needle.len() > haystack.len() {
         return false;
     }
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
+
+    let first_lower = needle[0].to_ascii_lowercase();
+    let first_upper = needle[0].to_ascii_uppercase();
+    let mut offset = 0;
+    while offset + needle.len() <= haystack.len() {
+        let found = if first_lower == first_upper {
+            memchr(first_lower, &haystack[offset..])
+        } else {
+            memchr2(first_lower, first_upper, &haystack[offset..])
+        };
+        let Some(pos) = found else {
+            return false;
+        };
+        offset += pos;
+        if offset + needle.len() > haystack.len() {
+            return false;
+        }
+        if haystack[offset..offset + needle.len()].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+        offset += 1;
+    }
+    false
 }
 
 #[inline]
@@ -519,6 +538,19 @@ fn starts_with_case_insensitive(candidate: &str, prefix: &str, prefix_lower: &st
     } else {
         candidate.to_lowercase().starts_with(prefix_lower)
     }
+}
+
+fn compare_path_suggestions(a: &&str, b: &&str, segment_prefix: &str) -> std::cmp::Ordering {
+    let a_is_numeric = a.chars().all(|ch| ch.is_ascii_digit());
+    let b_is_numeric = b.chars().all(|ch| ch.is_ascii_digit());
+    (!a.starts_with(segment_prefix))
+        .cmp(&!b.starts_with(segment_prefix))
+        .then_with(|| {
+            (segment_prefix.is_empty() && a_is_numeric)
+                .cmp(&(segment_prefix.is_empty() && b_is_numeric))
+        })
+        .then_with(|| a.len().cmp(&b.len()))
+        .then_with(|| a.cmp(b))
 }
 
 #[inline]
@@ -654,7 +686,13 @@ impl<'a> StreamCtxPtr<'a> {
     fn with_mut<R>(self, f: impl FnOnce(&mut StreamCtx) -> R) -> R {
         // SAFETY: parsing is strictly single-threaded and synchronous; the context
         // outlives all visitors/seeds created during parse_streaming_with_cap.
-        unsafe { f(self.ptr.as_ptr().as_mut().expect("stream ctx pointer is null")) }
+        unsafe {
+            f(self
+                .ptr
+                .as_ptr()
+                .as_mut()
+                .expect("stream ctx pointer is null"))
+        }
     }
 }
 
@@ -1123,35 +1161,44 @@ impl JsonIndex {
             return Vec::new();
         }
 
-        let chunk_matches: Vec<Vec<u32>> = nodes
-            .par_chunks(CHUNK_SIZE)
-            .enumerate()
-            .map(|(chunk_idx, chunk)| {
-                let chunk_start = start_id + (chunk_idx * CHUNK_SIZE) as u32;
-                let mut local = Vec::with_capacity(max_results.min(chunk.len()).min(32));
-                for (offset, node) in chunk.iter().enumerate() {
-                    let node_id = chunk_start + offset as u32;
-                    if matches(node_id, node) {
-                        local.push(node_id);
-                        if local.len() == max_results {
-                            break;
+        let mut ids = Vec::with_capacity(max_results.min(nodes.len()));
+        let chunks_per_batch = (rayon::current_num_threads() * 4).max(1);
+
+        for (batch_idx, batch) in nodes.chunks(CHUNK_SIZE * chunks_per_batch).enumerate() {
+            let batch_start = start_id + (batch_idx * CHUNK_SIZE * chunks_per_batch) as u32;
+            let chunk_matches: Vec<Vec<u32>> = batch
+                .par_chunks(CHUNK_SIZE)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| {
+                    let chunk_start = batch_start + (chunk_idx * CHUNK_SIZE) as u32;
+                    let mut local = Vec::with_capacity(max_results.min(chunk.len()).min(32));
+                    for (offset, node) in chunk.iter().enumerate() {
+                        let node_id = chunk_start + offset as u32;
+                        if matches(node_id, node) {
+                            local.push(node_id);
+                            if local.len() == max_results {
+                                break;
+                            }
                         }
                     }
-                }
-                local
-            })
-            .collect();
+                    local
+                })
+                .collect();
 
-        let mut ids = Vec::with_capacity(max_results.min(nodes.len()));
-        for mut local in chunk_matches {
-            let remaining = max_results - ids.len();
-            if remaining == 0 {
-                break;
+            for mut local in chunk_matches {
+                let remaining = max_results - ids.len();
+                if remaining == 0 {
+                    return ids;
+                }
+                if local.len() <= remaining {
+                    ids.append(&mut local);
+                } else {
+                    ids.extend(local.into_iter().take(remaining));
+                    return ids;
+                }
             }
-            if local.len() <= remaining {
-                ids.append(&mut local);
-            } else {
-                ids.extend(local.into_iter().take(remaining));
+
+            if ids.len() >= max_results {
                 break;
             }
         }
@@ -1688,9 +1735,9 @@ impl JsonIndex {
                         }
                         want_values
                             && match node.kind() {
-                                NodeKind::Str => finder
-                                    .find(self.str_val_of_node(node).as_bytes())
-                                    .is_some(),
+                                NodeKind::Str => {
+                                    finder.find(self.str_val_of_node(node).as_bytes()).is_some()
+                                }
                                 NodeKind::Num => {
                                     let mut text = StackString::<64>::new();
                                     finder
@@ -1988,27 +2035,16 @@ impl JsonIndex {
             })
             .collect();
 
-        suggestions.sort_unstable_by(|a, b| {
-            let a_is_numeric = a.chars().all(|ch| ch.is_ascii_digit());
-            let b_is_numeric = b.chars().all(|ch| ch.is_ascii_digit());
-            let a_rank = (
-                !a.starts_with(segment_prefix),
-                segment_prefix.is_empty() && a_is_numeric,
-                a.len(),
-                *a,
-            );
-            let b_rank = (
-                !b.starts_with(segment_prefix),
-                segment_prefix.is_empty() && b_is_numeric,
-                b.len(),
-                *b,
-            );
-            a_rank.cmp(&b_rank)
-        });
+        if suggestions.len() > limit {
+            suggestions.select_nth_unstable_by(limit, |a, b| {
+                compare_path_suggestions(a, b, segment_prefix)
+            });
+            suggestions.truncate(limit);
+        }
+        suggestions.sort_unstable_by(|a, b| compare_path_suggestions(a, b, segment_prefix));
 
         suggestions
             .into_iter()
-            .take(limit)
             .map(|candidate| format!("{base}{candidate}"))
             .collect()
     }
