@@ -17,7 +17,7 @@ jobs:
   guard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0          # history completa necessaria per merge-base
       - name: Verify tag commit is on master
@@ -39,7 +39,7 @@ jobs:
     outputs:
       release_id: ${{ steps.create.outputs.id }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0          # necessario per trovare il tag precedente
       - name: Generate release notes
@@ -81,7 +81,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Linux system dependencies
         run: |
@@ -279,7 +279,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -376,7 +376,7 @@ jobs:
     env:
       HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -454,7 +454,7 @@ jobs:
     env:
       HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -534,7 +534,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/download-artifact@v8
         with: { name: macos-sig, path: artifacts }
