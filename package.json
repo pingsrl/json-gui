@@ -19,7 +19,7 @@
     "test:e2e:setup": "cd tests/e2e/wdio && npm install"
   },
   "dependencies": {
-    "@tanstack/react-virtual": "^3.14.10",
+    "@tanstack/react-virtual": "^3.14.12",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.3",
     "@tauri-apps/plugin-fs": "^2.5.2",
