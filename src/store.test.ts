@@ -186,6 +186,52 @@ describe('insertVisibleChildren', () => {
 })
 
 describe('visible slice helpers', () => {
+  it('mantiene conteggi e pagine identici con rami chiusi, vuoti e righe sintetiche', () => {
+    const roots = [makeNode(1, 'a'), makeNode(2, 'b'), makeNode(3, 'c')]
+    const more: NodeDto = { ...makeNode(-1, null), synthetic_kind: 'load-more' }
+    const expanded = new Map<number, NodeDto[]>([
+      [1, [makeNode(4, 'nested'), makeNode(5, 'empty'), more]],
+      [4, [makeNode(6, 'leaf')]],
+      [5, []],
+      [99, [makeNode(100, 'hidden')]],
+    ])
+    for (const collapse of [undefined, 4, 1]) {
+      if (collapse !== undefined) expanded.delete(collapse)
+      const expected = buildVisibleNodes(roots, expanded)
+      const sizes = buildVisibleSubtreeSizeMap(roots, expanded)
+      expect(countVisibleNodes(roots, expanded, sizes)).toBe(expected.length)
+      for (let offset = 0; offset <= expected.length + 1; offset++) {
+        for (const limit of [0, 1, 3, 20]) {
+          expect(getVisibleSlice(roots, expanded, offset, limit, sizes))
+            .toEqual(expected.slice(offset, offset + limit))
+        }
+      }
+    }
+  })
+
+  it('non alloca una voce per ogni foglia su alberi larghi', () => {
+    const leaves = Array.from({ length: 50_000 }, (_, i) => makeNode(i + 1, null))
+    const expanded = new Map([[0, leaves]])
+    const roots = [makeNode(0, 'root')]
+    const sizes = buildVisibleSubtreeSizeMap(roots, expanded)
+    expect(sizes.size).toBe(1)
+    expect(countVisibleNodes(roots, expanded, sizes)).toBe(50_001)
+    expect(getVisibleSlice(roots, expanded, 49_999, 10, sizes).map(v => v.node.id))
+      .toEqual([49_999, 50_000])
+    expect(getVisibleSlice(leaves, new Map(), 49_999, 10))
+      .toEqual([{ node: leaves[49_999], depth: 0 }])
+  })
+
+  it('gestisce alberi profondi senza ricorsione', () => {
+    const roots = [makeNode(0, 'root')]
+    const expanded = new Map<number, NodeDto[]>()
+    for (let i = 0; i < 10_000; i++) expanded.set(i, [makeNode(i + 1, 'child')])
+    const sizes = buildVisibleSubtreeSizeMap(roots, expanded)
+    expect(countVisibleNodes(roots, expanded, sizes)).toBe(10_001)
+    expect(getVisibleSlice(roots, expanded, 10_000, 1, sizes))
+      .toEqual([{ node: expanded.get(9_999)![0], depth: 10_000 }])
+  })
+
   it('calcola il conteggio visibile senza materializzare tutto l albero', () => {
     const grandchild = makeNode(100, 'gc')
     const child = makeNode(10, 'c', 'object', 1)

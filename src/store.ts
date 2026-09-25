@@ -314,32 +314,28 @@ export function buildVisibleSubtreeSizeMap(
   expandedNodes: Map<number, NodeDto[]>
 ): Map<number, number> {
   const sizeMap = new Map<number, number>();
-  const stack: Array<{ node: NodeDto; visited: boolean }> = [];
-
-  for (let i = rootChildren.length - 1; i >= 0; i -= 1) {
-    stack.push({ node: rootChildren[i], visited: false });
-  }
+  if (expandedNodes.size === 0) return sizeMap;
+  // Only expanded branches need a size entry; all other nodes have span 1.
+  // Keep one frame per depth, rather than one per sibling/leaf.
+  const stack = [{ id: 0, nodes: rootChildren, index: 0, size: 0 }];
 
   while (stack.length > 0) {
-    const frame = stack.pop()!;
-    const children = expandedNodes.get(frame.node.id);
-
-    if (frame.visited) {
-      let size = 1;
-      if (children && children.length > 0) {
-        for (const child of children) {
-          size += sizeMap.get(child.id) ?? 1;
-        }
+    const frame = stack[stack.length - 1];
+    if (frame.index >= frame.nodes.length) {
+      stack.pop();
+      if (stack.length > 0) {
+        sizeMap.set(frame.id, frame.size);
+        stack[stack.length - 1].size += frame.size;
       }
-      sizeMap.set(frame.node.id, size);
       continue;
     }
 
-    stack.push({ node: frame.node, visited: true });
+    const node = frame.nodes[frame.index++];
+    const children = expandedNodes.get(node.id);
     if (children && children.length > 0) {
-      for (let i = children.length - 1; i >= 0; i -= 1) {
-        stack.push({ node: children[i], visited: false });
-      }
+      stack.push({ id: node.id, nodes: children, index: 0, size: 1 });
+    } else {
+      frame.size += 1;
     }
   }
 
@@ -351,6 +347,7 @@ export function countVisibleNodes(
   expandedNodes: Map<number, NodeDto[]>,
   sizeMap: Map<number, number> = buildVisibleSubtreeSizeMap(rootChildren, expandedNodes)
 ): number {
+  if (sizeMap.size === 0) return rootChildren.length;
   let total = 0;
   for (const node of rootChildren) {
     total += sizeMap.get(node.id) ?? 1;
@@ -366,6 +363,10 @@ export function getVisibleSlice(
   sizeMap: Map<number, number> = buildVisibleSubtreeSizeMap(rootChildren, expandedNodes)
 ): VNode[] {
   if (limit <= 0) return [];
+  if (sizeMap.size === 0) {
+    const start = Math.max(0, offset);
+    return rootChildren.slice(start, start + limit).map((node) => ({ node, depth: 0 }));
+  }
 
   const rows: VNode[] = [];
   const stack: Array<{ nodes: NodeDto[]; depth: number; index: number }> = [
