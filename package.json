@@ -35,7 +35,7 @@
     "@tauri-apps/cli": "^2.12.2",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
-    "@vitejs/plugin-react": "^6.1.1",
+    "@vitejs/plugin-react": "^6.1.2",
     "@vitest/coverage-v8": "^5.0.3",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
